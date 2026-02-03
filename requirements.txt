@@ -1,0 +1,31 @@
+# Polymoney - Polymarket Trading Bot Framework
+# Core dependencies
+
+# Polymarket API client
+py-clob-client>=0.1.0
+
+# WebSocket client
+websockets>=12.0
+
+# REST API framework
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+
+# Database ORM
+sqlalchemy>=2.0.0
+aiosqlite>=0.19.0
+
+# Data validation
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+
+# Configuration
+python-dotenv>=1.0.0
+pyyaml>=6.0
+
+# CLI
+typer>=0.9.0
+rich>=13.0.0
+
+# HTTP client
+httpx>=0.26.0
