@@ -73,6 +73,11 @@ class PositionArbitrageStrategy(BaseStrategy):
         phase1_end: End of phase 1 in seconds (default 300)
         phase2_end: End of phase 2 in seconds (default 600)
         low_prob_threshold: Don't buy tokens below this price (default 0.05)
+        ecr_threshold: ECR stop-loss threshold (default 1.05 = 105%)
+        balance_threshold: Position balance threshold for warning (default 0.70)
+        enable_ecr_stoploss: Enable ECR stop-loss mechanism (default True)
+        enable_rebalancing: Enable market order rebalancing (default False)
+        rebalancing_cooldown: Cooldown between rebalancing orders in seconds (default 60)
     """
 
     def __init__(
@@ -91,6 +96,13 @@ class PositionArbitrageStrategy(BaseStrategy):
         self.phase1_end = self.params.get("phase1_end", 300)
         self.phase2_end = self.params.get("phase2_end", 600)
         self.low_prob_threshold = self.params.get("low_prob_threshold", 0.05)
+        
+        # Risk control parameters
+        self.ecr_threshold = self.params.get("ecr_threshold", 1.05)  # 105%
+        self.balance_threshold = self.params.get("balance_threshold", 0.70)
+        self.enable_ecr_stoploss = self.params.get("enable_ecr_stoploss", True)
+        self.enable_rebalancing = self.params.get("enable_rebalancing", False)
+        self.rebalancing_cooldown = self.params.get("rebalancing_cooldown", 60)
 
         # Internal position tracking
         self.up_position = InternalPosition()
@@ -104,6 +116,12 @@ class PositionArbitrageStrategy(BaseStrategy):
         self.current_up_price = 0.5
         self.current_down_price = 0.5
         self.market_start_time: Optional[datetime] = None
+        
+        # Risk state tracking
+        self._risk_state = "normal"  # "normal", "warning", "limited"
+        self._ecr_violations = 0
+        self._last_rebalancing_time: Optional[datetime] = None
+        self._rebalancing_events: List[Dict[str, Any]] = []
 
     @property
     def strategy_type(self) -> str:
@@ -135,6 +153,73 @@ class PositionArbitrageStrategy(BaseStrategy):
         if up == 0 or down == 0:
             return 0.0
         return min(up, down) / max(up, down)
+    
+    @property
+    def risk_state(self) -> str:
+        """
+        Get current risk state.
+        
+        Returns:
+            - "normal": ECR < 100%, healthy
+            - "warning": ECR >= 100% but < threshold
+            - "limited": ECR >= threshold, stop generating orders
+        """
+        ecr = self.effective_cost_rate
+        if ecr == float("inf"):
+            return "normal"  # No position yet
+        
+        if ecr >= self.ecr_threshold:
+            return "limited"
+        elif ecr >= 1.0:
+            return "warning"
+        return "normal"
+    
+    def calculate_projected_ecr(self, side: str, shares: float, price: float) -> float:
+        """
+        Calculate projected ECR after a hypothetical order fills.
+        
+        Args:
+            side: "up" or "down"
+            shares: Number of shares in the hypothetical order
+            price: Price per share
+            
+        Returns:
+            Projected effective cost rate (returns 0.0 if no hedged position)
+        """
+        # Current state
+        up_shares = self.up_position.shares
+        down_shares = self.down_position.shares
+        total_cost = self.up_position.cost + self.down_position.cost
+        
+        # Add hypothetical order
+        if side == "up":
+            up_shares += shares
+        else:
+            down_shares += shares
+        total_cost += shares * price
+        
+        min_shares = min(up_shares, down_shares)
+        if min_shares <= 0:
+            # No hedged position yet - ECR is not meaningful
+            # Return 0 to allow building initial position
+            return 0.0
+        
+        return total_cost / min_shares
+    
+    def is_position_imbalanced(self) -> bool:
+        """Check if position is severely imbalanced."""
+        return self.balance_ratio < self.balance_threshold
+    
+    def can_rebalance(self) -> bool:
+        """Check if rebalancing is allowed (not in cooldown)."""
+        if not self.enable_rebalancing:
+            return False
+        
+        if self._last_rebalancing_time is None:
+            return True
+        
+        elapsed = (datetime.now() - self._last_rebalancing_time).total_seconds()
+        return elapsed >= self.rebalancing_cooldown
 
     def get_market_phase(self) -> int:
         """Get current market phase (1, 2, or 3)."""
@@ -165,6 +250,11 @@ class PositionArbitrageStrategy(BaseStrategy):
         self.pending_orders.clear()
         self._order_counter = 0
         self.market_start_time = None
+        # Reset risk state
+        self._risk_state = "normal"
+        self._ecr_violations = 0
+        self._last_rebalancing_time = None
+        self._rebalancing_events.clear()
 
     def on_market_start(self, market_id: str, market_info: Dict[str, Any]) -> None:
         """Initialize for a new market."""
@@ -178,6 +268,39 @@ class PositionArbitrageStrategy(BaseStrategy):
         self.current_down_price = price_data.down_price
 
         signals = []
+        
+        # Update risk state
+        current_risk = self.risk_state
+        if current_risk != self._risk_state:
+            self._risk_state = current_risk
+            logger.info(f"[{self.name}] Risk state changed to: {current_risk} (ECR: {self.effective_cost_rate:.2%})")
+        
+        # ECR stop-loss check
+        if self.enable_ecr_stoploss and current_risk == "limited":
+            ecr = self.effective_cost_rate
+            self._ecr_violations += 1
+            if self._ecr_violations <= 3:  # Log first few violations
+                logger.warning(
+                    f"[{self.name}] ECR STOP-LOSS: ECR {ecr:.2%} exceeds threshold {self.ecr_threshold:.2%}. "
+                    f"Stopping new orders."
+                )
+            return signals  # Return empty - no new orders
+        
+        # Check for rebalancing opportunity
+        if self.is_position_imbalanced() and self.can_rebalance():
+            rebalance_signal = self._generate_rebalancing_order(price_data)
+            if rebalance_signal:
+                signals.append(rebalance_signal)
+                self._last_rebalancing_time = datetime.now()
+                # Record rebalancing event
+                self._rebalancing_events.append({
+                    "timestamp": datetime.now().isoformat(),
+                    "side": "up" if rebalance_signal.token_type == TokenType.YES else "down",
+                    "size": rebalance_signal.size,
+                    "price": rebalance_signal.target_price,
+                    "balance_before": self.balance_ratio,
+                })
+                return signals  # Return just the rebalancing order
 
         # Calculate limit prices
         up_limit, down_limit = self._calculate_limit_prices(
@@ -198,22 +321,85 @@ class PositionArbitrageStrategy(BaseStrategy):
         # Phase 3: Focus on lagging side, avoid low probability
         if phase == 3:
             if lagging_side == "up" and price_data.up_price >= self.low_prob_threshold:
-                signals.append(self._create_signal("up", up_limit, self.batch_size))
+                if self._check_ecr_before_order("up", up_limit, self.batch_size):
+                    signals.append(self._create_signal("up", up_limit, self.batch_size))
             elif lagging_side == "down" and price_data.down_price >= self.low_prob_threshold:
-                signals.append(self._create_signal("down", down_limit, self.batch_size))
+                if self._check_ecr_before_order("down", down_limit, self.batch_size):
+                    signals.append(self._create_signal("down", down_limit, self.batch_size))
         else:
             # Phase 1-2: Normal operation, prioritize lagging side
             if lagging_side == "up" or lagging_side == "balanced":
                 if self._should_place_order("up", up_limit):
-                    signals.append(self._create_signal("up", up_limit, self.batch_size))
-                    available -= self.batch_size
+                    if self._check_ecr_before_order("up", up_limit, self.batch_size):
+                        signals.append(self._create_signal("up", up_limit, self.batch_size))
+                        available -= self.batch_size
 
             if available >= self.batch_size:
                 if lagging_side == "down" or lagging_side == "balanced":
                     if self._should_place_order("down", down_limit):
-                        signals.append(self._create_signal("down", down_limit, self.batch_size))
+                        if self._check_ecr_before_order("down", down_limit, self.batch_size):
+                            signals.append(self._create_signal("down", down_limit, self.batch_size))
 
         return signals
+    
+    def _check_ecr_before_order(self, side: str, price: float, cost: float) -> bool:
+        """Check if placing this order would exceed ECR threshold."""
+        if not self.enable_ecr_stoploss:
+            return True
+        
+        shares = cost / price
+        projected_ecr = self.calculate_projected_ecr(side, shares, price)
+        
+        if projected_ecr >= self.ecr_threshold:
+            logger.debug(
+                f"[{self.name}] Order rejected: projected ECR {projected_ecr:.2%} "
+                f"would exceed threshold {self.ecr_threshold:.2%}"
+            )
+            return False
+        
+        return True
+    
+    def _generate_rebalancing_order(self, price_data: PriceData) -> Optional[OrderSignal]:
+        """Generate a market order to rebalance position."""
+        if not self.enable_rebalancing:
+            return None
+        
+        up = self.up_position.shares
+        down = self.down_position.shares
+        
+        if up == 0 and down == 0:
+            return None
+        
+        # Determine underweight side
+        if up < down:
+            underweight_side = "up"
+            deficit = down - up
+            market_price = price_data.up_price
+        else:
+            underweight_side = "down"
+            deficit = up - down
+            market_price = price_data.down_price
+        
+        # Calculate shares needed to reach target balance (0.85 ratio)
+        target_ratio = 0.85
+        max_shares = max(up, down)
+        target_min = max_shares * target_ratio
+        current_min = min(up, down)
+        shares_needed = target_min - current_min
+        
+        if shares_needed <= 0:
+            return None
+        
+        # Use current market price (essentially a market order)
+        # Add small buffer to ensure fill
+        order_price = min(market_price * 1.01, 0.99)
+        
+        logger.info(
+            f"[{self.name}] REBALANCING: Buying {shares_needed:.1f} {underweight_side} shares "
+            f"at ~${order_price:.3f} to improve balance from {self.balance_ratio:.2%}"
+        )
+        
+        return self._create_signal(underweight_side, order_price, shares_needed * order_price)
 
     def _calculate_limit_prices(self, up_price: float, down_price: float) -> Tuple[float, float]:
         """Calculate limit prices based on target cost."""
@@ -312,6 +498,10 @@ class PositionArbitrageStrategy(BaseStrategy):
             "params": {
                 "target_cost": self.target_cost,
                 "batch_size": self.batch_size,
+                "ecr_threshold": self.ecr_threshold,
+                "balance_threshold": self.balance_threshold,
+                "enable_ecr_stoploss": self.enable_ecr_stoploss,
+                "enable_rebalancing": self.enable_rebalancing,
             },
             "up_position": {
                 "shares": up,
@@ -328,4 +518,9 @@ class PositionArbitrageStrategy(BaseStrategy):
             "hedged_position": self.hedged_position,
             "market_phase": self.get_market_phase(),
             "lagging_side": self.get_lagging_side(),
+            # Risk metrics
+            "risk_state": self.risk_state,
+            "ecr_violations": self._ecr_violations,
+            "rebalancing_events": len(self._rebalancing_events),
+            "is_position_imbalanced": self.is_position_imbalanced(),
         }
