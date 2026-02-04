@@ -1,0 +1,173 @@
+# ============================================================================
+# PolyMoney Position Arbitrage Strategy Configuration
+# ============================================================================
+#
+# This file contains all configurable parameters for the position arbitrage
+# strategy, simulation runner, and risk controls. Values here serve as defaults
+# and can be overridden via CLI arguments.
+#
+# Usage:
+#   python scripts/run_simulation.py live --config config/strategy_defaults.yaml
+#   python scripts/run_simulation.py backtest --config config/my_custom.yaml
+#
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# Strategy Core Parameters
+# ---------------------------------------------------------------------------
+strategy:
+  # Target cost rate: UP_limit + DOWN_limit should sum to this value.
+  # Must be < 1.0 for guaranteed profit.
+  # Reduced from 0.98 → 0.96 to provide 4% margin for fill asymmetry.
+  # With 2% margin (0.98), just 1 extra fill on one side pushes ECR > 1.0.
+  # With 4% margin (0.96), can absorb 2 extra asymmetric fills.
+  target_cost: 0.96
+
+  # Batch ratio: order size as fraction of position_size.
+  # batch_size = position_size × batch_ratio (auto-calculated).
+  # Default 0.001 (1/1000): for $100 budget → $0.10 per order.
+  # Very small batches give fine-grained averaging and precise ECR convergence.
+  # NOTE: For real Polymarket trading, minimum is ~$2.50 (5-share minimum).
+  # The strategy applies a floor of $0.10 for safety.
+  batch_ratio: 0.001
+
+  # Explicit batch_size override (uncomment to disable auto-calculation):
+  # batch_size: 1.0
+
+  # Maximum position size per market in USD.
+  position_size: 100.0
+
+  # Order timeout in seconds before auto-cancel.
+  order_timeout: 60
+
+  # Phase boundaries (seconds from market start):
+  #   Phase 1 (0 → phase1_end): Aggressive position building
+  #   Phase 2 (phase1_end → phase2_end): Steady optimization
+  #   Phase 3 (phase2_end → end): Close-out, focus on lagging side
+  phase1_end: 300
+  phase2_end: 600
+
+  # Don't buy tokens below this price (avoid nearly-decided markets).
+  low_prob_threshold: 0.05
+
+  # Maximum orders per price tick.
+  # Reduced from 4 to 2: fewer orders per tick means less waste from stale orders.
+  max_orders_per_tick: 2
+
+# ---------------------------------------------------------------------------
+# Risk Control Parameters
+# ---------------------------------------------------------------------------
+risk:
+  # ECR stop-loss threshold. Orders are blocked when ECR >= this value.
+  ecr_threshold: 1.05
+
+  # Position balance warning threshold (min/max ratio).
+  balance_threshold: 0.70
+
+  # Enable/disable ECR stop-loss mechanism.
+  enable_ecr_stoploss: true
+
+  # Enable/disable market order rebalancing for severe imbalance.
+  enable_rebalancing: true
+
+  # Cooldown between rebalancing market orders (seconds).
+  rebalancing_cooldown: 30
+
+  # Balance ratio to trigger market order rebalancing.
+  severe_imbalance_threshold: 0.50
+
+  # Maximum market order size as fraction of total position.
+  market_order_size_cap: 0.10
+
+  # Market skew filter: if max(up_price, down_price) exceeds this threshold,
+  # new limit orders are suspended to prevent one-sided position building.
+  # In extremely skewed markets, only the cheap side fills, creating unhedged risk.
+  max_skew_threshold: 0.85
+
+  # Trend patience threshold: when max(up, down) exceeds this but is below
+  # max_skew_threshold, enter "trend patience" mode — only buy the cheap side
+  # and wait for the expensive side to pull back. This replaces outright rejection.
+  trend_patience_threshold: 0.65
+
+
+# ---------------------------------------------------------------------------
+# Trend Detection Parameters
+# ---------------------------------------------------------------------------
+trend_detection:
+  # Enable/disable trend detection filter.
+  enabled: true
+
+  # Time window in seconds for momentum calculation.
+  momentum_window_seconds: 30.0
+
+  # Momentum value at which confidence reaches 100%.
+  max_momentum_threshold: 0.10
+
+  # Confidence level to stop placing orders on losing side.
+  trend_stop_threshold: 0.70
+
+# ---------------------------------------------------------------------------
+# Urgency Pricing Parameters
+# ---------------------------------------------------------------------------
+urgency_pricing:
+  # Enable/disable urgency-based dynamic limit pricing.
+  enabled: true
+
+  # Weight for imbalance vs time urgency (higher = more aggressive).
+  urgency_weight: 1.5
+
+  # Maximum offset reduction factor from urgency adjustments.
+  urgency_price_factor: 0.5
+
+  # Default market duration in seconds (fallback if settlement time unknown).
+  market_duration: 900
+
+# ---------------------------------------------------------------------------
+# Simulation Parameters
+# ---------------------------------------------------------------------------
+simulation:
+  # Coins to monitor for live simulation.
+  coins:
+    - btc
+    - eth
+    - sol
+
+  # Runtime duration in seconds (0 = infinite).
+  duration_seconds: 0
+
+  # Output directory for results.
+  output_dir: simulation_results
+
+  # Market scan interval (seconds) - how often to poll for new markets.
+  market_scan_interval: 60.0
+
+  # Metrics output interval (seconds) - how often to log metrics.
+  metrics_output_interval: 1.0
+
+  # Cancel pending orders after this many seconds.
+  order_timeout: 30.0
+
+  # Cancel orders when market price moves this far from limit (fraction).
+  # 20%: binary markets swing 10%+/s, tight thresholds cause cancel-replace cycles.
+  stale_order_threshold: 0.20
+
+  # Minimum trading time remaining (seconds) to enter a market.
+  min_trading_time: 300.0
+
+  # Minimum token price to consider market tradeable.
+  min_price_threshold: 0.05
+
+  # Maximum entry skew: skip markets where max(up, down) exceeds this at entry.
+  # Relaxed from 65% to 75%: moderately skewed markets are handled by the
+  # strategy's "trend patience" mode (cheap-side only buying).
+  max_entry_skew: 0.75
+
+# ---------------------------------------------------------------------------
+# Global Fund Management
+# ---------------------------------------------------------------------------
+fund_management:
+  # Maximum number of markets trading simultaneously.
+  max_concurrent_markets: 6
+
+  # Maximum total cost exposure across all active markets (USD).
+  max_total_exposure: 500.0

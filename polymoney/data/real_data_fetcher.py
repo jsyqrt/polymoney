@@ -268,11 +268,16 @@ class RealDataFetcher:
             except httpx.RequestError as e:
                 if self.rate_limiter.record_failure(key):
                     delay = self.rate_limiter.get_backoff_delay(key)
-                    logger.warning(f"Request failed: {e}, retrying in {delay}s")
+                    # Get more detailed error info
+                    error_type = type(e).__name__
+                    error_msg = str(e) or "connection error"
+                    logger.warning(f"Request failed ({error_type}): {error_msg}, retrying in {delay:.1f}s")
                     await asyncio.sleep(delay)
                     continue
                 else:
-                    logger.error(f"Max retries exceeded: {e}")
+                    error_type = type(e).__name__
+                    error_msg = str(e) or "connection error"
+                    logger.error(f"Max retries exceeded ({error_type}): {error_msg}")
                     return None
     
     async def get_event_by_slug(self, slug: str) -> Optional[Dict[str, Any]]:
@@ -676,24 +681,40 @@ class RealDataFetcher:
         
         best_bid = float(bids[0]["price"]) if bids else None
         best_ask = float(asks[0]["price"]) if asks else None
+        is_stale = False
+        spread = 0
         
+        # Calculate spread if both sides available
         if best_bid is not None and best_ask is not None:
-            mid_price = (best_bid + best_ask) / 2
             spread = best_ask - best_bid
+            
+            # If spread is too wide (>50%), prefer last trade price
+            if spread > 0.5:
+                last_trade = await self.get_last_trade_price(token_id)
+                if last_trade:
+                    mid_price = float(last_trade.get("price", 0.5))
+                    logger.debug(f"Token {token_id}: wide spread ({spread:.2f}), using last_trade={mid_price:.3f}")
+                else:
+                    mid_price = (best_bid + best_ask) / 2
+                    logger.warning(f"Token {token_id}: wide spread ({spread:.2f}), no last_trade, using mid={mid_price:.3f}")
+            else:
+                mid_price = (best_bid + best_ask) / 2
         elif best_bid is not None:
             mid_price = best_bid
-            spread = 0
+            logger.debug(f"Token {token_id}: only bids available, using bid={best_bid}")
         elif best_ask is not None:
             mid_price = best_ask
-            spread = 0
+            logger.debug(f"Token {token_id}: only asks available, using ask={best_ask}")
         else:
             # Empty orderbook, fallback to last trade
             last_trade = await self.get_last_trade_price(token_id)
             if last_trade:
                 mid_price = float(last_trade.get("price", 0.5))
+                logger.debug(f"Token {token_id}: empty orderbook, using last_trade={mid_price}")
             else:
                 mid_price = 0.5  # Default to 50%
-            spread = 0
+                is_stale = True
+                logger.warning(f"Token {token_id}: no orderbook or trades, defaulting to 0.5")
         
         return PriceUpdate(
             token_id=token_id,
@@ -702,6 +723,7 @@ class RealDataFetcher:
             best_ask=best_ask,
             spread=spread,
             timestamp=time.time(),
+            is_stale=is_stale,
         )
     
     async def stream_prices(
