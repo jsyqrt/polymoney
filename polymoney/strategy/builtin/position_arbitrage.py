@@ -172,25 +172,6 @@ class TrendDetector:
         
         return trend_side, confidence
     
-    def should_block_order(self, side: str) -> bool:
-        """
-        Check if order should be blocked due to strong trend.
-        
-        Args:
-            side: Order side ('up' or 'down')
-            
-        Returns:
-            True if order should be blocked (going against strong trend)
-        """
-        trend_side, confidence = self.get_trend()
-        
-        if confidence < self.trend_stop_threshold:
-            return False
-        
-        # Block if order is opposite to trend
-        # e.g., if trend is "up" (UP prices rising), block "down" orders
-        return side != trend_side
-    
     def reset(self) -> None:
         """Clear price history."""
         self._up_history.clear()
@@ -200,48 +181,36 @@ class TrendDetector:
 @register_strategy("position-arbitrage")
 class PositionArbitrageStrategy(BaseStrategy):
     """
-    Position Arbitrage / Market Maker Strategy (Optimized).
+    Position Arbitrage / Market Maker Strategy.
 
-    Buys both UP and DOWN tokens below market price to achieve
-    a total cost < $1, guaranteeing profit regardless of outcome.
-    
-    Optimization Features:
-        - ECR Prediction: Rejects orders that would worsen ECR beyond tolerance
-        - Trend Detection: Detects one-sided trends and blocks losing-side orders
-        - Urgency Pricing: Dynamically adjusts limit prices based on time and imbalance
-        - Dynamic Order Sizing: Scales order size up to 5x for lagging side
-        - Enhanced Rebalancing: Market orders for severe imbalance (balance < 50%)
+    Buys both UP and DOWN tokens below market price via limit orders so that
+    the total cost per hedged pair < $1, guaranteeing profit at settlement.
+
+    Key Features:
+        - ECR Prediction: Pre-calculates post-order ECR and rejects orders that worsen it
+        - Trend-following Pricing: Asymmetric limit prices in skewed markets
+        - Urgency Pricing: Tightens limits as time or imbalance urgency grows
+        - Proportional Sizing: Allocates order cost by price ratio for balanced shares
+        - Market Rebalancing: Market orders for severe position imbalance
 
     Core Parameters:
-        target_cost: Target cost rate (default 0.96 = 96%)
-        batch_ratio: Order size as fraction of position_size (default 0.001 = 1/1000)
-        batch_size: Override for batch_ratio auto-calculation (default: auto)
+        target_cost: UP_limit + DOWN_limit target (default 0.96)
+        batch_ratio: Order size = position_size × batch_ratio (default 0.001)
+        batch_size: Explicit override for batch_ratio auto-calculation
+        min_order_shares: Polymarket minimum order size in shares (default 5)
         order_timeout: Order timeout in seconds (default 60)
-        phase1_end: End of phase 1 in seconds (default 300)
-        phase2_end: End of phase 2 in seconds (default 600)
-        low_prob_threshold: Don't buy tokens below this price (default 0.05)
-        
+        phase1_end / phase2_end: Phase boundaries in seconds (default 300 / 600)
+        low_prob_threshold: Skip tokens below this price (default 0.05)
+        max_orders_per_tick: Orders generated per price update (default 2)
+
     Risk Control Parameters:
-        ecr_threshold: ECR stop-loss threshold (default 1.05 = 105%)
-        balance_threshold: Position balance threshold for warning (default 0.70)
-        enable_ecr_stoploss: Enable ECR stop-loss mechanism (default True)
-        enable_rebalancing: Enable market order rebalancing (default True)
-        rebalancing_cooldown: Cooldown between rebalancing orders (default 30s)
-        severe_imbalance_threshold: Balance ratio to trigger market orders (default 0.50)
-        market_order_size_cap: Max market order as fraction of position (default 0.10)
-        max_skew_threshold: Max one-side price to allow new orders (default 0.85)
-        
-    Trend Detection Parameters:
-        enable_trend_detection: Enable trend detection filter (default True)
-        momentum_window: Number of ticks for momentum calculation (default 5)
-        trend_stop_threshold: Confidence level to stop losing-side orders (default 0.70)
-        max_momentum_threshold: Momentum value for 100% confidence (default 0.10)
-        
-    Urgency Pricing Parameters:
-        enable_urgency_pricing: Enable urgency-based limit pricing (default True)
-        urgency_weight: Weight for imbalance vs time urgency (default 1.5)
-        urgency_price_factor: Max offset reduction factor (default 0.5)
-        market_duration: Total market duration in seconds (default 900)
+        ecr_threshold: ECR threshold for minority-side-only mode (default 1.05)
+        balance_threshold: Balance ratio warning threshold (default 0.70)
+        max_skew_threshold: Suspend new orders above this skew (default 0.85)
+        trend_patience_threshold: Asymmetric pricing activation (default 0.65)
+        severe_imbalance_threshold: Market order rebalancing trigger (default 0.50)
+
+    See config/strategy_defaults.yaml for full parameter reference.
     """
 
     def __init__(
@@ -259,14 +228,17 @@ class PositionArbitrageStrategy(BaseStrategy):
         # Batch size: auto-derived from position_size if not explicitly set.
         # batch_ratio (default 0.001 = 1/1000) determines granularity.
         # Smaller batch = better averaging, more precise ECR convergence.
-        # For real Polymarket trading, minimum is ~$2.50 (5-share minimum at 0.50 price).
-        # For simulation, no minimum needed.
         self.batch_ratio = self.params.get("batch_ratio", 0.001)
         explicit_batch = self.params.get("batch_size")
         if explicit_batch is not None:
             self.batch_size = explicit_batch
         else:
             self.batch_size = max(position_size * self.batch_ratio, 0.10)
+        
+        # Minimum order size in shares.  Polymarket CLOB enforces a per-market
+        # minimum (typically 5-15 shares).  Default 5 matches the common floor.
+        # The strategy converts this to a dollar minimum at order time.
+        self.min_order_shares = self.params.get("min_order_shares", 5)
         
         self.order_timeout = self.params.get("order_timeout", 60)
         self.phase1_end = self.params.get("phase1_end", 300)
@@ -470,41 +442,6 @@ class PositionArbitrageStrategy(BaseStrategy):
             return float("inf")
         return new_cost / new_min
 
-    def _predict_worst_case_pnl(self, side: str, price: float, order_cost: float) -> float:
-        """
-        Predict worst-case PnL after placing an order.
-        
-        Worst case is min(UP wins PnL, DOWN wins PnL).
-        Only >= 0 guarantees no loss regardless of outcome.
-        
-        Args:
-            side: Order direction ('up' or 'down')
-            price: Expected fill price
-            order_cost: Order amount in dollars
-            
-        Returns:
-            Predicted worst-case PnL after the order fills.
-        """
-        up = self.up_position.shares
-        down = self.down_position.shares
-        total_cost = self.up_position.cost + self.down_position.cost
-
-        new_shares = order_cost / price
-        if side == "up":
-            new_up = up + new_shares
-            new_down = down
-        else:
-            new_up = up
-            new_down = down + new_shares
-        new_cost = total_cost + order_cost
-
-        if new_up == 0 and new_down == 0:
-            return 0.0
-
-        up_win_pnl = new_up - new_cost
-        down_win_pnl = new_down - new_cost
-        return min(up_win_pnl, down_win_pnl)
-
     def is_position_imbalanced(self) -> bool:
         """Check if position is severely imbalanced."""
         return self.balance_ratio < self.balance_threshold
@@ -620,46 +557,6 @@ class PositionArbitrageStrategy(BaseStrategy):
         # Imbalance matters more (weight it higher)
         combined = max(time_urgency, imbalance_urgency * self.urgency_weight)
         return min(1.0, combined)
-
-    def _calculate_dynamic_order_cost(self, side: str, limit_price: float, available: float) -> float:
-        """
-        Calculate dynamic order cost for position rebalancing.
-        
-        For lagging side when imbalanced: scale up to 5x batch_size to accelerate rebalancing.
-        For leading side or balanced: use standard batch_size.
-        
-        Args:
-            side: Order direction ('up' or 'down')
-            limit_price: Limit price for the order
-            available: Available budget
-            
-        Returns:
-            Order cost in dollars
-        """
-        up = self.up_position.shares
-        down = self.down_position.shares
-        
-        # Check if position is imbalanced
-        gap_shares = abs(up - down)
-        max_shares = max(up, down)
-        
-        is_imbalanced = max_shares > 0 and gap_shares / max_shares > 0.1
-        is_lagging = (side == "up" and up < down) or (side == "down" and down < up)
-        
-        if is_imbalanced and is_lagging and gap_shares > 0:
-            # Calculate cost to fill the gap
-            desired_cost = gap_shares * limit_price
-            # Scale factor: min(5.0, desired_cost / batch_size)
-            scale_factor = min(5.0, desired_cost / self.batch_size)
-            order_cost = self.batch_size * scale_factor
-            # Cap at available budget
-            order_cost = min(available, order_cost)
-            # Ensure at least batch_size
-            order_cost = max(self.batch_size, order_cost)
-            return order_cost
-        
-        # Standard batch_size for balanced or leading side
-        return min(available, self.batch_size)
 
     def reset(self) -> None:
         """Reset strategy state."""
@@ -794,10 +691,28 @@ class PositionArbitrageStrategy(BaseStrategy):
             if rebalance_signal:
                 signals.append(rebalance_signal)
                 self._last_rebalancing_time = datetime.now()
+                
+                # Track the rebalancing order in strategy's pending list so that
+                # budget and ECR prediction account for it.  Previously omitted
+                # because market orders always filled immediately; now that we use
+                # aggressive limit orders, the fill may be delayed.
+                rebal_side = "up" if rebalance_signal.token_type == TokenType.YES else "down"
+                rebal_cost = rebalance_signal.size * rebalance_signal.target_price
+                self._order_counter += 1
+                self.pending_orders.append(LimitOrder(
+                    order_id=f"rebal_{rebal_side}_{self._order_counter}",
+                    side=rebal_side,
+                    price=rebalance_signal.target_price,
+                    shares=rebalance_signal.size,
+                    cost=rebal_cost,
+                    created_market_price=(price_data.up_price if rebal_side == "up"
+                                         else price_data.down_price),
+                ))
+                
                 # Record rebalancing event
                 self._rebalancing_events.append({
                     "timestamp": datetime.now().isoformat(),
-                    "side": "up" if rebalance_signal.token_type == TokenType.YES else "down",
+                    "side": rebal_side,
                     "size": rebalance_signal.size,
                     "price": rebalance_signal.target_price,
                     "balance_before": self.balance_ratio,
@@ -907,7 +822,6 @@ class PositionArbitrageStrategy(BaseStrategy):
         ecr_recovery_side = self._ecr_recovery_side  # "up", "down", or None
         
         # === Proportional order sizing ===
-        # === Proportional order sizing ===
         # In a skewed market (e.g., UP=0.70 DOWN=0.30), equal dollar orders
         # produce unbalanced shares.  Split the pair budget by price ratio
         # so both sides get equal shares.
@@ -920,10 +834,12 @@ class PositionArbitrageStrategy(BaseStrategy):
         
         pair_budget = self.batch_size * 2  # Total per order pair
         
-        # Minimum order cost: at least batch_size (could be very small with high granularity).
-        # For real trading, Polymarket enforces ~$2.50 minimum (5-share minimum).
-        # For simulation, use batch_size as floor to avoid dust orders.
-        min_order_cost = max(self.batch_size * 0.5, 0.01)  # Half batch_size or 1 cent
+        # Minimum order cost enforces the Polymarket minimum order size.
+        # Convert min_order_shares (default 5) to dollars using the cheaper
+        # side's limit price (worst case).  This ensures every order exceeds
+        # the exchange minimum, e.g. 5 shares × $0.30 = $1.50.
+        min_price = min(up_limit, down_limit)
+        min_order_cost = max(self.min_order_shares * min_price, self.batch_size * 0.5)
         while available >= min_order_cost and orders_created < max_orders_per_tick:
             # Calculate current imbalance
             gap_shares = abs(up_shares_total - down_shares_total)
@@ -1028,28 +944,19 @@ class PositionArbitrageStrategy(BaseStrategy):
 
         return signals
     
-    def _check_ecr_before_order(self, side: str, price: float, cost: float) -> bool:
-        """Check if placing this order would exceed ECR threshold."""
-        if not self.enable_ecr_stoploss:
-            return True
-        
-        shares = cost / price
-        projected_ecr = self.calculate_projected_ecr(side, shares, price)
-        
-        if projected_ecr >= self.ecr_threshold:
-            logger.debug(
-                f"[{self.name}] Order rejected: projected ECR {projected_ecr:.2%} "
-                f"would exceed threshold {self.ecr_threshold:.2%}"
-            )
-            return False
-        
-        return True
-    
     def _generate_rebalancing_order(self, price_data: PriceData) -> Optional[OrderSignal]:
         """
-        Generate a market order to rebalance severely imbalanced position.
+        Generate an aggressive limit order to rebalance severely imbalanced position.
         
-        Uses market_order_size_cap to limit order size and prevent excessive slippage.
+        Uses a limit price just below market (0.2% discount) so the order sits on
+        the book as a MAKER — paying 0% fee instead of 1.56% taker fee.  At 0.2%
+        below market, the order fills on the first micro-dip (typically within 1-3
+        seconds in 15-min crypto markets).
+        
+        If the order doesn't fill immediately it enters the pending queue and will
+        be checked every price update, or cancelled after order_timeout.
+        
+        Uses market_order_size_cap to limit order size.
         """
         if not self.enable_rebalancing:
             return None
@@ -1080,21 +987,27 @@ class PositionArbitrageStrategy(BaseStrategy):
         if shares_needed <= 0:
             return None
         
-        # Apply market order size cap (fraction of max position value)
+        # Enforce minimum order size (Polymarket minimum)
+        if shares_needed < self.min_order_shares:
+            shares_needed = float(self.min_order_shares)
+        
+        # Apply order size cap (fraction of total position cost)
         total_cost = self.up_position.cost + self.down_position.cost
         max_order_cost = total_cost * self.market_order_size_cap
         
-        # Use current market price (essentially a market order)
-        # Add small buffer to ensure fill
-        order_price = min(market_price * 1.01, 0.99)
+        # Aggressive limit price: 0.2% below market.
+        # This keeps us as MAKER (0% fee + 20% daily rebate) while still being
+        # close enough to market that the order fills on micro-dips.
+        # Previous approach: market_price * 1.01 (taker, 1.56% fee at 50¢).
+        order_price = max(market_price * 0.998, 0.01)
         
         # Calculate order cost and cap if necessary
         order_cost = shares_needed * order_price
         if order_cost > max_order_cost and max_order_cost > 0:
             capped_shares = max_order_cost / order_price
             logger.info(
-                f"[{self.name}] REBALANCING: Capping order from {shares_needed:.1f} to {capped_shares:.1f} shares "
-                f"(${order_cost:.2f} → ${max_order_cost:.2f}) due to size cap {self.market_order_size_cap:.0%}"
+                f"[{self.name}] REBALANCING: Capping from {shares_needed:.1f} to {capped_shares:.1f} shares "
+                f"(${order_cost:.2f} → ${max_order_cost:.2f}, cap={self.market_order_size_cap:.0%})"
             )
             shares_needed = capped_shares
             order_cost = max_order_cost
@@ -1105,14 +1018,15 @@ class PositionArbitrageStrategy(BaseStrategy):
             logger.warning(
                 f"[{self.name}] REBALANCING REJECTED: would push ECR to {projected_ecr:.2%} "
                 f"(threshold {self.ecr_threshold:.2%}). "
-                f"Skipping market order for {shares_needed:.1f} {underweight_side} shares."
+                f"Skipping {shares_needed:.1f} {underweight_side} shares."
             )
             self._last_rebalancing_rejection_time = datetime.now()
             return None
         
         logger.info(
-            f"[{self.name}] REBALANCING: Buying {shares_needed:.1f} {underweight_side} shares "
-            f"at ~${order_price:.3f} to improve balance from {self.balance_ratio:.2%} "
+            f"[{self.name}] REBALANCING: {underweight_side.upper()} {shares_needed:.1f} shares "
+            f"limit ${order_price:.4f} (market ${market_price:.4f}, -0.2%) "
+            f"balance {self.balance_ratio:.0%} → ~{target_ratio:.0%} "
             f"(projected ECR: {projected_ecr:.2%})"
         )
         
@@ -1249,304 +1163,275 @@ class PositionArbitrageStrategy(BaseStrategy):
         
         return up_limit, down_limit
 
+    # ------------------------------------------------------------------
+    # Order gating — split into focused sub-methods for readability
+    # ------------------------------------------------------------------
+
     def _should_place_order(self, side: str, limit_price: float, order_cost: Optional[float] = None) -> bool:
         """
-        Check if order should be placed with comprehensive ECR protection.
-        
-        Core rules:
-        - Must ensure ECR improves or stays within tolerance after order
-        - Phase 3: Focus on lagging side, avoid low probability tokens
-        
-        Args:
-            side: Order direction ('up' or 'down')
-            limit_price: Limit price for the order
-            order_cost: Order cost (uses batch_size if None)
-            
-        Returns:
-            True if order should be placed, False otherwise.
+        Top-level gate: should the strategy emit this order?
+
+        Delegates to focused sub-checks in priority order.  Returns as soon
+        as any sub-check produces a definitive answer.
         """
         if order_cost is None:
             order_cost = self.batch_size
-            
-        # Basic validation
-        if limit_price <= 0 or order_cost <= 0:
-            return False
-        market_price = self.current_up_price if side == "up" else self.current_down_price
-        if market_price is None or market_price <= 0:
-            return False
 
-        # Core condition: limit price must be <= market price
-        if limit_price > market_price:
+        # --- 1. Basic validation ------------------------------------------------
+        ok, market_price = self._check_order_basics(side, limit_price, order_cost)
+        if not ok:
             return False
-
-        # Note: Trend detection now only influences limit pricing (_calculate_limit_prices).
-        # Hard order blocking was removed because it conflicted with the imbalance check,
-        # creating a deadlock where neither side could place orders.
 
         up = self.up_position.shares
         down = self.down_position.shares
+
+        # --- 2. Position imbalance hard guard (>3× ratio) -----------------------
+        if not self._check_imbalance_guard(side, up, down):
+            return False
+
         phase = self.get_market_phase()
-        lagging_side = self.get_lagging_side()
-
-        # === Position imbalance guard ===
-        # Prevent further worsening of already-imbalanced positions.
-        # If the overweight side has > 3x the underweight side's shares,
-        # block new orders on the overweight side (only the lagging side may trade).
-        if up > 0 and down > 0:
-            max_shares = max(up, down)
-            min_shares = min(up, down)
-            imbalance_ratio = max_shares / min_shares if min_shares > 0 else float('inf')
-            overweight_side = "up" if up > down else "down"
-            if imbalance_ratio > 3.0 and side == overweight_side:
-                logger.debug(
-                    f"[{self.name}] Imbalance guard: blocking {side.upper()} order "
-                    f"(ratio={imbalance_ratio:.1f}x, UP={up:.1f}, DOWN={down:.1f})"
-                )
-                return False
-
-        # === Core ECR Protection ===
         current_ecr = self.effective_cost_rate
         predicted_ecr = self._predict_effective_cost_rate(side, limit_price, order_cost)
 
-        # Initial state (up=0, down=0): Check if balanced orders would be profitable
+        # --- 3. Initial position (no fills yet) ---------------------------------
         if up == 0 and down == 0:
-            # Calculate what ECR would be if we place orders on BOTH sides at limit prices
-            # This prevents placing single-sided orders when the market is untradeable
-            if self.current_up_price is None or self.current_down_price is None:
-                return False  # Can't calculate without valid prices
-            
-            price_sum = self.current_up_price + self.current_down_price
-            
-            if price_sum > 0:
-                # Calculate limit prices for both sides using same scale
-                scale = self.target_cost / price_sum if price_sum > self.target_cost else 1.0
-                up_limit = self.current_up_price * scale
-                down_limit = self.current_down_price * scale
-                
-                # Simulate equal dollar orders on both sides at their limit prices
-                up_shares = order_cost / up_limit if up_limit > 0 else 0
-                down_shares = order_cost / down_limit if down_limit > 0 else 0
-                total_cost_both = order_cost * 2
-                hedged_both = min(up_shares, down_shares)
-                
-                if hedged_both > 0:
-                    balanced_ecr = total_cost_both / hedged_both
-                    # When prices are asymmetric (e.g., 0.60/0.40), equal dollar investments
-                    # produce unequal shares, causing ECR > 1.0. Only perfectly balanced
-                    # prices (0.50/0.50) give ECR = target_cost (0.995).
-                    # 
-                    # For initial position building, use a progressive threshold:
-                    # - Starts lenient (1.5) and tightens to (1.1) over Phase 1
-                    # - The strategy will rebalance and improve ECR over time
-                    # - This allows trading in most market conditions
-                    initial_ecr_threshold = self._get_phase1_ecr_limit()
-                    if balanced_ecr > initial_ecr_threshold:
-                        logger.debug(
-                            f"[{self.name}] Order rejected {side.upper()}@{limit_price:.1%}(${order_cost:.2f}): "
-                            f"market untradeable - balanced ECR would be {balanced_ecr:.2%} > {initial_ecr_threshold:.0%} "
-                            f"(prices: {self.current_up_price:.2f}/{self.current_down_price:.2f})"
-                        )
-                        return False
-            
-            # Also check single-order ECR (for when pending orders exist)
-            # Phase 1: Use progressive threshold for aggressive building
-            # Phase 2-3: Use strict threshold (1.0)
-            initial_single_order_threshold = self._get_phase1_ecr_limit() if phase == 1 else 1.0
-            if predicted_ecr != float("inf") and predicted_ecr >= initial_single_order_threshold:
+            return self._check_initial_position(side, limit_price, order_cost, phase, predicted_ecr)
+
+        # --- 4. Recovery mode for severely imbalanced positions ------------------
+        recovery_result = self._check_recovery_mode(side, up, down, current_ecr, predicted_ecr)
+        if recovery_result is not None:
+            return recovery_result
+
+        # --- 5. Recovery-side exemption (from balance rule in on_price_update) ---
+        recovery_exempt = self._check_recovery_exemption(
+            side, phase, current_ecr, predicted_ecr, market_price
+        )
+        if recovery_exempt is not None:
+            return recovery_exempt
+
+        # --- 6. ECR protection per phase ----------------------------------------
+        if not self._check_ecr_protection(side, up, down, phase, limit_price, order_cost,
+                                          current_ecr, predicted_ecr):
+            return False
+
+        # --- 7. Phase 3 settlement protection -----------------------------------
+        if phase == 3:
+            return self._check_phase3(side, market_price, current_ecr, predicted_ecr)
+
+        # --- 8. Phase 1-2 imbalance preference ----------------------------------
+        return self._check_imbalance_preference(side, up, down)
+
+    # ---- Sub-checks (private) ------------------------------------------------
+
+    def _check_order_basics(self, side: str, limit_price: float, order_cost: float
+                            ) -> Tuple[bool, Optional[float]]:
+        """Validate basic order parameters.  Returns (ok, market_price)."""
+        if limit_price <= 0 or order_cost <= 0:
+            return False, None
+        market_price = self.current_up_price if side == "up" else self.current_down_price
+        if market_price is None or market_price <= 0:
+            return False, None
+        if limit_price > market_price:
+            return False, None
+        return True, market_price
+
+    def _check_imbalance_guard(self, side: str, up: float, down: float) -> bool:
+        """Block overweight-side orders when imbalance exceeds 3×."""
+        if up > 0 and down > 0:
+            max_s, min_s = max(up, down), min(up, down)
+            ratio = max_s / min_s if min_s > 0 else float("inf")
+            overweight = "up" if up > down else "down"
+            if ratio > 3.0 and side == overweight:
                 logger.debug(
-                    f"[{self.name}] Order rejected {side.upper()}@{limit_price:.1%}(${order_cost:.2f}): "
-                    f"initial order would cause ECR >= {initial_single_order_threshold:.0%} (predicted {predicted_ecr:.1%})"
+                    f"[{self.name}] Imbalance guard: blocking {side.upper()} "
+                    f"(ratio={ratio:.1f}×, UP={up:.1f}, DOWN={down:.1f})"
                 )
+                return False
+        return True
+
+    def _check_initial_position(self, side: str, limit_price: float,
+                                order_cost: float, phase: int,
+                                predicted_ecr: float) -> bool:
+        """Gate for the very first orders when no position exists."""
+        if self.current_up_price is None or self.current_down_price is None:
+            return False
+
+        price_sum = self.current_up_price + self.current_down_price
+        if price_sum > 0:
+            scale = self.target_cost / price_sum if price_sum > self.target_cost else 1.0
+            up_limit = self.current_up_price * scale
+            down_limit = self.current_down_price * scale
+
+            up_shares = order_cost / up_limit if up_limit > 0 else 0
+            down_shares = order_cost / down_limit if down_limit > 0 else 0
+            hedged = min(up_shares, down_shares)
+
+            if hedged > 0:
+                balanced_ecr = (order_cost * 2) / hedged
+                threshold = self._get_phase1_ecr_limit()
+                if balanced_ecr > threshold:
+                    logger.debug(
+                        f"[{self.name}] Initial rejected {side.upper()}@{limit_price:.1%}"
+                        f"(${order_cost:.2f}): balanced ECR {balanced_ecr:.2%} > {threshold:.0%}"
+                    )
+                    return False
+
+        single_threshold = self._get_phase1_ecr_limit() if phase == 1 else 1.0
+        if predicted_ecr != float("inf") and predicted_ecr >= single_threshold:
+            logger.debug(
+                f"[{self.name}] Initial rejected {side.upper()}@{limit_price:.1%}"
+                f"(${order_cost:.2f}): predicted ECR {predicted_ecr:.1%} >= {single_threshold:.0%}"
+            )
+            return False
+        return True
+
+    def _check_recovery_mode(self, side: str, up: float, down: float,
+                             current_ecr: float, predicted_ecr: float
+                             ) -> Optional[bool]:
+        """
+        Handle severely imbalanced positions (balance < 50%).
+
+        Returns True/False when a definitive decision is made, or None to
+        continue to the next sub-check.
+        """
+        balance = self.balance_ratio
+        if balance >= 0.50 or (up == 0 and down == 0):
+            # Not in recovery territory — edge-case: infinite ECR with balance >= 0.50
+            if current_ecr == float("inf"):
+                return False if predicted_ecr == float("inf") else True
+            return None  # Continue to next check
+
+        minority = "up" if up < down else "down"
+
+        if current_ecr == float("inf") and predicted_ecr == float("inf"):
+            logger.debug(
+                f"[{self.name}] Recovery rejected {side.upper()}: "
+                f"would stay single-sided (ECR ∞)"
+            )
+            return False
+
+        if side == minority:
+            logger.debug(
+                f"[{self.name}] Recovery order: {side.upper()} "
+                f"(balance={balance:.2f}, ECR {current_ecr:.2f}→{predicted_ecr:.2f})"
+            )
+            return True
+
+        logger.debug(
+            f"[{self.name}] Recovery blocked majority {side.upper()} "
+            f"(balance={balance:.2f})"
+        )
+        return False
+
+    def _check_recovery_exemption(self, side: str, phase: int,
+                                  current_ecr: float, predicted_ecr: float,
+                                  market_price: float) -> Optional[bool]:
+        """
+        Handle orders pre-approved by the balance rule (_ecr_recovery_side).
+
+        Returns True/False when a definitive decision is made, or None to
+        continue to the next sub-check.
+        """
+        if self._ecr_recovery_side is None or side != self._ecr_recovery_side:
+            return None  # Not a recovery-exempted order
+
+        if phase == 3:
+            if current_ecr < 1.0:
+                logger.debug(f"[{self.name}] Phase 3 recovery rejected — already profitable")
+                return False
+            if predicted_ecr >= current_ecr:
+                logger.debug(f"[{self.name}] Phase 3 recovery rejected — wouldn't improve ECR")
                 return False
             return True
 
-        # === Recovery bypass for imbalanced positions ===
-        # When balance_ratio is low, ECR is high because min(up, down) is small.
-        # Normal ECR thresholds (1.5 in Phase 1, 1.05 in Phase 2-3) would reject
-        # ALL orders, creating a permanent deadlock.  We must allow minority-side
-        # orders to gradually restore balance.
-        #
-        # Threshold 0.50 means: if minority side has < 50% of majority's shares,
-        # enter recovery mode.  Previous value 0.15 was too narrow — a position
-        # with 3:1 imbalance (balance=0.33) would NOT trigger recovery and
-        # then Phase 1's 1.5 threshold would block everything.
-        balance = self.balance_ratio
-        if balance < 0.50 and (up > 0 or down > 0):
-            minority_side = "up" if up < down else "down"
-            
-            if current_ecr == float("inf") and predicted_ecr == float("inf"):
-                # Would continue single-sided — reject
-                logger.debug(
-                    f"[{self.name}] Order rejected {side.upper()}@{limit_price:.1%}(${order_cost:.2f}): "
-                    f"would continue single-sided position (ECR stays infinite)"
-                )
-                return False
-            
-            if side == minority_side:
-                # Minority-side order in recovery mode — always allow
-                logger.debug(
-                    f"[{self.name}] Recovery order: {side.upper()}@{limit_price:.1%}(${order_cost:.2f}) "
-                    f"(balance={balance:.2f}, ECR {current_ecr:.2f}→{predicted_ecr:.2f})"
-                )
-                return True
-            else:
-                # Majority-side order — block (imbalance guard should also catch this)
-                logger.debug(
-                    f"[{self.name}] Order rejected {side.upper()}@{limit_price:.1%}: "
-                    f"majority side blocked during recovery (balance={balance:.2f})"
-                )
-                return False
-        
-        if current_ecr == float("inf"):
-            # Single-sided but balance_ratio >= 0.50 shouldn't happen, but handle gracefully
-            if predicted_ecr == float("inf"):
-                return False
-            return True
-        
-        # === Recovery-side exemption ===
-        # When the balance rule (on_price_update) has decided "minority side only"
-        # and this order IS on the recovery side, it's already pre-approved.
-        # Don't block it with absolute ECR thresholds — those thresholds exist
-        # to prevent building a BAD position, but recovery orders FIX a bad position.
-        # Only sanity-check: the order shouldn't make ECR worse.
-        is_recovery_order = (self._ecr_recovery_side is not None 
-                             and side == self._ecr_recovery_side)
-        
-        if is_recovery_order:
-            # In Phase 3, recovery orders must also obey Phase 3 rules
-            # (no new orders when profitable, must strictly improve ECR)
-            if phase == 3:
-                if current_ecr < 1.0:
-                    logger.debug(
-                        f"[{self.name}] Phase 3: recovery order rejected — "
-                        f"ECR={current_ecr:.2%} already profitable, protecting gain"
-                    )
-                    return False
-                if predicted_ecr >= current_ecr:
-                    logger.debug(
-                        f"[{self.name}] Phase 3: recovery order rejected {side.upper()} — "
-                        f"would not improve ECR ({current_ecr:.2%} → {predicted_ecr:.2%})"
-                    )
-                    return False
-                return True
-            
-            if predicted_ecr <= current_ecr + 0.02:
-                # Recovery order that improves or maintains ECR — always allow
-                return True
-            else:
-                logger.debug(
-                    f"[{self.name}] Recovery order rejected {side.upper()}@{limit_price:.1%}(${order_cost:.2f}): "
-                    f"would worsen ECR {current_ecr:.1%} → {predicted_ecr:.1%}"
-                )
-                return False
-        
-        # === Normal orders (not in recovery mode) ===
+        if predicted_ecr <= current_ecr + 0.02:
+            return True  # Improves or maintains ECR
+
+        logger.debug(
+            f"[{self.name}] Recovery exemption rejected {side.upper()}: "
+            f"ECR {current_ecr:.1%}→{predicted_ecr:.1%}"
+        )
+        return False
+
+    def _check_ecr_protection(self, side: str, up: float, down: float,
+                              phase: int, limit_price: float, order_cost: float,
+                              current_ecr: float, predicted_ecr: float) -> bool:
+        """ECR-based order rejection for Phase 1 vs Phase 2-3."""
         if phase == 1:
-            # Phase 1: Aggressive position building with progressive cap
-            initial_ecr_threshold = self._get_phase1_ecr_limit()
-            if predicted_ecr >= initial_ecr_threshold:
+            cap = self._get_phase1_ecr_limit()
+            if predicted_ecr >= cap:
                 logger.debug(
-                    f"[{self.name}] Phase 1 order rejected {side.upper()}@{limit_price:.1%}(${order_cost:.2f}): "
-                    f"ECR would exceed {initial_ecr_threshold:.0%} (predicted {predicted_ecr:.1%})"
+                    f"[{self.name}] Phase 1 ECR cap: {side.upper()}@{limit_price:.1%} "
+                    f"rejected (predicted {predicted_ecr:.1%} >= {cap:.0%})"
                 )
                 return False
         else:
-            # Phase 2-3: ECR protection with balance awareness
             ecr_tolerance = 0.02
-            
-            improves_balance = (
-                (side == "up" and up < down) or
-                (side == "down" and down < up)
-            )
-            
-            if improves_balance:
-                # Balance-improving orders: allow as long as ECR doesn't get WORSE.
-                # Previous bug: blocking when predicted_ecr >= ecr_threshold (1.05)
-                # caused a deadlock when ECR was already far above 1.05 — every
-                # recovery order was rejected even though it would improve ECR.
-                # Fix: only block if the order makes ECR worse, not based on
-                # absolute threshold.  An order that moves ECR 1.45→1.43 is good.
+            improves = (side == "up" and up < down) or (side == "down" and down < up)
+
+            if improves:
                 if predicted_ecr > current_ecr + ecr_tolerance:
                     logger.debug(
-                        f"[{self.name}] Balance order rejected {side.upper()}@{limit_price:.1%}(${order_cost:.2f}): "
-                        f"ECR would worsen {current_ecr:.1%} → {predicted_ecr:.1%}"
+                        f"[{self.name}] Balance order rejected {side.upper()}: "
+                        f"ECR {current_ecr:.1%}→{predicted_ecr:.1%}"
                     )
                     return False
             else:
-                # Non-balance-improving orders: stricter rules
                 if predicted_ecr > current_ecr + ecr_tolerance:
                     logger.debug(
-                        f"[{self.name}] Order rejected {side.upper()}@{limit_price:.1%}(${order_cost:.2f}): "
-                        f"ECR would worsen beyond tolerance {current_ecr:.1%} → {predicted_ecr:.1%}"
+                        f"[{self.name}] Order rejected {side.upper()}: "
+                        f"ECR worsens {current_ecr:.1%}→{predicted_ecr:.1%}"
                     )
                     return False
-                
                 if predicted_ecr >= 1.0:
                     logger.debug(
-                        f"[{self.name}] Order rejected {side.upper()}@{limit_price:.1%}(${order_cost:.2f}): "
-                        f"ECR would exceed 100% (predicted {predicted_ecr:.1%})"
+                        f"[{self.name}] Order rejected {side.upper()}: "
+                        f"ECR would exceed 100% ({predicted_ecr:.1%})"
                     )
                     return False
+        return True
 
-        # === Phase 3 special logic: protect profits, recover only ===
-        # Near settlement, stop building position to avoid ECR oscillation.
-        # BTC showed ECR bouncing 0.95→1.08→0.98→1.06 endlessly because
-        # both-side fills constantly shift balance.
-        if phase == 3:
-            # Don't buy low probability side (price < threshold)
-            if market_price < self.low_prob_threshold:
-                logger.debug(
-                    f"[{self.name}] Phase 3: rejecting low probability {side.upper()} (price {market_price:.1%})"
-                )
-                return False
+    def _check_phase3(self, side: str, market_price: float,
+                      current_ecr: float, predicted_ecr: float) -> bool:
+        """Phase 3 settlement protection: lock profits, recovery only."""
+        if market_price < self.low_prob_threshold:
+            logger.debug(f"[{self.name}] Phase 3: low prob {side.upper()} ({market_price:.1%})")
+            return False
 
-            # If already profitable, stop — protect the gain
-            if current_ecr < 1.0:
-                logger.debug(
-                    f"[{self.name}] Phase 3: ECR={current_ecr:.2%} < 100%, "
-                    f"no new orders — protecting profit"
-                )
-                return False
+        if current_ecr < 1.0:
+            logger.debug(f"[{self.name}] Phase 3: profitable ECR={current_ecr:.2%}, locking")
+            return False
 
-            # Unprofitable: only allow orders that actually improve ECR
-            if predicted_ecr >= current_ecr:
-                logger.debug(
-                    f"[{self.name}] Phase 3: rejecting {side.upper()} — "
-                    f"would not improve ECR ({current_ecr:.2%} → {predicted_ecr:.2%})"
-                )
-                return False
+        if predicted_ecr >= current_ecr:
+            logger.debug(
+                f"[{self.name}] Phase 3: {side.upper()} wouldn't improve ECR "
+                f"({current_ecr:.2%}→{predicted_ecr:.2%})"
+            )
+            return False
 
-            # Also focus on lagging side only
-            if lagging_side != "balanced" and side != lagging_side:
-                logger.debug(
-                    f"[{self.name}] Phase 3: stopping leading side {side.upper()}, focusing on {lagging_side.upper()}"
-                )
-                return False
+        lagging = self.get_lagging_side()
+        if lagging != "balanced" and side != lagging:
+            logger.debug(f"[{self.name}] Phase 3: leading {side.upper()} paused")
+            return False
 
-            return True
+        return True
 
-        # === Phase 1-2 logic ===
-        max_shares = max(up, down)
-        min_shares = min(up, down)
-
-        # When imbalanced (>10%), prefer lagging side but allow trending side through
-        if max_shares > 0 and (max_shares - min_shares) / max_shares > 0.1:
+    def _check_imbalance_preference(self, side: str, up: float, down: float) -> bool:
+        """Phase 1-2: prefer lagging side, allow trending side through."""
+        max_s, min_s = max(up, down), min(up, down)
+        if max_s > 0 and (max_s - min_s) / max_s > 0.1:
             is_lagging = (side == "up" and up < down) or (side == "down" and down < up)
             if is_lagging:
-                return True  # Lagging side always allowed
-            
-            # Leading side: allow if it's the trending direction
-            # The trend pricing already makes the trending side more aggressive,
-            # so letting it through here avoids the deadlock
+                return True
+
             if self.enable_trend_detection:
                 trend_side, confidence = self._trend_detector.get_trend()
                 if confidence > 0.3 and side == trend_side:
-                    return True  # Trending side allowed even if leading
-            
-            return False  # Leading side paused (no trend or weak trend)
+                    return True
 
-        # Balanced: allow both sides
-        return True
+            return False
+
+        return True  # Balanced: allow both sides
 
     def _create_signal(self, side: str, price: float, cost: float) -> OrderSignal:
         """Create an order signal."""

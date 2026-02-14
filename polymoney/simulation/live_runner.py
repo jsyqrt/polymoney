@@ -33,6 +33,66 @@ from polymoney.strategy.builtin.position_arbitrage import PositionArbitrageStrat
 logger = get_logger("simulation.live_runner")
 
 
+# ---------------------------------------------------------------------------
+# Polymarket fee model
+# ---------------------------------------------------------------------------
+# Most Polymarket markets are fee-free.  15-min crypto markets charge a
+# TAKER-only fee that peaks at 1.56% effective rate when the share price
+# is near $0.50 and declines to ~0% at the extremes ($0.01 and $0.99).
+# MAKERS (limit orders sitting on the book) pay NO fee and receive a
+# daily 20% rebate from the collected taker fees.
+#
+# Since our strategy places limit orders (maker), normal fills are fee-free.
+# Only rebalancing "market" orders (which cross the spread as taker) incur
+# fees.  For buy taker orders, the fee is collected in shares — fewer shares
+# are received.
+#
+# Official fee table:
+#   https://docs.polymarket.com/polymarket-learn/trading/maker-rebates-program
+#
+# The approximation below uses (4*p*(1-p))^1.8 * MAX_FEE, which fits the
+# official table within ~0.1% at all price points.
+# ---------------------------------------------------------------------------
+
+_TAKER_FEE_MAX = 0.0156   # 1.56% max effective rate at p=0.50
+_TAKER_FEE_EXPONENT = 1.8  # Steepness of the decline toward extremes
+
+
+def calculate_taker_fee_rate(price: float) -> float:
+    """
+    Calculate the effective taker fee rate for a Polymarket 15-min crypto market.
+
+    Args:
+        price: Share price (0.0 to 1.0).
+
+    Returns:
+        Effective fee rate as a fraction (e.g. 0.0156 = 1.56%).
+        Multiply by trade value to get absolute fee in USDC.
+    """
+    if price <= 0.01 or price >= 0.99:
+        return 0.0
+    parabolic = 4.0 * price * (1.0 - price)  # Peaks at 1.0 when price=0.50
+    return _TAKER_FEE_MAX * (parabolic ** _TAKER_FEE_EXPONENT)
+
+
+def apply_taker_fee_to_shares(shares: float, fill_price: float) -> float:
+    """
+    Apply taker fee to a buy order, reducing shares received.
+
+    On Polymarket, buy taker fees are collected in shares:
+    you pay the full USDC amount but receive fewer shares.
+
+    Args:
+        shares: Shares before fee deduction.
+        fill_price: Average fill price per share.
+
+    Returns:
+        Shares after fee deduction.
+    """
+    fee_rate = calculate_taker_fee_rate(fill_price)
+    return shares * (1.0 - fee_rate)
+
+
 @dataclass
 class OrderbookSnapshot:
     """
@@ -594,9 +654,11 @@ class MarketSimulation:
         elif side == "down" and self.last_down_spread > 0:
             real_spread = self.last_down_spread
         else:
-            # Fallback: must exceed strategy's target_cost discount (4% for 0.96)
-            # so the spread model can actually fill limit orders.
-            real_spread = 0.06  # 6%
+            # Conservative fallback when no real data available.
+            # 3% is a realistic upper bound for 15-min crypto market spreads
+            # on Polymarket (typical range 1-5%).  The previous 6% was too
+            # generous and allowed almost all limit orders to fill instantly.
+            real_spread = 0.03  # 3%
         
         # Minimum spread floor
         return max(real_spread, 0.005)  # At least 0.5%
@@ -663,7 +725,14 @@ class MarketSimulation:
             # Orderbook exists but limit price is below all asks - no fill
             return None
         
-        # Fallback: simple spread-based model (no depth data)
+        # Fallback: spread-based model with probabilistic fills (no depth data)
+        #
+        # Real markets don't fill every limit order that's within the spread.
+        # A limit order requires a TAKER to cross the spread and hit it.
+        # Model: fill probability decreases as the limit price moves further
+        # from the market price, and larger orders are harder to fill.
+        import random
+        
         spread_tolerance = self._get_effective_spread(side)
         price_diff = (market_price - limit_price) / market_price if market_price > 0 else 0
         
@@ -672,12 +741,35 @@ class MarketSimulation:
         size_slippage = min(0.005, order_value * 0.0001)  # Cap at 0.5%
         
         if limit_price >= market_price:
-            # Aggressive order - fill at market + slippage
+            # Aggressive (taker) order — fill at market + slippage
             fill_price = min(market_price * (1 + size_slippage), 0.99)
             return (fill_price, size)
         elif price_diff <= spread_tolerance:
-            # Within spread tolerance - fill at limit price
-            return (limit_price, size)
+            # Within spread tolerance — probabilistic fill
+            #
+            # Fill probability:
+            #   - 90% when limit == market (right at the top of the book)
+            #   - Linearly decays to 20% at the edge of the spread
+            #   - Larger orders get a penalty (×0.8 for big orders)
+            #
+            # This prevents the old behavior where ANY limit within the spread
+            # filled 100% of the time, which was unrealistically optimistic.
+            proximity = 1.0 - (price_diff / spread_tolerance) if spread_tolerance > 0 else 1.0
+            base_probability = 0.20 + 0.70 * proximity  # 20% → 90%
+            
+            # Size penalty: orders > 50 shares are harder to fill without
+            # visible orderbook liquidity
+            size_penalty = 1.0 if size <= 50 else max(0.5, 1.0 - (size - 50) * 0.002)
+            fill_probability = base_probability * size_penalty
+            
+            if random.random() < fill_probability:
+                return (limit_price, size)
+            else:
+                logger.debug(
+                    f"[{self.slug}] Spread model: {side.upper()} limit={limit_price:.4f} "
+                    f"not filled (prob={fill_probability:.0%}, diff={price_diff:.2%})"
+                )
+                return None
         
         return None
 
@@ -714,15 +806,22 @@ class MarketSimulation:
         self._next_order_id += 1
         order_id = f"{self.slug}_{side_str}_{self._next_order_id}"
 
+        market_price = price_data.up_price if side_str == "up" else price_data.down_price
+        
+        # Detect taker orders: any order priced at or above market crosses
+        # the spread as a taker and incurs fees on Polymarket.
+        # All current strategy orders are maker (limit below market),
+        # including rebalancing orders (market × 0.998).
+        is_taker = signal.target_price >= market_price
+
         order = {
             "order_id": order_id,
             "side": side_str,
             "size": signal.size,
             "price": signal.target_price,
             "timestamp": time.time(),
+            "is_taker": is_taker,
         }
-
-        market_price = price_data.up_price if side_str == "up" else price_data.down_price
 
         # Link runner order_id to the most recently added strategy pending order
         self._link_order_id(order_id, side_str, signal.target_price)
@@ -867,9 +966,27 @@ class MarketSimulation:
         self.pending_orders = remaining
 
     def _execute_fill(self, order: Dict[str, Any], fill_price: float) -> None:
-        """Execute an order fill."""
+        """
+        Execute an order fill, applying taker fee when applicable.
+        
+        Limit orders (maker) incur no fee on Polymarket.
+        Rebalancing / market orders (taker) incur a fee that reduces shares received.
+        The ``is_taker`` flag in the order dict controls this.
+        """
         side = order["side"]
         size = order["size"]
+        
+        # Apply taker fee (rebalancing orders only)
+        if order.get("is_taker", False):
+            fee_rate = calculate_taker_fee_rate(fill_price)
+            size_after_fee = apply_taker_fee_to_shares(size, fill_price)
+            if fee_rate > 0.0001:
+                logger.info(
+                    f"[{self.slug}] Taker fee: {side.upper()} {size:.1f} → {size_after_fee:.1f} shares "
+                    f"(fee rate={fee_rate:.2%}, cost=${size * fill_price:.4f})"
+                )
+            size = size_after_fee
+        
         cost = size * fill_price
 
         self.result.orders_filled += 1
