@@ -529,11 +529,18 @@ class WebSocketManager:
                     "best_ask": token_price.best_ask,
                 })
                 
-                # Emit full orderbook depth for fill simulation
+                # Emit orderbook depth for fill simulation.
+                # Mark small updates as incremental deltas: if the message
+                # has ≤ 3 levels total, it's likely a level change rather
+                # than a full snapshot (Polymarket snapshots have 10+ levels).
+                total_levels = len(bids) + len(asks)
+                is_incremental = total_levels <= 3
+                
                 self._emit_event("token_orderbook", asset_id, {
                     "token_id": asset_id,
                     "bids": bids,
                     "asks": asks,
+                    "incremental": is_incremental,
                 })
         else:
             # Legacy: combined orderbook (no asset_id)

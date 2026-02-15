@@ -59,6 +59,13 @@ strategy:
   # Reduced from 4 to 2: fewer orders per tick means less waste from stale orders.
   max_orders_per_tick: 2
 
+  # Adaptive target_cost: dynamically adjusts discount based on orderbook spread.
+  # High liquidity (tight spread) → smaller discount (higher target).
+  # Low liquidity (wide spread) → larger discount (lower target).
+  enable_adaptive_target: true
+  adaptive_target_min: 0.94   # Floor for wide-spread (illiquid) markets
+  adaptive_target_max: 0.98   # Ceiling for tight-spread (liquid) markets
+
 # ---------------------------------------------------------------------------
 # Risk Control Parameters
 # ---------------------------------------------------------------------------

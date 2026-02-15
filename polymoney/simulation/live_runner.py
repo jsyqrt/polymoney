@@ -28,7 +28,7 @@ from polymoney.data.real_data_fetcher import (
     PriceUpdate,
 )
 from polymoney.data.websocket_client import WebSocketManager
-from polymoney.strategy.builtin.position_arbitrage import PositionArbitrageStrategy
+from polymoney.strategy.builtin.position_arbitrage import LimitOrder, PositionArbitrageStrategy
 
 logger = get_logger("simulation.live_runner")
 
@@ -91,6 +91,139 @@ def apply_taker_fee_to_shares(shares: float, fill_price: float) -> float:
     """
     fee_rate = calculate_taker_fee_rate(fill_price)
     return shares * (1.0 - fee_rate)
+
+
+class FillCalibrationTracker:
+    """
+    Tracks fill attempt outcomes for probability model calibration.
+    
+    Records each fill evaluation event — the predicted fill probability and
+    whether the order actually filled — enabling post-hoc analysis to tune
+    the spread-based probability model parameters (base_probability range,
+    size_penalty curve, proximity mapping).
+    
+    Usage:
+        tracker = FillCalibrationTracker()
+        tracker.record(probability=0.65, filled=True, ...)
+        
+        # After simulation, export for analysis:
+        stats = tracker.get_calibration_stats()
+        tracker.export_to_jsonl("fill_calibration.jsonl")
+    """
+    
+    def __init__(self):
+        self._events: List[Dict[str, Any]] = []
+    
+    def record(
+        self,
+        side: str,
+        limit_price: float,
+        market_price: float,
+        size: float,
+        spread_tolerance: float,
+        fill_probability: float,
+        filled: bool,
+        fill_source: str = "spread",  # "depth", "spread", or "taker"
+        slug: str = "",
+    ) -> None:
+        """
+        Record a fill evaluation event.
+        
+        Args:
+            side: "up" or "down"
+            limit_price: Order's limit price
+            market_price: Market price at evaluation time
+            size: Order size in shares
+            spread_tolerance: Effective spread used for probability calculation
+            fill_probability: Computed fill probability (0-1)
+            filled: Whether the order actually filled
+            fill_source: Which fill model was used
+            slug: Market slug for reference
+        """
+        price_diff = (market_price - limit_price) / market_price if market_price > 0 else 0
+        self._events.append({
+            "timestamp": time.time(),
+            "slug": slug,
+            "side": side,
+            "limit_price": limit_price,
+            "market_price": market_price,
+            "price_diff": price_diff,
+            "size": size,
+            "spread_tolerance": spread_tolerance,
+            "fill_probability": fill_probability,
+            "filled": filled,
+            "fill_source": fill_source,
+        })
+    
+    def get_calibration_stats(self) -> Dict[str, Any]:
+        """
+        Compute calibration statistics for model tuning.
+        
+        Groups fill events by probability bucket (0-10%, 10-20%, ..., 90-100%)
+        and computes actual fill rate per bucket. A well-calibrated model has
+        actual_rate ≈ bucket_midpoint for each bucket.
+        
+        Returns:
+            Dict with bucket stats, total events, overall fill rate, and
+            Brier score (lower is better).
+        """
+        if not self._events:
+            return {"total_events": 0}
+        
+        # Only look at spread-model events (depth fills are always fill/no-fill)
+        spread_events = [e for e in self._events if e["fill_source"] == "spread"]
+        
+        if not spread_events:
+            return {"total_events": len(self._events), "spread_events": 0}
+        
+        # Group by probability bucket
+        buckets: Dict[str, List[bool]] = {}
+        for i in range(10):
+            bucket_key = f"{i*10}-{(i+1)*10}%"
+            buckets[bucket_key] = []
+        
+        brier_sum = 0.0
+        for event in spread_events:
+            prob = event["fill_probability"]
+            filled = event["filled"]
+            bucket_idx = min(9, int(prob * 10))
+            bucket_key = f"{bucket_idx*10}-{(bucket_idx+1)*10}%"
+            buckets[bucket_key].append(filled)
+            brier_sum += (prob - (1.0 if filled else 0.0)) ** 2
+        
+        brier_score = brier_sum / len(spread_events) if spread_events else 0
+        
+        bucket_stats = {}
+        for key, fills in buckets.items():
+            if fills:
+                bucket_stats[key] = {
+                    "count": len(fills),
+                    "actual_fill_rate": sum(fills) / len(fills),
+                }
+        
+        total_fills = sum(1 for e in spread_events if e["filled"])
+        return {
+            "total_events": len(self._events),
+            "spread_events": len(spread_events),
+            "spread_fill_rate": total_fills / len(spread_events),
+            "brier_score": brier_score,
+            "buckets": bucket_stats,
+        }
+    
+    def export_to_jsonl(self, filepath: str) -> int:
+        """
+        Export all events to a JSONL file for offline analysis.
+        
+        Returns:
+            Number of events exported.
+        """
+        import json as _json
+        with open(filepath, "a") as f:
+            for event in self._events:
+                f.write(_json.dumps(event) + "\n")
+        count = len(self._events)
+        self._events.clear()
+        return count
 
 
 @dataclass
@@ -224,6 +357,51 @@ class OrderbookSnapshot:
         
         return cls(bids=bids, asks=asks, timestamp=time.time())
     
+    def apply_incremental_update(self, changes: Dict[str, Any]) -> None:
+        """
+        Apply incremental orderbook changes (adds, removes, updates).
+        
+        Supports delta messages from WS that modify individual levels instead
+        of sending the full orderbook each time. This keeps the local orderbook
+        more up-to-date between full REST snapshots.
+        
+        Expected format:
+            {
+                "bids": [{"price": "0.50", "size": "100"}, ...],
+                "asks": [{"price": "0.55", "size": "50"}, ...],
+            }
+        
+        A level with size=0 removes that price level.
+        A level with size>0 adds or replaces that price level.
+        """
+        self.timestamp = time.time()
+        
+        for raw_level in changes.get("bids", []):
+            price, size = self._parse_level(raw_level)
+            if price is None:
+                continue
+            # Remove existing level at this price
+            self.bids = [(p, s) for p, s in self.bids if abs(p - price) > 0.0001]
+            # Add back if size > 0
+            if size is not None and size > 0:
+                self.bids.append((price, size))
+        # Re-sort bids descending
+        if changes.get("bids"):
+            self.bids.sort(key=lambda x: x[0], reverse=True)
+        
+        for raw_level in changes.get("asks", []):
+            price, size = self._parse_level(raw_level)
+            if price is None:
+                continue
+            # Remove existing level at this price
+            self.asks = [(p, s) for p, s in self.asks if abs(p - price) > 0.0001]
+            # Add back if size > 0
+            if size is not None and size > 0:
+                self.asks.append((price, size))
+        # Re-sort asks ascending
+        if changes.get("asks"):
+            self.asks.sort(key=lambda x: x[0])
+
     @staticmethod
     def _parse_level(level) -> Tuple[Optional[float], Optional[float]]:
         """Parse a single orderbook level into (price, size)."""
@@ -453,6 +631,60 @@ class SimulationStats:
         }
 
 
+class LiquidityCompetitionTracker:
+    """
+    Tracks fill activity across all active markets to model liquidity competition.
+    
+    When multiple markets are filling orders simultaneously, real-world liquidity
+    is shared among them. This tracker records recent fill events and provides a
+    competition factor that can reduce fill probability for the spread-based model.
+    
+    Competition factor:
+      - 1 active market filling: no penalty (factor=1.0)
+      - 3+ markets filling concurrently in last 5s: ~20% penalty (factor=0.8)
+      - 6+ markets: ~40% penalty (factor=0.6)
+    """
+    
+    def __init__(self, window_seconds: float = 5.0):
+        self.window_seconds = window_seconds
+        self._fill_events: List[Tuple[float, str]] = []  # (timestamp, slug)
+    
+    def record_fill(self, slug: str) -> None:
+        """Record that a market had a fill."""
+        self._fill_events.append((time.time(), slug))
+        # Prune old events
+        cutoff = time.time() - self.window_seconds * 2
+        self._fill_events = [(t, s) for t, s in self._fill_events if t >= cutoff]
+    
+    def get_competition_factor(self, exclude_slug: str = "") -> float:
+        """
+        Get fill probability multiplier based on concurrent fill activity.
+        
+        Args:
+            exclude_slug: Exclude this market from the count (self)
+            
+        Returns:
+            Multiplier from 0.6 to 1.0 (lower = more competition).
+        """
+        now = time.time()
+        cutoff = now - self.window_seconds
+        
+        # Count distinct markets with recent fills
+        active_slugs = set()
+        for ts, slug in self._fill_events:
+            if ts >= cutoff and slug != exclude_slug:
+                active_slugs.add(slug)
+        
+        concurrent = len(active_slugs)
+        if concurrent <= 1:
+            return 1.0
+        
+        # Penalty: each additional concurrent market reduces probability by ~10%
+        # Cap at 0.6 (40% max penalty with 6+ concurrent markets)
+        penalty = min(0.4, (concurrent - 1) * 0.10)
+        return 1.0 - penalty
+
+
 class MarketSimulation:
     """Manages simulation for a single market."""
 
@@ -460,6 +692,7 @@ class MarketSimulation:
         self,
         market: Dict[str, Any],
         config: SimulationConfig,
+        liquidity_tracker: Optional[LiquidityCompetitionTracker] = None,
     ):
         self.market = market
         self.config = config
@@ -491,8 +724,10 @@ class MarketSimulation:
             start_time=time.time(),
         )
 
-        # Track pending orders (each has a unique 'order_id' key)
-        self.pending_orders: List[Dict[str, Any]] = []
+        # Pending orders: unified with strategy.pending_orders as single source.
+        # Runner accesses strategy.pending_orders directly (LimitOrder objects).
+        # This legacy list is kept only as a thin alias for backward compatibility
+        # with code that accesses self.pending_orders.
         self._next_order_id: int = 0
 
         # Last price and timestamp for staleness detection
@@ -522,6 +757,27 @@ class MarketSimulation:
         # Orderbook depth cache (per token side)
         self.up_orderbook: Optional[OrderbookSnapshot] = None
         self.down_orderbook: Optional[OrderbookSnapshot] = None
+        
+        # Fill probability calibration tracker
+        self.fill_tracker = FillCalibrationTracker()
+        
+        # Shared liquidity competition tracker (from LiveRunner)
+        self._liquidity_tracker = liquidity_tracker
+
+    @property
+    def pending_orders(self) -> List:
+        """
+        Unified pending orders (single source of truth).
+        
+        Returns the strategy's pending_orders list directly. Both strategy
+        (for ECR/budget) and runner (for fill simulation) use this same list.
+        """
+        return self.strategy.pending_orders
+
+    @pending_orders.setter
+    def pending_orders(self, value: List) -> None:
+        """Set pending orders (for backward compatibility with assignment patterns)."""
+        self.strategy.pending_orders = value
 
     def process_price_update(self, price: PriceUpdate) -> None:
         """Process a price update and generate/fill orders."""
@@ -590,6 +846,11 @@ class MarketSimulation:
             if now - self._last_order_tick_time >= self._order_tick_interval:
                 self._last_order_tick_time = now
                 
+                # Feed spread info to strategy for adaptive target_cost
+                up_spread = self.up_orderbook.spread if self.up_orderbook and self.up_orderbook.is_valid else self.last_up_spread
+                down_spread = self.down_orderbook.spread if self.down_orderbook and self.down_orderbook.is_valid else self.last_down_spread
+                self.strategy.update_spread_info(up_spread, down_spread)
+                
                 # Get order signals from strategy
                 signals = self.strategy.on_price_update(price_data)
 
@@ -615,7 +876,7 @@ class MarketSimulation:
 
     def update_orderbook(self, side: str, snapshot: OrderbookSnapshot) -> None:
         """
-        Update cached orderbook for a token side.
+        Update cached orderbook for a token side (full snapshot replacement).
         
         Args:
             side: "up" or "down"
@@ -625,6 +886,30 @@ class MarketSimulation:
             self.up_orderbook = snapshot
         else:
             self.down_orderbook = snapshot
+
+    def update_orderbook_incremental(self, side: str, changes: Dict[str, Any]) -> None:
+        """
+        Apply incremental orderbook changes to an existing snapshot.
+        
+        If no existing snapshot exists, creates a new one from the changes.
+        This is called for WS delta updates that modify individual price levels
+        rather than sending the full orderbook.
+        
+        Args:
+            side: "up" or "down"
+            changes: Dict with "bids" and/or "asks" arrays of level changes
+        """
+        book = self.up_orderbook if side == "up" else self.down_orderbook
+        
+        if book and book.is_valid:
+            book.apply_incremental_update(changes)
+        else:
+            # No existing book — treat this as a full snapshot
+            snapshot = OrderbookSnapshot.from_raw(changes)
+            if side == "up":
+                self.up_orderbook = snapshot
+            else:
+                self.down_orderbook = snapshot
 
     def _get_orderbook(self, side: str) -> Optional[OrderbookSnapshot]:
         """Get the cached orderbook for a side, or None if stale/missing."""
@@ -743,6 +1028,11 @@ class MarketSimulation:
         if limit_price >= market_price:
             # Aggressive (taker) order — fill at market + slippage
             fill_price = min(market_price * (1 + size_slippage), 0.99)
+            self.fill_tracker.record(
+                side=side, limit_price=limit_price, market_price=market_price,
+                size=size, spread_tolerance=spread_tolerance,
+                fill_probability=1.0, filled=True, fill_source="taker", slug=self.slug,
+            )
             return (fill_price, size)
         elif price_diff <= spread_tolerance:
             # Within spread tolerance — probabilistic fill
@@ -762,7 +1052,23 @@ class MarketSimulation:
             size_penalty = 1.0 if size <= 50 else max(0.5, 1.0 - (size - 50) * 0.002)
             fill_probability = base_probability * size_penalty
             
-            if random.random() < fill_probability:
+            # Liquidity competition: reduce probability when multiple markets
+            # are actively filling, modeling shared real-world liquidity.
+            if self._liquidity_tracker:
+                competition_factor = self._liquidity_tracker.get_competition_factor(self.slug)
+                fill_probability *= competition_factor
+            
+            filled = random.random() < fill_probability
+            
+            # Record for calibration analysis
+            self.fill_tracker.record(
+                side=side, limit_price=limit_price, market_price=market_price,
+                size=size, spread_tolerance=spread_tolerance,
+                fill_probability=fill_probability, filled=filled,
+                fill_source="spread", slug=self.slug,
+            )
+            
+            if filled:
                 return (limit_price, size)
             else:
                 logger.debug(
@@ -772,27 +1078,6 @@ class MarketSimulation:
                 return None
         
         return None
-
-    def _link_order_id(self, runner_order_id: str, side: str, price: float) -> None:
-        """
-        Link the runner's unique order_id to the strategy's LimitOrder.
-        
-        The strategy creates LimitOrder entries in on_price_update() with its own
-        order_id format (e.g., "up_1"). This method overwrites the strategy's
-        order_id with the runner's unique ID for precise matching during
-        fill/cancel operations.
-        
-        Only matches orders that haven't already been linked to a runner ID
-        (strategy IDs use format "{side}_{N}", runner IDs use "{slug}_{side}_{N}").
-        """
-        # Find the most recent UNLINKED strategy pending order matching side and price
-        for pending in reversed(self.strategy.pending_orders):
-            if pending.side == side and abs(pending.price - price) < 0.001:
-                # Skip orders already linked to a runner ID (contain slug prefix)
-                if self.slug in pending.order_id:
-                    continue
-                pending.order_id = runner_order_id
-                return
 
     def _submit_order(self, signal: OrderSignal, price_data: PriceData) -> None:
         """Submit an order based on strategy signal with depth-aware fill simulation."""
@@ -810,21 +1095,19 @@ class MarketSimulation:
         
         # Detect taker orders: any order priced at or above market crosses
         # the spread as a taker and incurs fees on Polymarket.
-        # All current strategy orders are maker (limit below market),
-        # including rebalancing orders (market × 0.998).
         is_taker = signal.target_price >= market_price
 
-        order = {
-            "order_id": order_id,
-            "side": side_str,
-            "size": signal.size,
-            "price": signal.target_price,
-            "timestamp": time.time(),
-            "is_taker": is_taker,
-        }
-
-        # Link runner order_id to the most recently added strategy pending order
-        self._link_order_id(order_id, side_str, signal.target_price)
+        # Link runner fields to the strategy's LimitOrder (single source of truth).
+        # The strategy already created a LimitOrder in on_price_update().
+        # We augment it with runner-side fields (order_id, timestamp, is_taker).
+        for pending in reversed(self.strategy.pending_orders):
+            if pending.side == side_str and abs(pending.price - signal.target_price) < 0.001:
+                if self.slug in pending.order_id:
+                    continue  # Already linked
+                pending.order_id = order_id
+                pending.timestamp = time.time()
+                pending.is_taker = is_taker
+                break
 
         # Attempt depth-aware fill simulation
         fill_result = self._simulate_fill_with_depth(
@@ -833,105 +1116,111 @@ class MarketSimulation:
 
         if fill_result:
             fill_price, filled_size = fill_result
-            # If partially filled, update the order size
             if filled_size < signal.size - 0.01:
-                # Partial fill: execute what we can, leave rest pending
-                filled_order = {**order, "size": filled_size}
-                self._execute_fill(filled_order, fill_price)
-                # Remaining goes to pending
-                remaining = signal.size - filled_size
-                remaining_order = {
-                    **order,
-                    "order_id": f"{order_id}_rem",
-                    "size": remaining,
-                }
-                self.pending_orders.append(remaining_order)
+                # Partial fill: execute what we can, update remaining in pending
+                self._execute_fill_unified(order_id, side_str, filled_size, fill_price, is_taker)
+                # Update the pending order's remaining size
+                for pending in self.strategy.pending_orders:
+                    if pending.order_id == order_id:
+                        pending.shares = signal.size - filled_size
+                        pending.cost = pending.shares * pending.price
+                        break
                 logger.debug(
                     f"[{self.slug}] Partial fill: {filled_size:.1f}/{signal.size:.1f} "
-                    f"@ {fill_price:.4f}, {remaining:.1f} pending"
+                    f"@ {fill_price:.4f}, {signal.size - filled_size:.1f} pending"
                 )
             else:
-                # Full fill
-                self._execute_fill(order, fill_price)
-        else:
-            # No immediate fill - add to pending
-            self.pending_orders.append(order)
+                # Full fill — remove from strategy pending
+                self._execute_fill_unified(order_id, side_str, filled_size, fill_price, is_taker)
+                self.strategy.pending_orders = [
+                    p for p in self.strategy.pending_orders if p.order_id != order_id
+                ]
 
-    def _cancel_pending_order(self, order: Dict[str, Any], reason: str) -> None:
-        """Cancel a pending order and free up strategy budget."""
-        side = order["side"]
-        limit_price = order["price"]
-        order_id = order.get("order_id", "")
-        logger.info(
-            f"[{self.slug}] Cancelling {side.upper()} order ({reason}): "
-            f"id={order_id}, limit={limit_price:.4f}, size={order['size']:.1f}"
-        )
-        # Remove from strategy's pending orders to free up budget
-        # Use order_id for precise matching, fall back to side+price
-        found = False
-        for i, pending in enumerate(self.strategy.pending_orders):
-            if order_id and pending.order_id == order_id:
-                self.strategy.pending_orders.pop(i)
-                found = True
-                break
-            elif not order_id and pending.side == side and abs(pending.price - limit_price) < 0.01:
-                self.strategy.pending_orders.pop(i)
-                found = True
-                break
-        if not found:
-            logger.warning(
-                f"[{self.slug}] Failed to find matching strategy pending order for "
-                f"id={order_id} {side.upper()}@{limit_price:.4f} "
-                f"(strategy has {len(self.strategy.pending_orders)} pending)"
-            )
+    def _cancel_pending_order(self, order_id: str, reason: str) -> None:
+        """Cancel a pending order by order_id (removes from unified pending list)."""
+        self.strategy.pending_orders = [
+            p for p in self.strategy.pending_orders if p.order_id != order_id
+        ]
 
     def _sync_pending_orders(self) -> None:
         """
-        Force-sync strategy's pending orders with runner's actual pending list.
+        Validate pending orders integrity (unified list — no sync needed).
         
-        This is a safety net: if _cancel_pending_order or _execute_fill fails to
-        match, ghost entries accumulate in the strategy's pending list, permanently
-        consuming budget. This method removes any ghost entries.
+        With the unified pending order model, strategy and runner share the same
+        list, eliminating ghost entries. This method now just performs sanity
+        checks: remove any orders with invalid state.
         """
-        runner_up_count = sum(1 for o in self.pending_orders if o["side"] == "up")
-        runner_down_count = sum(1 for o in self.pending_orders if o["side"] == "down")
-
-        strategy_up = [o for o in self.strategy.pending_orders if o.side == "up"]
-        strategy_down = [o for o in self.strategy.pending_orders if o.side == "down"]
-
-        ghost_up = len(strategy_up) - runner_up_count
-        ghost_down = len(strategy_down) - runner_down_count
-
-        if ghost_up > 0 or ghost_down > 0:
-            # Trim strategy pending to match runner's count (keep newest entries)
-            new_pending = strategy_up[-runner_up_count:] if runner_up_count > 0 else []
-            new_pending += strategy_down[-runner_down_count:] if runner_down_count > 0 else []
-            ghost_total = ghost_up + ghost_down
-            ghost_cost = sum(o.cost for o in self.strategy.pending_orders) - sum(o.cost for o in new_pending)
+        before = len(self.strategy.pending_orders)
+        self.strategy.pending_orders = [
+            o for o in self.strategy.pending_orders
+            if o.status == "pending" and o.shares > 0.001
+        ]
+        removed = before - len(self.strategy.pending_orders)
+        if removed > 0:
             logger.info(
-                f"[{self.slug}] Sync: removed {ghost_total} ghost pending orders "
-                f"(freed ${ghost_cost:.2f} budget). "
-                f"Strategy had UP:{len(strategy_up)}/DOWN:{len(strategy_down)}, "
-                f"Runner has UP:{runner_up_count}/DOWN:{runner_down_count}"
+                f"[{self.slug}] Sync: cleaned {removed} invalid pending orders"
             )
-            self.strategy.pending_orders = new_pending
+
+    def _get_fill_delay(self, limit_price: float, market_price: float) -> float:
+        """
+        Calculate minimum delay (seconds) before a pending order can fill.
+        
+        Models the real-world observation that limit orders further from
+        market price take longer to attract a counterparty.  Orders right
+        at the market can fill on the next tick; orders deep in the book
+        need the market to move toward them first.
+        
+        Delay schedule:
+          - limit at or near market (≤0.5% diff): 1s minimum wait
+          - limit moderately below (1-2% diff): 3-5s wait
+          - limit far below (3%+ diff): 5-10s wait
+        
+        This prevents the simulation from filling orders unrealistically
+        fast when they're far from market.
+        
+        Args:
+            limit_price: Order's limit price
+            market_price: Current market mid-price
+            
+        Returns:
+            Minimum age in seconds before the order should be evaluated for fills.
+        """
+        if market_price <= 0:
+            return 1.0
+        
+        price_diff = (market_price - limit_price) / market_price
+        price_diff = max(0.0, price_diff)
+        
+        # Linear interpolation: 1s at 0% diff, up to 10s at 5% diff
+        delay = 1.0 + min(price_diff / 0.05, 1.0) * 9.0
+        return delay
 
     def _check_fills(self, price_data: PriceData) -> None:
         """Check pending orders for fills using depth simulation, timeouts, and staleness."""
-        remaining = []
+        remaining: List[LimitOrder] = []
         stale_threshold = self.config.stale_order_threshold
         order_timeout = self.config.order_timeout
         now = time.time()
 
-        for order in self.pending_orders:
-            side = order["side"]
-            limit_price = order["price"]
-            size = order["size"]
+        for order in list(self.strategy.pending_orders):
+            side = order.side
+            limit_price = order.price
+            size = order.shares
 
             market_price = price_data.up_price if side == "up" else price_data.down_price
 
             # Calculate price difference as percentage
             price_diff = (market_price - limit_price) / market_price if market_price > 0 else 0
+
+            # Fill delay: simulate real-world order queue time.
+            # Orders further from market need more time to attract counterparties.
+            order_age = now - order.timestamp if order.timestamp > 0 else now - order.created_at.timestamp()
+            min_delay = self._get_fill_delay(limit_price, market_price)
+            
+            if order_age < min_delay:
+                # Too young — keep in pending without attempting fill
+                remaining.append(order)
+                continue
 
             # Attempt depth-aware fill
             fill_result = self._simulate_fill_with_depth(side, size, limit_price, market_price)
@@ -940,44 +1229,56 @@ class MarketSimulation:
                 fill_price, filled_size = fill_result
                 if filled_size < size - 0.01:
                     # Partial fill from depth
-                    filled_order = {**order, "size": filled_size}
-                    self._execute_fill(filled_order, fill_price)
-                    order["size"] = size - filled_size
+                    self._execute_fill_unified(
+                        order.order_id, side, filled_size, fill_price, order.is_taker
+                    )
+                    order.shares = size - filled_size
+                    order.cost = order.shares * order.price
                     remaining.append(order)
                 else:
                     # Full fill
-                    self._execute_fill(order, fill_price)
+                    self._execute_fill_unified(
+                        order.order_id, side, filled_size, fill_price, order.is_taker
+                    )
+                    # Don't add to remaining — it's filled
             elif price_diff > stale_threshold:
                 # Market moved too far from limit - cancel stale order
-                self._cancel_pending_order(
-                    order,
-                    f"stale: market={market_price:.2f}, diff={price_diff:.1%}"
+                logger.info(
+                    f"[{self.slug}] Cancelling {side.upper()} order (stale: market={market_price:.2f}, diff={price_diff:.1%}): "
+                    f"id={order.order_id}, limit={limit_price:.4f}, size={size:.1f}"
                 )
-            elif now - order["timestamp"] > order_timeout:
+                # Don't add to remaining — it's cancelled
+            elif order_age > order_timeout:
                 # Order has been pending too long - cancel to free budget
-                age = now - order["timestamp"]
-                self._cancel_pending_order(
-                    order,
-                    f"timeout: {age:.0f}s > {order_timeout:.0f}s"
+                logger.info(
+                    f"[{self.slug}] Cancelling {side.upper()} order (timeout: {order_age:.0f}s > {order_timeout:.0f}s): "
+                    f"id={order.order_id}, limit={limit_price:.4f}, size={size:.1f}"
                 )
+                # Don't add to remaining — it's cancelled
             else:
                 remaining.append(order)
 
-        self.pending_orders = remaining
+        self.strategy.pending_orders = remaining
 
-    def _execute_fill(self, order: Dict[str, Any], fill_price: float) -> None:
+    def _execute_fill_unified(
+        self, order_id: str, side: str, size: float, fill_price: float, is_taker: bool = False
+    ) -> None:
         """
         Execute an order fill, applying taker fee when applicable.
         
-        Limit orders (maker) incur no fee on Polymarket.
-        Rebalancing / market orders (taker) incur a fee that reduces shares received.
-        The ``is_taker`` flag in the order dict controls this.
-        """
-        side = order["side"]
-        size = order["size"]
+        This is the unified fill method that works with the single-source
+        pending order list. It does NOT remove from pending — the caller
+        is responsible for that.
         
+        Args:
+            order_id: Unique order identifier
+            side: "up" or "down"
+            size: Shares to fill
+            fill_price: Average fill price
+            is_taker: Whether this is a taker order (incurs fees)
+        """
         # Apply taker fee (rebalancing orders only)
-        if order.get("is_taker", False):
+        if is_taker:
             fee_rate = calculate_taker_fee_rate(fill_price)
             size_after_fee = apply_taker_fee_to_shares(size, fill_price)
             if fee_rate > 0.0001:
@@ -990,46 +1291,50 @@ class MarketSimulation:
         cost = size * fill_price
 
         self.result.orders_filled += 1
+        
+        # Track fill for liquidity competition modeling
+        if self._liquidity_tracker:
+            self._liquidity_tracker.record_fill(self.slug)
 
         if side == "up":
             self.result.up_shares += size
             self.result.up_cost += cost
-            # Sync with strategy's internal position tracking
             self.strategy.up_position.add(size, fill_price)
         else:
             self.result.down_shares += size
             self.result.down_cost += cost
-            # Sync with strategy's internal position tracking
             self.strategy.down_position.add(size, fill_price)
 
-        # Remove corresponding order from strategy's pending_orders
-        # Use order_id for precise matching, fall back to side+size/price
+    # Legacy compatibility — wraps _execute_fill_unified
+    def _execute_fill(self, order: Dict[str, Any], fill_price: float) -> None:
+        """Execute fill from a dict-format order (legacy compatibility)."""
+        side = order["side"]
+        size = order["size"]
+        is_taker = order.get("is_taker", False)
         order_id = order.get("order_id", "")
-        found = False
-        for i, pending in enumerate(self.strategy.pending_orders):
-            if order_id and pending.order_id == order_id:
-                self.strategy.pending_orders.pop(i)
-                found = True
-                break
-            elif not order_id and pending.side == side:
-                size_match = abs(pending.shares - size) / max(pending.shares, 0.001) < 0.05
-                price_match = abs(pending.price - order["price"]) < 0.01
-                if size_match or price_match:
-                    self.strategy.pending_orders.pop(i)
-                    found = True
-                    break
-        if not found:
-            logger.debug(
-                f"[{self.slug}] Fill: no matching strategy pending for "
-                f"id={order_id} {side.upper()} size={size:.2f} price={order['price']:.4f} "
-                f"(strategy has {len(self.strategy.pending_orders)} pending)"
-            )
+        
+        self._execute_fill_unified(order_id, side, size, fill_price, is_taker)
+        
+        # Remove from strategy pending (single source)
+        self.strategy.pending_orders = [
+            p for p in self.strategy.pending_orders if p.order_id != order_id
+        ]
 
     def finalize(self, winner: str) -> MarketResult:
         """Finalize the market simulation with settlement."""
         self.result.winner = winner
         self.result.end_time = time.time()
         self.result.calculate_final_metrics()
+        
+        # Log calibration stats for this market
+        cal_stats = self.fill_tracker.get_calibration_stats()
+        if cal_stats.get("spread_events", 0) > 0:
+            logger.info(
+                f"[{self.slug}] Fill calibration: {cal_stats['spread_events']} spread evals, "
+                f"fill_rate={cal_stats.get('spread_fill_rate', 0):.0%}, "
+                f"brier={cal_stats.get('brier_score', 0):.4f}"
+            )
+        
         return self.result
 
     @property
@@ -1075,6 +1380,7 @@ class LiveRunner:
     - Strategy execution with simulated fills
     - Configurable runtime duration
     - Metrics output and state persistence
+    - Liquidity competition modeling across concurrent markets
     """
 
     def __init__(self, config: SimulationConfig):
@@ -1088,6 +1394,9 @@ class LiveRunner:
 
         # Active simulations (slug -> MarketSimulation)
         self._active_sims: Dict[str, MarketSimulation] = {}
+        
+        # Global liquidity competition tracker
+        self._liquidity_tracker = LiquidityCompetitionTracker()
 
         # Completed results
         self._results: List[MarketResult] = []
@@ -1335,9 +1644,9 @@ class LiveRunner:
             "settlement_time": event.settlement_time,
         }
 
-        sim = MarketSimulation(market, self.config)
+        sim = MarketSimulation(market, self.config, liquidity_tracker=self._liquidity_tracker)
 
-        # Initialize strategy lifecycle (pass settlement_time for urgency calculation)
+        # Initialize strategy lifecycle (pass settlement_time and min_order_size for dynamic params)
         sim.strategy.on_market_start(
             market_id=slug,
             market_info={
@@ -1345,6 +1654,7 @@ class LiveRunner:
                 "coin": event.coin,
                 "condition_id": event.condition_id,
                 "settlement_time": event.settlement_time,
+                "min_order_size": getattr(event, "min_order_size", None),
             }
         )
 
@@ -1387,6 +1697,12 @@ class LiveRunner:
             self._results.append(result)
             self.stats.add_result(result)
             self._append_result(result)
+            
+            # Export fill calibration data for offline analysis
+            cal_file = self.config.output_dir / "fill_calibration.jsonl"
+            exported = sim.fill_tracker.export_to_jsonl(str(cal_file))
+            if exported > 0:
+                logger.debug(f"Exported {exported} fill calibration events for {slug}")
 
             logger.info(
                 f"Market {slug} settled ({winner}): "
@@ -1458,7 +1774,7 @@ class LiveRunner:
             logger.debug(f"[WS] {slug} {side.upper()}: {mid_price:.4f}")
 
         elif event_type == "token_orderbook":
-            # Per-token orderbook depth update
+            # Per-token orderbook depth update (full snapshot or incremental delta)
             token_id = identifier
             if token_id not in self._token_to_market:
                 return
@@ -1467,14 +1783,32 @@ class LiveRunner:
             if slug not in self._active_sims:
                 return
 
-            # Parse and cache orderbook snapshot
-            snapshot = OrderbookSnapshot.from_raw(data)
-            self._active_sims[slug].update_orderbook(side, snapshot)
-            logger.debug(
-                f"[WS Book] {slug} {side.upper()}: "
-                f"bids={len(snapshot.bids)} asks={len(snapshot.asks)} "
-                f"spread={snapshot.spread:.4f}"
-            )
+            sim = self._active_sims[slug]
+            
+            # Detect incremental vs full snapshot:
+            # Full snapshots have many levels; incremental updates typically have
+            # 1-3 changed levels and may include a "type": "delta" marker.
+            is_incremental = data.get("type") == "delta" or data.get("incremental", False)
+            
+            if is_incremental:
+                # Apply incremental update to existing orderbook
+                sim.update_orderbook_incremental(side, data)
+                book = sim.up_orderbook if side == "up" else sim.down_orderbook
+                if book:
+                    logger.debug(
+                        f"[WS Book Δ] {slug} {side.upper()}: "
+                        f"bids={len(book.bids)} asks={len(book.asks)} "
+                        f"spread={book.spread:.4f}"
+                    )
+            else:
+                # Full snapshot replacement
+                snapshot = OrderbookSnapshot.from_raw(data)
+                sim.update_orderbook(side, snapshot)
+                logger.debug(
+                    f"[WS Book] {slug} {side.upper()}: "
+                    f"bids={len(snapshot.bids)} asks={len(snapshot.asks)} "
+                    f"spread={snapshot.spread:.4f}"
+                )
 
         elif event_type == "token_trade":
             # Per-token trade (can use for price update)

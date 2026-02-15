@@ -78,6 +78,7 @@ class MarketEventData:
     timestamp: float
     settlement_time: Optional[float] = None
     winner: Optional[str] = None  # For MARKET_SETTLED
+    min_order_size: Optional[float] = None  # Market-specific minimum order (shares)
 
 
 # Type alias for event callbacks

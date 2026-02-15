@@ -503,30 +503,23 @@ lagging_limit = min(market × 0.995, limit + (market - limit) × 0.5)
 | **Spread fallback 收紧** | 从 6% 降至 3%，并改为概率性成交（20%-90%） |
 | **`_should_place_order` 拆分** | 从 ~270 行单函数拆分为 8 个聚焦子方法 |
 | **死代码清理** | 移除 4 个未使用方法（~130 行），对齐文档与代码 |
+| **target_cost 自适应** | `_get_adaptive_target_cost()` 根据实际 spread 动态调整 target_cost（0.94~0.98），高流动性小折扣，低流动性大折扣 |
+| **Phase 1 偏斜感知 ECR 上限** | `_get_phase1_ecr_limit()` 在偏斜市场中按 skew_intensity 收紧 ECR 上限，防止高 ECR 进入 Phase 2 |
+| **Phase 3 利润改善** | `_check_phase3()` 在 ECR < 1.0 时允许 lagging 侧进一步改善 ECR 的订单 |
+| **动态 min_order_shares** | `on_market_start()` 从 market_info 接收市场级 `min_order_size`，覆盖默认值 |
+| **成交延迟模拟** | `_get_fill_delay()` 根据 limit 与 market 的距离计算 1~10s 延迟，防止即时成交 |
+| **WS Orderbook 增量** | `apply_incremental_update()` 支持 WS 推送的增量订单簿更新（≤3 level = delta），减少 REST 依赖 |
+| **概率模型校准** | `FillCalibrationTracker` 记录每次 spread 模型成交判定的概率与结果，导出 JSONL + Brier score |
+| **流动性竞争** | `LiquidityCompetitionTracker` 跟踪跨市场成交活动，多市场同时活跃时降低成交概率（最多 40% 惩罚） |
+| **统一 pending 跟踪** | `LimitOrder` 作为 Strategy 和 Runner 的单一数据源，消除幽灵订单和同步问题 |
 
-### 8.2 策略层面（待完成）
-
-| 方向 | 说明 | 优先级 |
-|------|------|--------|
-| **target_cost 自适应** | 根据实际 spread 动态调整折扣幅度，高流动性用小折扣，低流动性用大折扣 | P1 |
-| **Phase 1 策略优化** | Phase 1 的渐进 ECR 上限（1.5→1.1）在极端偏斜市场仍可能导致高 ECR 进入 Phase 2 | P2 |
-| **Phase 3 退出优化** | 当前 Phase 3 在 ECR < 1.0 时完全停止，可考虑保留改善 ECR 的订单 | P2 |
-| **动态 min_order_shares** | 从 Polymarket API 查询市场实际 `min_order_size` 而非固定 5 shares | P2 |
-
-### 8.3 成交模型层面（待完成）
-
-| 方向 | 说明 | 优先级 |
-|------|------|--------|
-| **成交延迟模拟** | 模拟限价单的等待时间（基于历史成交频率）而非即时判定 | P1 |
-| **流动性竞争** | 当多市场同时活跃时，考虑流动性竞争效应 | P2 |
-| **WS Orderbook 增量** | 支持 WS 推送的增量订单簿更新，减少对 REST 的依赖 | P1 |
-| **概率模型校准** | 用实盘数据回测确定最优 fill probability 参数 | P1 |
-
-### 8.4 代码质量（待完成）
+### 8.2 未来优化方向
 
 | 方向 | 说明 | 优先级 |
 |------|------|--------|
-| **双重 pending 跟踪** | Strategy 和 Runner 各维护一套 pending_orders，靠同步弥合。考虑统一为单一来源 | P2 |
+| **实盘概率校准** | 收集 `fill_calibration.jsonl` 数据，用 Brier score 优化 base_probability / size_penalty 参数 | P1 |
+| **Polymarket min_order_size API** | 当 Polymarket API 暴露 per-market minimum 时，在 `MarketEventData` 中填充实际值 | P2 |
+| **Maker 返佣建模** | Maker 每日 20% 费用返佣未建模；纳入可提高利润预估准确性 | P3 |
 
 ---
 

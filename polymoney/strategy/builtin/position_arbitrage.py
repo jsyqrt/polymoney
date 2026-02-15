@@ -46,7 +46,13 @@ class InternalPosition:
 
 @dataclass
 class LimitOrder:
-    """Internal limit order tracking."""
+    """
+    Unified order tracking used by both Strategy and Runner.
+    
+    This is the single source of truth for pending orders. Both the strategy
+    (for ECR prediction and budget) and the runner (for fill simulation and
+    timeout) operate on this same object.
+    """
 
     order_id: str
     side: str  # 'up' or 'down'
@@ -56,6 +62,9 @@ class LimitOrder:
     status: str = "pending"
     created_at: datetime = field(default_factory=datetime.now)
     created_market_price: float = 0.0
+    # Runner-side fields for fill simulation
+    timestamp: float = 0.0  # Unix timestamp for timeout tracking (set by runner)
+    is_taker: bool = False  # Whether this crosses the spread as a taker
 
 
 class TrendDetector:
@@ -224,6 +233,16 @@ class PositionArbitrageStrategy(BaseStrategy):
 
         # Strategy parameters
         self.target_cost = self.params.get("target_cost", 0.96)
+        
+        # Adaptive target_cost: dynamically adjust discount based on orderbook spread.
+        # High liquidity (tight spread) → smaller discount → higher fill rate.
+        # Low liquidity (wide spread) → larger discount → safer fills.
+        # Bounds: [adaptive_target_min, adaptive_target_max]
+        self.enable_adaptive_target = self.params.get("enable_adaptive_target", True)
+        self.adaptive_target_min = self.params.get("adaptive_target_min", 0.94)
+        self.adaptive_target_max = self.params.get("adaptive_target_max", 0.98)
+        self._last_up_spread: float = 0.0
+        self._last_down_spread: float = 0.0
         
         # Batch size: auto-derived from position_size if not explicitly set.
         # batch_ratio (default 0.001 = 1/1000) determines granularity.
@@ -469,11 +488,15 @@ class PositionArbitrageStrategy(BaseStrategy):
 
     def _get_phase1_ecr_limit(self) -> float:
         """
-        Get progressive ECR tolerance for Phase 1.
+        Get progressive ECR tolerance for Phase 1 with skew awareness.
         
-        Decays from 1.5 (start of Phase 1) to 1.1 (end of Phase 1),
-        preventing excessive ECR at Phase 1 exit while still allowing
-        aggressive initial position building.
+        Base behavior: decays from 1.5 (start) to 1.1 (end of Phase 1).
+        
+        Skew adjustment: in highly skewed markets, one-sided fills are more
+        likely, so the ECR cap is tightened proportionally to skew intensity.
+        At 75% skew (max_entry_skew), the cap is reduced by 20% (e.g. 1.5→1.3
+        at start, 1.1→1.02 at end).  This prevents entering Phase 2 with a
+        dangerously high ECR that's hard to recover from.
         
         Returns:
             Maximum allowed ECR for Phase 1 orders.
@@ -483,7 +506,22 @@ class PositionArbitrageStrategy(BaseStrategy):
         
         elapsed = (datetime.now() - self.market_start_time).total_seconds()
         progress = min(1.0, elapsed / self.phase1_end)  # 0 → 1 over Phase 1
-        return 1.5 - 0.4 * progress  # 1.5 → 1.1
+        base_limit = 1.5 - 0.4 * progress  # 1.5 → 1.1
+        
+        # Skew adjustment: tighten ECR cap in skewed markets
+        if self.current_up_price is not None and self.current_down_price is not None:
+            max_price = max(self.current_up_price, self.current_down_price)
+            # Skew intensity: 0 at 50% (balanced), 1 at max_entry_skew (75%)
+            skew_start = 0.50
+            skew_end = self.params.get("max_entry_skew", 0.75)
+            if max_price > skew_start and skew_end > skew_start:
+                skew_intensity = min(1.0, (max_price - skew_start) / (skew_end - skew_start))
+                # Reduce the cap by up to 20% of (cap - 1.0)
+                # At skew_intensity=1: 1.5 → 1.3 at start, 1.1 → 1.02 at end
+                reduction = skew_intensity * 0.40 * (base_limit - 1.0)
+                base_limit -= reduction
+        
+        return max(1.02, base_limit)  # Never go below 1.02 (2% margin)
 
     def get_market_phase(self) -> int:
         """Get current market phase (1, 2, or 3)."""
@@ -505,6 +543,72 @@ class PositionArbitrageStrategy(BaseStrategy):
         elif self.down_position.shares < self.up_position.shares:
             return "down"
         return "balanced"
+
+    def update_spread_info(self, up_spread: float, down_spread: float) -> None:
+        """
+        Update spread information from orderbook data.
+        
+        Called by the simulation runner when orderbook data is available.
+        Used by adaptive target_cost to adjust discount dynamically.
+        
+        Args:
+            up_spread: Current bid-ask spread for UP token (absolute, e.g. 0.02)
+            down_spread: Current bid-ask spread for DOWN token (absolute, e.g. 0.02)
+        """
+        if up_spread > 0:
+            self._last_up_spread = up_spread
+        if down_spread > 0:
+            self._last_down_spread = down_spread
+
+    def _get_adaptive_target_cost(self) -> float:
+        """
+        Calculate adaptive target_cost based on current orderbook spread.
+        
+        The intuition: spread represents the "cost of immediacy" in the market.
+        Tight spread (1-2%) = liquid market, orders fill easily → small discount (0.98).
+        Wide spread (5%+) = illiquid market, need wider limits → large discount (0.94).
+        
+        Linear interpolation between min and max based on average spread:
+          spread ≤ 1% → target_max (0.98)
+          spread ≥ 5% → target_min (0.94)
+          
+        Returns:
+            Adaptive target_cost (or static target_cost if adaptive is disabled).
+        """
+        if not self.enable_adaptive_target:
+            return self.target_cost
+        
+        avg_spread = 0.0
+        count = 0
+        if self._last_up_spread > 0:
+            avg_spread += self._last_up_spread
+            count += 1
+        if self._last_down_spread > 0:
+            avg_spread += self._last_down_spread
+            count += 1
+        
+        if count == 0:
+            # No spread data available — use static target_cost
+            return self.target_cost
+        
+        avg_spread /= count
+        
+        # Map spread to target_cost:
+        #   spread ≤ 1% (tight) → adaptive_target_max (e.g. 0.98)
+        #   spread ≥ 5% (wide)  → adaptive_target_min (e.g. 0.94)
+        spread_low = 0.01   # Tight spread threshold
+        spread_high = 0.05  # Wide spread threshold
+        
+        if avg_spread <= spread_low:
+            adaptive = self.adaptive_target_max
+        elif avg_spread >= spread_high:
+            adaptive = self.adaptive_target_min
+        else:
+            # Linear interpolation
+            ratio = (avg_spread - spread_low) / (spread_high - spread_low)
+            adaptive = self.adaptive_target_max - ratio * (self.adaptive_target_max - self.adaptive_target_min)
+        
+        return adaptive
 
     def _calculate_time_urgency(self) -> float:
         """
@@ -577,6 +681,9 @@ class PositionArbitrageStrategy(BaseStrategy):
         self._rebalancing_events.clear()
         self._skew_rejection_logged = False
         self._trend_patience_logged = False
+        # Reset adaptive target spread data
+        self._last_up_spread = 0.0
+        self._last_down_spread = 0.0
         # Reset trend detector
         self._trend_detector.reset()
 
@@ -586,7 +693,20 @@ class PositionArbitrageStrategy(BaseStrategy):
         self.market_start_time = datetime.now()
         # Use settlement_time from market_info if available for accurate urgency calculation
         self.market_settlement_time = market_info.get("settlement_time")
-        logger.info(f"[{self.name}] Market started: {market_id}")
+        
+        # Dynamic min_order_shares: use market-specific value from API if available.
+        # Polymarket enforces per-market minimums (typically 5-15 shares).
+        # Falls back to the configured default (5 shares).
+        api_min_order = market_info.get("min_order_size")
+        if api_min_order is not None and api_min_order > 0:
+            old_min = self.min_order_shares
+            self.min_order_shares = api_min_order
+            logger.info(
+                f"[{self.name}] Market started: {market_id} "
+                f"(min_order_shares: {old_min}→{api_min_order} from API)"
+            )
+        else:
+            logger.info(f"[{self.name}] Market started: {market_id}")
 
     def on_price_update(self, price_data: PriceData) -> List[OrderSignal]:
         """Process price update and generate order signals."""
@@ -1047,13 +1167,19 @@ class PositionArbitrageStrategy(BaseStrategy):
         The key insight: in a trending market, the trending side is getting MORE
         expensive — buy it NOW before it costs even more. The declining side is
         getting CHEAPER — be patient and buy it later at a better price.
+        
+        Uses adaptive target_cost when enabled: tight spreads → higher target (fills
+        more easily), wide spreads → lower target (larger safety margin).
         """
         price_sum = up_price + down_price
+        
+        # Use adaptive target_cost based on current spread
+        effective_target = self._get_adaptive_target_cost()
 
-        if price_sum <= self.target_cost:
+        if price_sum <= effective_target:
             return up_price, down_price
 
-        total_offset = price_sum - self.target_cost  # Total discount needed (e.g., 0.02)
+        total_offset = price_sum - effective_target  # Total discount needed (e.g., 0.02)
         max_price = max(up_price, down_price)
         
         # === Trend patience: asymmetric offset allocation ===
@@ -1103,7 +1229,7 @@ class PositionArbitrageStrategy(BaseStrategy):
             )
         else:
             # Normal: proportional scaling (same % discount on both sides)
-            base_scale = self.target_cost / price_sum
+            base_scale = effective_target / price_sum
             up_limit = up_price * base_scale
             down_limit = down_price * base_scale
             
@@ -1256,9 +1382,10 @@ class PositionArbitrageStrategy(BaseStrategy):
         if self.current_up_price is None or self.current_down_price is None:
             return False
 
+        effective_target = self._get_adaptive_target_cost()
         price_sum = self.current_up_price + self.current_down_price
         if price_sum > 0:
-            scale = self.target_cost / price_sum if price_sum > self.target_cost else 1.0
+            scale = effective_target / price_sum if price_sum > effective_target else 1.0
             up_limit = self.current_up_price * scale
             down_limit = self.current_down_price * scale
 
@@ -1393,13 +1520,34 @@ class PositionArbitrageStrategy(BaseStrategy):
 
     def _check_phase3(self, side: str, market_price: float,
                       current_ecr: float, predicted_ecr: float) -> bool:
-        """Phase 3 settlement protection: lock profits, recovery only."""
+        """
+        Phase 3 settlement protection with conditional profit improvement.
+        
+        When ECR < 1.0 (profitable):
+          - Allow orders on the lagging side that would IMPROVE ECR further
+            (e.g. ECR 0.98 → 0.96), increasing guaranteed profit margin.
+          - Block orders that would worsen or not improve ECR.
+        When ECR >= 1.0 (unprofitable):
+          - Only allow ECR-improving orders on the lagging side (recovery mode).
+        """
         if market_price < self.low_prob_threshold:
             logger.debug(f"[{self.name}] Phase 3: low prob {side.upper()} ({market_price:.1%})")
             return False
 
+        lagging = self.get_lagging_side()
+
         if current_ecr < 1.0:
-            logger.debug(f"[{self.name}] Phase 3: profitable ECR={current_ecr:.2%}, locking")
+            # Profitable — allow ECR-IMPROVING orders on lagging side only
+            if predicted_ecr < current_ecr and side == lagging:
+                logger.debug(
+                    f"[{self.name}] Phase 3: improving profitable ECR "
+                    f"{current_ecr:.2%}→{predicted_ecr:.2%} ({side.upper()})"
+                )
+                return True
+            logger.debug(
+                f"[{self.name}] Phase 3: profitable ECR={current_ecr:.2%}, "
+                f"{'would worsen' if predicted_ecr >= current_ecr else 'not lagging side'}"
+            )
             return False
 
         if predicted_ecr >= current_ecr:
@@ -1409,7 +1557,6 @@ class PositionArbitrageStrategy(BaseStrategy):
             )
             return False
 
-        lagging = self.get_lagging_side()
         if lagging != "balanced" and side != lagging:
             logger.debug(f"[{self.name}] Phase 3: leading {side.upper()} paused")
             return False
@@ -1500,6 +1647,7 @@ class PositionArbitrageStrategy(BaseStrategy):
             "position_size": self.position_size,
             "params": {
                 "target_cost": self.target_cost,
+                "effective_target_cost": self._get_adaptive_target_cost(),
                 "batch_size": self.batch_size,
                 "batch_ratio": self.batch_ratio,
                 "ecr_threshold": self.ecr_threshold,
@@ -1508,6 +1656,7 @@ class PositionArbitrageStrategy(BaseStrategy):
                 "enable_rebalancing": self.enable_rebalancing,
                 "enable_trend_detection": self.enable_trend_detection,
                 "enable_urgency_pricing": self.enable_urgency_pricing,
+                "enable_adaptive_target": self.enable_adaptive_target,
                 "severe_imbalance_threshold": self.severe_imbalance_threshold,
             },
             "up_position": {
