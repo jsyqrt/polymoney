@@ -69,8 +69,8 @@ $$
 ### 2.1 组件关系
 
 ```
-CLI (run_simulation.py)
-  └── LiveRunner
+CLI (scripts/run_trading.py)
+  └── TradingRunner
         ├── 市场扫描循环 (HTTP, 每60s)
         │     └── RealDataFetcher → Polymarket REST API
         ├── WebSocket 价格流 (实时)
@@ -513,7 +513,150 @@ lagging_limit = min(market × 0.995, limit + (market - limit) × 0.5)
 | **流动性竞争** | `LiquidityCompetitionTracker` 跟踪跨市场成交活动，多市场同时活跃时降低成交概率（最多 40% 惩罚） |
 | **统一 pending 跟踪** | `LimitOrder` 作为 Strategy 和 Runner 的单一数据源，消除幽灵订单和同步问题 |
 
-### 8.2 未来优化方向
+### 8.2 实盘交易架构（Live Trading Roadmap）
+
+#### 8.2.1 当前状态与差距
+
+系统已完成从 `LiveRunner` 单体到模块化 `TradingRunner` 的重构。纸上交易和实盘交易共用同一代码路径，仅通过 `OrderExecutor` 实现切换。
+
+| 组件 | 状态 | 说明 |
+|------|------|------|
+| 市场数据（REST + WS） | ✅ 已实现 | `MarketDataProvider` — 独立数据层 |
+| 成交模拟（深度 + Spread） | ✅ 已实现 | `SimulatedExecutor` — 提取自 MarketSimulation |
+| 策略逻辑（3 阶段 + ECR） | ✅ 已完成 | `PositionArbitrageStrategy` 不变 |
+| 轻量市场上下文 | ✅ 已实现 | `MarketContext` — 替代 MarketSimulation |
+| CLOB 客户端集成 | ✅ 已实现 | `TradingRunner._init_clob_client()` 从 .env 初始化 |
+| 真实下单 / 撤单 | ✅ 已实现 | `LiveExecutor` — 通过 ClobClient 执行 |
+| 成交确认与对账 | ✅ 已实现 | `FillManager` — 轮询订单状态 + 仓位对账 |
+| 风控（熔断 / Kill Switch） | ✅ 已实现 | `RiskManager` + `KillSwitch` |
+| 监控告警 | ✅ 已实现 | `AlertManager` — Discord/通用 Webhook |
+| 顶层编排器 | ✅ 已实现 | `TradingRunner` — 替代 LiveRunner |
+
+#### 8.2.2 目标架构
+
+```
+TradingRunner（顶层编排）
+  ├── MarketDataProvider（数据层）
+  │     ├── RealDataFetcher → Polymarket REST API
+  │     ├── WebSocketManager → Polymarket WS
+  │     └── OrderbookManager（深度缓存 + 增量更新）
+  │
+  ├── StrategyEngine（策略层）
+  │     ├── MarketContext × N（市场状态 + 策略实例）
+  │     │     └── PositionArbitrageStrategy
+  │     └── OrderExecutor（执行抽象）
+  │           ├── SimulatedExecutor（纸上交易：深度 / Spread 模型）
+  │           └── LiveExecutor（实盘：ClobClient）
+  │                 └── FillManager（成交跟踪 + 仓位对账）
+  │
+  ├── RiskManager（安全层）
+  │     ├── KillSwitch（紧急停止）
+  │     ├── CircuitBreaker（每日亏损 / 连续亏损熔断）
+  │     └── PositionReconciler（本地 vs 链上仓位对比）
+  │
+  └── Observability（可观测性）
+        ├── MetricsLogger（status.json / metrics.jsonl / results.jsonl）
+        ├── TradeLogger（trades.jsonl + DataStorage）
+        └── AlertManager（Webhook 告警）
+```
+
+数据流：
+
+```
+MarketDataProvider
+  │
+  ├── on_market_discovered → TradingRunner._on_market_discovered()
+  │     → 创建 MarketContext + 注册 executor + 订阅 WS
+  │
+  ├── on_price_update → TradingRunner._on_price_update()
+  │     → MarketContext.process_price_update() → OrderSignal[]
+  │     → RiskManager.can_trade() → SimulatedExecutor/LiveExecutor.submit_order()
+  │     → executor.check_fills() → MarketContext.apply_fill()
+  │
+  ├── on_orderbook_update → OrderExecutor.update_orderbook()
+  │     → SimulatedExecutor 更新深度缓存
+  │
+  └── on_settlement → TradingRunner._finalize_market()
+        → executor.cancel_all() → MarketContext.finalize() → RiskManager.record_result()
+```
+
+**启动命令**：
+
+```bash
+# 纸上交易（默认）
+python scripts/run_trading.py
+
+# 实盘交易
+python scripts/run_trading.py --live
+
+# 指定币种和时长
+python scripts/run_trading.py -m btc,eth -d 10h
+
+# 自定义仓位
+python scripts/run_trading.py --position-size 50
+```
+
+#### 8.2.3 实施阶段
+
+| 阶段 | 内容 | 状态 | 文件 |
+|------|------|------|------|
+| Phase 2 | `OrderExecutor` 接口 + `SimulatedExecutor` + `LiveExecutor` | ✅ 完成 | `polymoney/execution/` |
+| Phase 3 | `MarketDataProvider`（市场发现、WS、订单簿、结算） | ✅ 完成 | `polymoney/data/market_data_provider.py` |
+| Phase 4 | `MarketContext`（剥离执行逻辑，保留策略+状态） | ✅ 完成 | `polymoney/strategy/market_context.py` |
+| Phase 5 | `TradingRunner` 顶层编排器 + `scripts/run_trading.py` | ✅ 完成 | `polymoney/runner.py` |
+| Phase 6 | `ClobClient` 初始化、Token ID 映射、钱包验证 | ✅ 完成 | `runner.py._init_clob_client()` |
+| Phase 7 | `FillManager` 实盘成交跟踪（轮询 + 对账） | ✅ 完成 | `polymoney/execution/fill_manager.py` |
+| Phase 8 | `RiskManager` + `KillSwitch` + 熔断 | ✅ 完成 | `polymoney/risk/` |
+| Phase 9 | `AlertManager` Webhook 告警 | ✅ 完成 | `polymoney/monitoring/` |
+| Phase 10 | 验证上线（小额 dry run + 校准 + 渐进放量） | 🔜 待执行 | — |
+
+#### 8.2.4 关键组件设计
+
+**OrderExecutor 接口**（`polymoney/execution/executor.py`）：
+
+```python
+class OrderExecutor(ABC):
+    async def submit_order(market_id, side, token_id, price, size, is_taker) -> OrderResult
+    async def cancel_order(order_id) -> bool
+    async def check_fills(market_id, price_data) -> List[FillEvent]
+    async def cancel_all(market_id) -> int
+```
+
+**SimulatedExecutor**：继承现有 `MarketSimulation` 的全部成交逻辑：
+- `OrderbookSnapshot.simulate_buy_fill()` 深度逐档遍历
+- Spread 概率模型（20%-90%）
+- 成交延迟模拟（`_get_fill_delay`）
+- Taker 费用模型
+- `FillCalibrationTracker` + `LiquidityCompetitionTracker`
+
+**LiveExecutor**：包装 `py-clob-client`：
+- `ClobClient.create_order()` + `post_order()` 下单
+- `ClobClient.cancel()` 撤单
+- Token ID 解析：`(market_id, side)` → 真实 Polymarket token ID
+
+**RiskManager 安全规则**：
+- 每日最大亏损限制（默认 $50）
+- 单市场最大亏损（默认 $10）
+- 连续亏损熔断（5 连亏 → 暂停 30 分钟）
+- 总持仓硬上限（对照真实余额检查）
+- CLOB API 速率限制（10 req/s）
+
+**KillSwitch 触发方式**：
+- SIGINT / SIGTERM → 优雅停止（撤销所有挂单）
+- 触摸文件 `simulation_results/KILL` → 紧急停止
+- API 端点 `POST /api/kill` → 远程停止
+
+#### 8.2.5 实盘残余风险
+
+| 风险 | 说明 | 缓解措施 |
+|------|------|----------|
+| 深度模型成交率偏高 | 模拟中独占流动性，真实中可能被抢先 | 实盘校准 fill rate |
+| REST 快照刷新间隔 | 15s 刷新后深度恢复可能快于实际 | 增加 WS 增量更新权重 |
+| API 故障 / 超时 | 下单失败可能导致单侧暴露 | 指数退避重试 + 仓位对账 |
+| 钱包余额不足 | 余额检查与下单之间的竞态条件 | 预留 10% 安全边际 |
+| 结算检测延迟 | WS 价格确认需 3 次连续检查 | 结合 HTTP 轮询双重确认 |
+
+### 8.3 未来优化方向
 
 | 方向 | 说明 | 优先级 |
 |------|------|--------|

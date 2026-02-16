@@ -57,6 +57,29 @@ class TradingConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="TRADING_")
 
 
+class RiskConfig(BaseSettings):
+    """Risk management configuration."""
+
+    daily_loss_limit: float = Field(default=50.0, description="Max daily loss in USD")
+    per_market_loss_limit: float = Field(default=10.0, description="Max loss per market in USD")
+    consecutive_loss_pause: int = Field(default=5, description="Pause after N consecutive losses")
+    pause_duration_seconds: float = Field(default=1800.0, description="Pause duration in seconds")
+    max_total_exposure: float = Field(default=500.0, description="Max total exposure in USD")
+    api_rate_limit: int = Field(default=10, description="Max CLOB API calls per second")
+
+    model_config = SettingsConfigDict(env_prefix="RISK_")
+
+
+class AlertConfig(BaseSettings):
+    """Alert/monitoring configuration."""
+
+    webhook_url: Optional[str] = Field(default=None, description="Discord/Telegram webhook URL")
+    enable_alerts: bool = Field(default=False, description="Enable alert notifications")
+    alert_on_loss: float = Field(default=0.8, description="Alert when daily loss reaches this fraction of limit")
+
+    model_config = SettingsConfigDict(env_prefix="ALERT_")
+
+
 class DataConfig(BaseSettings):
     """Data storage configuration."""
 
@@ -80,6 +103,8 @@ class Config(BaseSettings):
     api: ApiConfig = Field(default_factory=ApiConfig)
     trading: TradingConfig = Field(default_factory=TradingConfig)
     data: DataConfig = Field(default_factory=DataConfig)
+    risk: RiskConfig = Field(default_factory=RiskConfig)
+    alert: AlertConfig = Field(default_factory=AlertConfig)
 
     model_config = SettingsConfigDict(
         env_file=".env",

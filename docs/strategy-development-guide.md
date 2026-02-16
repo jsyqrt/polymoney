@@ -191,7 +191,7 @@ class MyStrategy(BaseStrategy):
 After registration:
 - Strategy appears in `polymoney list-strategies`
 - Can be created via API: `POST /strategies` with `strategy_type: "my-strategy"`
-- Can be used in backtests: `polymoney backtest --strategy my-strategy`
+- Can be used in backtests (see [Backtesting](#backtesting) section below)
 
 ## Strategy Parameters
 
@@ -300,13 +300,30 @@ def test_generates_buy_signal():
 
 ### Backtesting
 
+回测和交易使用 `scripts/run_trading.py` 统一入口：
+
 ```bash
-# Run backtest
-polymoney backtest \
-    --strategy my-strategy \
-    --start 2024-01-01 \
-    --end 2024-01-31 \
-    --params '{"threshold": 0.35}'
+# 列出可用市场
+python scripts/run_trading.py list
+
+# 回测特定市场
+python scripts/run_trading.py backtest --slug btc-updown-15m-1770106500
+
+# 回测最近 N 个已结算市场
+python scripts/run_trading.py backtest --count 5
+
+# 指定策略参数
+python scripts/run_trading.py backtest --count 5 --target-cost 0.96 --ecr-threshold 1.05
+```
+
+实时纸上交易 / 实盘交易：
+
+```bash
+# 纸上交易（默认）
+python scripts/run_trading.py
+
+# 实盘交易
+python scripts/run_trading.py --live
 ```
 
 ## Best Practices

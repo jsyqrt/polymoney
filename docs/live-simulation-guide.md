@@ -1,16 +1,18 @@
-# Live Simulation Guide
+# Live Simulation & Trading Guide
 
-本文档说明如何使用 Polymoney 的实时模拟交易系统，对 BTC、ETH、SOL 的 15 分钟预测市场执行仓位套利策略。
+本文档说明如何使用 Polymoney 的实时交易系统，对 BTC、ETH、SOL 的 15 分钟预测市场执行仓位套利策略。
 
 ## 目录
 
 1. [快速开始](#快速开始)
-2. [启动选项](#启动选项)
-3. [监控状态](#监控状态)
-4. [停止模拟](#停止模拟)
-5. [输出文件](#输出文件)
-6. [AI 集成](#ai-集成)
-7. [故障排除](#故障排除)
+2. [运行模式](#运行模式)
+3. [启动选项](#启动选项)
+4. [监控状态](#监控状态)
+5. [停止交易](#停止交易)
+6. [输出文件](#输出文件)
+7. [安全机制](#安全机制)
+8. [AI 集成](#ai-集成)
+9. [故障排除](#故障排除)
 
 ---
 
@@ -24,20 +26,30 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. 运行模拟
+### 2. 配置环境（实盘必须）
 
 ```bash
-# 运行 10 小时
-python examples/run_live_simulation.py --duration 10h
+# 复制环境变量模板
+cp .env.example .env
 
-# 运行 3 天
-python examples/run_live_simulation.py --duration 3d
-
-# 无限期运行（直到 Ctrl+C）
-python examples/run_live_simulation.py
+# 编辑 .env，填入你的配置
+# 纸上交易不需要 private key，实盘交易必须配置
 ```
 
-### 3. 检查状态
+### 3. 运行
+
+```bash
+# 纸上交易（默认）
+python scripts/run_trading.py
+
+# 纸上交易，运行 10 小时
+python scripts/run_trading.py -d 10h
+
+# 实盘交易（需要 POLYMARKET_PRIVATE_KEY）
+python scripts/run_trading.py --live
+```
+
+### 4. 检查状态
 
 ```bash
 # 查看状态摘要
@@ -49,7 +61,36 @@ python -m polymoney.simulation.status_cli --json
 
 ---
 
+## 运行模式
+
+系统使用统一的 `scripts/run_trading.py` 入口，基于模块化 `TradingRunner` 架构：
+
+```bash
+# 纸上交易 — SimulatedExecutor（深度模型 + Spread 概率）
+python scripts/run_trading.py
+
+# 实盘交易 — LiveExecutor（真实 CLOB 订单）
+python scripts/run_trading.py --live
+```
+
+**架构组件：**
+
+| 组件 | 说明 |
+|------|------|
+| `TradingRunner` | 顶层编排器 |
+| `MarketDataProvider` | 数据层（REST + WebSocket + 订单簿） |
+| `MarketContext` | 轻量市场上下文（策略 + 状态） |
+| `OrderExecutor` | 执行抽象层（SimulatedExecutor / LiveExecutor） |
+| `FillManager` | 成交跟踪 + 仓位对账 |
+| `RiskManager` | 风控熔断（每日亏损/连续亏损/持仓上限） |
+| `KillSwitch` | 紧急停止机制 |
+| `AlertManager` | Webhook 告警（Discord 等） |
+
+---
+
 ## 启动选项
+
+以下选项适用于 `run` 命令（默认命令）：
 
 ### 运行时长
 
@@ -64,28 +105,30 @@ python -m polymoney.simulation.status_cli --json
 
 ```bash
 # 仅监控 BTC
-python examples/run_live_simulation.py --markets btc
+python scripts/run_trading.py -m btc
 
 # 监控 BTC 和 ETH
-python examples/run_live_simulation.py --markets btc,eth
+python scripts/run_trading.py -m btc,eth
 
 # 监控所有支持的币种（默认）
-python examples/run_live_simulation.py --markets btc,eth,sol
+python scripts/run_trading.py -m btc,eth,sol
 ```
 
 ### 策略参数
 
 ```bash
-python examples/run_live_simulation.py \
-    --target-cost 0.98 \
-    --batch-size 100 \
+python scripts/run_trading.py \
+    --target-cost 0.96 \
+    --batch-ratio 0.001 \
+    --position-size 100.0 \
     --ecr-threshold 1.05
 ```
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--target-cost` | 0.98 | 目标成本率 |
-| `--batch-size` | 100.0 | 订单批量（美元） |
+| `--target-cost` | 0.96 | 目标成本率（UP_limit + DOWN_limit） |
+| `--batch-ratio` | 0.001 | 订单大小 = position_size × batch_ratio |
+| `--position-size` | 100.0 | 每市场最大投入（美元） |
 | `--ecr-threshold` | 1.05 | ECR 止损阈值 |
 | `--disable-ecr-stoploss` | - | 禁用 ECR 止损 |
 | `--disable-rebalancing` | - | 禁用市价单再平衡 |
@@ -95,16 +138,16 @@ python examples/run_live_simulation.py \
 
 ```bash
 # 自定义输出目录
-python examples/run_live_simulation.py --output-dir ./my_results
+python scripts/run_trading.py -o ./my_results
 
 # 从上次状态恢复
-python examples/run_live_simulation.py --resume
+python scripts/run_trading.py --resume
 
 # 设置日志级别
-python examples/run_live_simulation.py --log-level DEBUG
+python scripts/run_trading.py --log-level DEBUG
 
-# 输出日志到文件
-python examples/run_live_simulation.py --log-file sim.log
+# 使用 YAML 配置文件
+python scripts/run_trading.py --config config/strategy_defaults.yaml
 ```
 
 ---
@@ -143,6 +186,7 @@ python -m polymoney.simulation.status_cli --json
 ```json
 {
   "running": true,
+  "mode": "paper",
   "start_time": "2026-02-03T10:00:00",
   "stats": {
     "markets_processed": 42,
@@ -186,29 +230,34 @@ python -m polymoney.simulation.status_cli --list-markets
 
 ---
 
-## 停止模拟
+## 停止交易
 
 ### 方法 1：Ctrl+C（推荐）
 
-在运行模拟的终端按 `Ctrl+C`，系统会：
-1. 完成当前市场处理周期
+在运行终端按 `Ctrl+C`，系统会：
+1. 取消所有挂单
 2. 保存最终状态到 `status.json`
 3. 输出最终指标
 4. 优雅退出
 
-### 方法 2：发送 SIGTERM
+### 方法 2：Kill Switch 文件
 
 ```bash
-# 找到进程 ID
-ps aux | grep run_live_simulation
+# 创建 kill switch 文件触发紧急停止
+echo "Manual stop" > simulation_results/KILL_SWITCH
 
-# 发送终止信号
-kill <PID>
+# 系统会自动检测文件、取消所有挂单并退出
 ```
 
-### 方法 3：强制终止
+### 方法 3：发送信号
 
 ```bash
+# 优雅停止
+kill <PID>
+
+# Unix: 触发 KillSwitch
+kill -USR1 <PID>
+
 # 强制终止（不推荐，可能丢失状态）
 kill -9 <PID>
 ```
@@ -219,13 +268,22 @@ kill -9 <PID>
 
 所有输出默认保存在 `simulation_results/` 目录：
 
-### status.json
+| 文件 | 说明 |
+|------|------|
+| `status.json` | 当前状态快照（原子写入，每次指标更新刷新） |
+| `metrics.jsonl` | 时间序列指标，周期性追加 |
+| `results.jsonl` | 每个市场的最终结算结果 |
+| `trades.jsonl` | 每笔成交记录（新架构 TradingRunner） |
+| `fill_calibration.jsonl` | 成交校准数据（概率 vs 实际） |
+| `archive/` | 历史状态备份 |
+| `KILL_SWITCH` | Kill switch 触发文件（自动删除） |
 
-当前状态快照，每次指标更新时刷新。
+### status.json 示例
 
 ```json
 {
   "running": true,
+  "mode": "paper",
   "start_time": "2026-02-03T10:00:00",
   "config": {
     "coins": ["btc", "eth", "sol"],
@@ -237,27 +295,47 @@ kill -9 <PID>
     "total_pnl": 1234.56,
     "sharpe_ratio": 1.82
   },
-  "active_markets": ["btc-updown-15m-1770129900"]
+  "active_markets": ["btc-updown-15m-1770129900"],
+  "market_details": { ... }
 }
 ```
 
-### metrics.jsonl
+---
 
-时间序列指标，每 5 分钟追加一行：
+## 安全机制
 
-```json
-{"timestamp": "2026-02-03T10:05:00", "total_pnl": 100.0, "sharpe_ratio": 0.5, ...}
-{"timestamp": "2026-02-03T10:10:00", "total_pnl": 150.0, "sharpe_ratio": 0.8, ...}
+### RiskManager（风控熔断）
+
+在 `.env` 或环境变量中配置：
+
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `RISK_DAILY_LOSS_LIMIT` | 50.0 | 每日最大亏损（USD） |
+| `RISK_PER_MARKET_LOSS_LIMIT` | 10.0 | 单市场最大亏损（USD） |
+| `RISK_CONSECUTIVE_LOSS_PAUSE` | 5 | 连续亏损 N 次后暂停 |
+| `RISK_PAUSE_DURATION_SECONDS` | 1800 | 暂停时长（默认 30 分钟） |
+| `RISK_MAX_TOTAL_EXPOSURE` | 500.0 | 总持仓上限（USD） |
+
+### KillSwitch（紧急停止）
+
+触发方式：
+1. **文件触发**：创建 `simulation_results/KILL_SWITCH` 文件
+2. **信号触发**：`kill -USR1 <PID>`
+3. **编程触发**：`kill_switch.activate("reason")`
+
+触发后系统自动：取消所有挂单 → 保存状态 → 退出
+
+### AlertManager（告警）
+
+配置 Discord/Telegram webhook 接收告警：
+
+```bash
+# .env
+ALERT_WEBHOOK_URL=https://discord.com/api/webhooks/...
+ALERT_ENABLE_ALERTS=true
 ```
 
-### results.jsonl
-
-每个市场的最终结果：
-
-```json
-{"slug": "btc-updown-15m-1770129000", "winner": "up", "pnl": 50.0, "roi": 0.05, ...}
-{"slug": "eth-updown-15m-1770129000", "winner": "down", "pnl": -20.0, "roi": -0.02, ...}
-```
+告警事件：每日亏损接近限额、市场结算（显著 PnL）、熔断触发、Kill Switch 激活。
 
 ---
 
@@ -270,8 +348,9 @@ python -m polymoney.simulation.status_cli --json
 ```
 
 **解析返回值：**
-- `running: true` → 模拟正在运行
-- `running: false` → 模拟已停止
+- `running: true` → 交易正在运行
+- `running: false` → 已停止
+- `mode: "paper"` / `"live"` → 当前运行模式
 
 ### 获取性能指标
 
@@ -285,12 +364,6 @@ python -m polymoney.simulation.status_cli --json | jq '.stats'
 - `sharpe_ratio`: 夏普率
 - `win_rate`: 胜率
 
-### 获取历史数据
-
-```bash
-python -m polymoney.simulation.status_cli --history --json
-```
-
 ### 示例：AI 监控脚本
 
 ```python
@@ -298,7 +371,7 @@ import json
 import subprocess
 
 def check_simulation_status():
-    """检查模拟状态并返回关键指标。"""
+    """检查交易状态并返回关键指标。"""
     result = subprocess.run(
         ["python", "-m", "polymoney.simulation.status_cli", "--json"],
         capture_output=True,
@@ -313,15 +386,15 @@ def check_simulation_status():
     
     return {
         "running": status.get("running", False),
+        "mode": status.get("mode", "unknown"),
         "pnl": stats.get("total_pnl", 0),
         "roi": stats.get("total_roi", 0),
         "sharpe": stats.get("sharpe_ratio", 0),
         "markets": stats.get("markets_processed", 0),
     }
 
-# 使用示例
 status = check_simulation_status()
-print(f"PnL: ${status['pnl']:.2f}, Sharpe: {status['sharpe']:.2f}")
+print(f"Mode: {status['mode']}, PnL: ${status['pnl']:.2f}, Sharpe: {status['sharpe']:.2f}")
 ```
 
 ---
@@ -346,14 +419,23 @@ print(f"PnL: ${status['pnl']:.2f}, Sharpe: {status['sharpe']:.2f}")
 2. 等待下一个 15 分钟周期开始
 3. 检查 Polymarket 网站确认市场存在
 
+### 问题：实盘模式启动失败
+
+**症状：** `RuntimeError: Live trading requires POLYMARKET_PRIVATE_KEY`
+
+**解决方案：**
+1. 确认 `.env` 文件存在且包含 `POLYMARKET_PRIVATE_KEY`
+2. 确认 `py-clob-client` 已安装：`pip install py-clob-client`
+3. 确认钱包有足够的 Polygon USDC 余额
+
 ### 问题：模拟崩溃
 
 **症状：** 进程意外退出
 
 **解决方案：**
 1. 使用 `--resume` 从上次状态恢复
-2. 检查日志文件 `--log-file sim.log`
-3. 增加日志级别 `--log-level DEBUG`
+2. 增加日志级别 `--log-level DEBUG`
+3. 检查输出目录中的 `status.json` 和日志
 
 ### 问题：状态文件损坏
 
@@ -361,28 +443,21 @@ print(f"PnL: ${status['pnl']:.2f}, Sharpe: {status['sharpe']:.2f}")
 
 **解决方案：**
 1. 删除 `status.json`
-2. 重新启动模拟（不使用 `--resume`）
+2. 重新启动（不使用 `--resume`）
 3. 检查 `archive/` 目录中的历史状态
-
-### 问题：内存使用过高
-
-**症状：** 长时间运行后内存增长
-
-**解决方案：**
-1. 定期重启模拟
-2. 使用 `--duration` 设置固定运行时长
-3. 减少 `--metrics-interval` 降低数据量
 
 ---
 
 ## 最佳实践
 
-1. **使用固定时长**：建议设置 `--duration`，避免无限运行
-2. **定期检查状态**：使用 `sim-status` 定期监控
-3. **保留日志**：使用 `--log-file` 保存日志便于排查问题
-4. **测试环境**：先用短时间（如 30 分钟）测试确认工作正常
-5. **备份数据**：定期备份 `simulation_results/` 目录
+1. **先用纸上交易验证**：先运行 `trade --mode paper` 确认策略表现
+2. **实盘从小额开始**：`--position-size 10` 开始，逐步放量
+3. **使用固定时长**：建议设置 `--duration`，避免无限运行
+4. **配置告警**：设置 Discord webhook 获取实时通知
+5. **定期检查状态**：使用 `status_cli` 监控
+6. **备份数据**：定期备份 `simulation_results/` 目录
+7. **保留日志**：使用 `--log-level INFO` 保存足够的调试信息
 
 ---
 
-*最后更新：2026-02-03*
+*最后更新：2026-02-16*

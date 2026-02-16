@@ -7,8 +7,8 @@
 # and can be overridden via CLI arguments.
 #
 # Usage:
-#   python scripts/run_simulation.py live --config config/strategy_defaults.yaml
-#   python scripts/run_simulation.py backtest --config config/my_custom.yaml
+#   python scripts/run_trading.py --config config/strategy_defaults.yaml
+#   python scripts/run_trading.py backtest --config config/my_custom.yaml
 #
 # ============================================================================
 

@@ -253,7 +253,7 @@ def _check_pending_fills(self, price_data: PriceData) -> None:
 | `polymoney/testing/runner.py` | 测试运行器 |
 | `polymoney/testing/analytics.py` | 性能分析模块 |
 | `tests/test_testing_module.py` | 单元测试 |
-| `examples/run_real_data_test.py` | 真实数据测试脚本 |
+| `scripts/run_trading.py` | 统一入口（list / backtest / run） |
 | `test_results/demo/` | 测试输出目录 |
 
 ---
@@ -366,20 +366,23 @@ enable_rebalancing = False  # 市价单补板（默认关闭）
 - `warning`：100% ≤ ECR < threshold，警告状态
 - `limited`：ECR ≥ threshold，停止下单
 
-### 8.3 新增命令行工具
+### 8.3 命令行工具
 
 ```bash
 # 列出可用市场
-python examples/run_real_data_test.py --list-markets
+python scripts/run_trading.py list
 
 # 测试单个市场
-python examples/run_real_data_test.py --slug btc-updown-15m-1770106500
+python scripts/run_trading.py backtest --slug btc-updown-15m-1770106500
 
 # 批量回测
-python examples/run_real_data_test.py --backtest 5
+python scripts/run_trading.py backtest --count 5
 
-# 禁用 ECR 止损
-python examples/run_real_data_test.py --backtest 5 --disable-ecr-stoploss
+# 纸上交易
+python scripts/run_trading.py
+
+# 实盘交易（需配置 POLYMARKET_PRIVATE_KEY）
+python scripts/run_trading.py --live
 ```
 
 ---
@@ -467,4 +470,4 @@ enable_rebalancing = True          # 默认启用再平衡
 
 ---
 
-*报告更新时间：2026-02-03 21:40*
+*报告更新时间：2026-02-16（统一 CLI 入口为 scripts/run_trading.py）*
