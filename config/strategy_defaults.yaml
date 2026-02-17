@@ -187,3 +187,11 @@ fund_management:
 
   # Maximum total cost exposure across all active markets (USD).
   max_total_exposure: 500.0
+
+  # Redemption delay in seconds (paper mode only).
+  # Models the real-world latency between settlement detection and USDC availability:
+  #   settlement → Data API reflects → redeem tx confirms → USDC credited.
+  # During this window, capital is locked and NOT available for new positions.
+  # 0 = instant (unrealistic), 60 = typical real-world latency.
+  # Live mode ignores this — PositionRedeemer handles real redemption.
+  redemption_delay: 60.0

@@ -220,6 +220,7 @@ class StrategyConfig:
             "max_entry_skew": sim.get("max_entry_skew", 0.75),
             "max_concurrent_markets": fm.get("max_concurrent_markets", 6),
             "max_total_exposure": fm.get("max_total_exposure", 500.0),
+            "redemption_delay": fm.get("redemption_delay", 60.0),
         }
 
         # Apply overrides (None values are skipped)

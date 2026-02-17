@@ -43,6 +43,7 @@ from polymoney.execution.executor import (
     OrderResultStatus,
 )
 from polymoney.execution.fill_manager import FillManager
+from polymoney.execution.redeemer import PositionRedeemer
 from polymoney.execution.simulated import SimulatedExecutor
 from polymoney.execution.live import LiveExecutor
 from polymoney.simulation.live_runner import (
@@ -102,8 +103,14 @@ class TradingRunner:
             )
 
         # Fill manager
+        # In paper mode, simulate redemption delay so capital isn't instantly reusable.
+        # In live mode, delay=0 because the real PositionRedeemer handles it.
         trade_log = config.output_dir / "trades.jsonl"
-        self.fill_manager = FillManager(trade_log_path=trade_log)
+        redemption_delay = config.redemption_delay if mode != "live" else 0.0
+        self.fill_manager = FillManager(
+            trade_log_path=trade_log,
+            redemption_delay=redemption_delay,
+        )
 
         # Risk management
         self.risk_manager = RiskManager(
@@ -122,6 +129,9 @@ class TradingRunner:
             webhook_url=alert_config.webhook_url,
             enabled=alert_config.enable_alerts,
         )
+
+        # Position redeemer (live mode only, initialized in _init_clob_client)
+        self.redeemer: Optional[PositionRedeemer] = None
 
         # Active market contexts: slug -> MarketContext
         self._contexts: Dict[str, MarketContext] = {}
@@ -187,6 +197,10 @@ class TradingRunner:
         # Start data provider
         await self.data_provider.start()
 
+        # Start position redeemer background scan (live mode)
+        if self.redeemer is not None:
+            await self.redeemer.start_background_scan()
+
         # Start background tasks
         tasks = [
             asyncio.create_task(self._metrics_output_loop()),
@@ -203,6 +217,10 @@ class TradingRunner:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Stop position redeemer
+            if self.redeemer is not None:
+                await self.redeemer.stop()
 
             # Stop kill switch
             await self.kill_switch.stop_monitoring()
@@ -305,6 +323,25 @@ class TradingRunner:
                 f"Live executor ready: host={pm_config.host}, "
                 f"chain_id={pm_config.chain_id}"
             )
+
+            # Initialize position redeemer for automatic fund recovery
+            try:
+                self.redeemer = PositionRedeemer(
+                    private_key=pm_config.private_key,
+                    funder=pm_config.funder,
+                    signature_type=pm_config.signature_type,
+                )
+                if self.redeemer.is_available:
+                    logger.info("Position redeemer initialized for automatic redemption")
+                else:
+                    logger.warning(
+                        "polymarket-apis not installed; auto-redeem disabled. "
+                        "Install with: pip install polymarket-apis"
+                    )
+                    self.redeemer = None
+            except Exception as e:
+                logger.warning(f"Position redeemer initialization failed: {e}")
+                self.redeemer = None
 
         except ImportError:
             raise RuntimeError(
@@ -580,7 +617,7 @@ class TradingRunner:
         # Unregister from components
         self.executor.unregister_market(slug)
         await self.data_provider.unsubscribe_market(slug)
-        final_pos = self.fill_manager.unregister_market(slug)
+        final_pos = self.fill_manager.unregister_market(slug, winner=winner)
 
         if winner:
             result = ctx.finalize(winner)
@@ -603,8 +640,53 @@ class TradingRunner:
                 f"Market {slug} settled ({winner}): "
                 f"PnL=${result.pnl:.2f}, ROI={result.roi * 100:.1f}%"
             )
+
+            # Automatic redemption: convert winning tokens -> USDC
+            if self.redeemer is not None and result.condition_id:
+                asyncio.create_task(
+                    self._auto_redeem(result.condition_id, slug)
+                )
         else:
             logger.warning(f"Market {slug} ended without winner")
+
+    async def _auto_redeem(self, condition_id: str, slug: str) -> None:
+        """
+        Attempt automatic redemption after settlement.
+
+        Runs as a fire-and-forget task so it doesn't block the main loop.
+        Retries up to 3 times with exponential backoff if the Data API
+        hasn't yet reflected the settlement.
+        """
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                results = await self.redeemer.redeem_market(condition_id)
+                if results:
+                    successes = [r for r in results if r.success]
+                    total_value = sum(r.value_redeemed for r in successes)
+                    if successes:
+                        logger.info(
+                            f"Auto-redeem {slug}: {len(successes)}/{len(results)} "
+                            f"positions redeemed, ${total_value:.2f} recovered"
+                        )
+                    else:
+                        logger.warning(
+                            f"Auto-redeem {slug}: all {len(results)} attempts failed"
+                        )
+                else:
+                    # Positions may not be reflected yet, retry
+                    if attempt < max_retries - 1:
+                        wait = 30 * (2 ** attempt)
+                        logger.info(
+                            f"Auto-redeem {slug}: no positions found yet, "
+                            f"retry in {wait}s (attempt {attempt + 1}/{max_retries})"
+                        )
+                        await asyncio.sleep(wait)
+                        continue
+                break
+            except Exception as e:
+                logger.error(f"Auto-redeem {slug} error: {e}", exc_info=True)
+                break
 
     # ------------------------------------------------------------------
     # Metrics and output
@@ -614,6 +696,10 @@ class TradingRunner:
         """Periodically output metrics."""
         while self._running:
             try:
+                # Track peak capital exposure for capital efficiency metrics
+                current_exposure = self.fill_manager.get_total_exposure()
+                self.stats.update_exposure(current_exposure)
+
                 self._write_status()
                 self._append_metrics()
 

@@ -4,6 +4,10 @@
 # Polymarket API client
 py-clob-client>=0.1.0
 
+# Polymarket Web3 client (for automatic position redemption after settlement)
+# Supports EOA, Magic, and Safe/Gnosis wallets with gasless redemption
+polymarket-apis>=0.1.0
+
 # WebSocket client
 websockets>=12.0
 

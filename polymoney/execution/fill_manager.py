@@ -6,6 +6,7 @@ Bridges the gap between the OrderExecutor and the StrategyEngine by:
 - Applying fills to position tracking (MarketContext)
 - Reconciling local positions with exchange state
 - Logging trades for audit and analysis
+- Simulating redemption delays (capital locked until redeemed)
 """
 
 import json
@@ -57,6 +58,22 @@ class PositionState:
         return self.min_shares / max_s
 
 
+@dataclass
+class PendingRedemption:
+    """Capital locked in a settled market awaiting redemption.
+
+    Models the real-world delay between settlement detection and USDC
+    availability in the wallet.  During this window, the capital is not
+    available for new positions but is no longer at market risk.
+    """
+
+    market_id: str
+    settlement_value: float  # USDC to be recovered (winning shares)
+    total_cost: float        # Original cost of the position
+    settled_at: float        # time.time() when settlement was detected
+    release_at: float        # time.time() when capital becomes available
+
+
 class FillManager:
     """
     Manages fill events and position tracking.
@@ -66,13 +83,22 @@ class FillManager:
     2. Notifies registered callbacks (for strategy/engine)
     3. Logs trades to JSONL for audit
     4. Provides position reconciliation interface
+    5. Tracks pending redemptions (capital locked during settlement)
     """
 
-    def __init__(self, trade_log_path: Optional[Path] = None):
+    def __init__(
+        self,
+        trade_log_path: Optional[Path] = None,
+        redemption_delay: float = 0.0,
+    ):
         """
         Args:
             trade_log_path: Path to JSONL file for trade logging.
                            None disables logging.
+            redemption_delay: Seconds to hold settled capital before releasing.
+                             0 = instant release (live mode uses real redemption).
+                             >0 = simulated delay (paper mode, models real latency).
+                             Recommended: 30-120s for realistic simulation.
         """
         self._positions: Dict[str, PositionState] = {}
         self._callbacks: List[FillCallback] = []
@@ -80,14 +106,56 @@ class FillManager:
         self._total_fills = 0
         self._total_cancellations = 0
 
+        # Redemption simulation
+        self._redemption_delay = redemption_delay
+        self._pending_redemptions: List[PendingRedemption] = []
+        self._total_redemptions: int = 0
+        self._total_redeemed_value: float = 0.0
+
     def register_market(self, market_id: str) -> None:
         """Initialize position tracking for a market."""
         if market_id not in self._positions:
             self._positions[market_id] = PositionState(market_id=market_id)
 
-    def unregister_market(self, market_id: str) -> PositionState:
-        """Remove and return final position state for a market."""
-        return self._positions.pop(market_id, PositionState(market_id=market_id))
+    def unregister_market(
+        self,
+        market_id: str,
+        winner: Optional[str] = None,
+    ) -> PositionState:
+        """Remove and return final position state for a market.
+
+        If a redemption_delay is configured and a winner is provided,
+        the settlement value is queued as a pending redemption.  The
+        locked capital counts toward exposure until the delay elapses,
+        preventing the system from over-allocating to new markets.
+
+        Args:
+            market_id: Market slug to unregister.
+            winner: "up" or "down" if market settled, None if unknown.
+
+        Returns:
+            The final PositionState for the market.
+        """
+        pos = self._positions.pop(market_id, PositionState(market_id=market_id))
+
+        if self._redemption_delay > 0 and winner:
+            settlement_value = pos.up_shares if winner == "up" else pos.down_shares
+            if settlement_value > 0:
+                now = time.time()
+                pending = PendingRedemption(
+                    market_id=market_id,
+                    settlement_value=settlement_value,
+                    total_cost=pos.total_cost,
+                    settled_at=now,
+                    release_at=now + self._redemption_delay,
+                )
+                self._pending_redemptions.append(pending)
+                logger.info(
+                    f"[{market_id}] Redemption queued: ${settlement_value:.2f} "
+                    f"available in {self._redemption_delay:.0f}s"
+                )
+
+        return pos
 
     def add_callback(self, callback: FillCallback) -> None:
         """Add a fill notification callback."""
@@ -197,16 +265,54 @@ class FillManager:
         return dict(self._positions)
 
     def get_total_exposure(self) -> float:
-        """Get total cost across all markets."""
-        return sum(p.total_cost for p in self._positions.values())
+        """Get total capital committed: active positions + pending redemptions.
+
+        Pending redemptions lock capital until the redemption delay elapses.
+        This prevents the system from entering new markets with capital that
+        hasn't actually been recovered yet.
+        """
+        self._flush_matured_redemptions()
+        active = sum(p.total_cost for p in self._positions.values())
+        pending = sum(r.total_cost for r in self._pending_redemptions)
+        return active + pending
+
+    def get_pending_redemption_value(self) -> float:
+        """Get total value locked in pending redemptions."""
+        self._flush_matured_redemptions()
+        return sum(r.settlement_value for r in self._pending_redemptions)
+
+    def _flush_matured_redemptions(self) -> None:
+        """Release redemptions whose delay has elapsed."""
+        if not self._pending_redemptions:
+            return
+
+        now = time.time()
+        matured = [r for r in self._pending_redemptions if now >= r.release_at]
+
+        for r in matured:
+            self._total_redemptions += 1
+            self._total_redeemed_value += r.settlement_value
+            logger.info(
+                f"[{r.market_id}] Redemption complete: "
+                f"${r.settlement_value:.2f} USDC released "
+                f"(waited {now - r.settled_at:.0f}s)"
+            )
+
+        if matured:
+            self._pending_redemptions = [
+                r for r in self._pending_redemptions if now < r.release_at
+            ]
 
     def get_stats(self) -> Dict[str, Any]:
         """Get aggregate fill statistics."""
+        self._flush_matured_redemptions()
         return {
             "total_fills": self._total_fills,
             "total_cancellations": self._total_cancellations,
             "active_markets": len(self._positions),
             "total_exposure": self.get_total_exposure(),
+            "pending_redemptions": len(self._pending_redemptions),
+            "total_redeemed": self._total_redeemed_value,
         }
 
     def reconcile(

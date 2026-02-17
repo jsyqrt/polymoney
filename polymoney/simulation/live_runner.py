@@ -457,6 +457,12 @@ class SimulationConfig:
     max_concurrent_markets: int = 6       # Max markets trading simultaneously
     max_total_exposure: float = 500.0     # Max total cost across all markets
 
+    # Redemption simulation (paper mode only; live mode uses real redemption)
+    # Delay in seconds between settlement detection and capital release.
+    # Models the real-world gap: settlement → API reflects → redeem tx confirms.
+    # 0 = instant (unrealistic), 60 = typical real-world latency.
+    redemption_delay: float = 60.0
+
     @classmethod
     def parse_duration(cls, duration_str: str) -> float:
         """
@@ -565,10 +571,15 @@ class SimulationStats:
     markets_won: int = 0
     markets_lost: int = 0
 
-    # Aggregate metrics
+    # Aggregate metrics (per-market sum)
     total_pnl: float = 0.0
-    total_cost: float = 0.0
-    total_roi: float = 0.0
+    total_cost: float = 0.0       # Sum of all market costs (counts recycled capital multiple times)
+    total_roi: float = 0.0        # total_pnl / total_cost (per-dollar efficiency)
+
+    # Capital efficiency metrics
+    peak_exposure: float = 0.0    # Highest simultaneous capital at risk
+    capital_redeemed: float = 0.0  # Total USDC recovered from settlements
+    capital_turnover: float = 0.0  # total_cost / peak_exposure (how many times capital was recycled)
 
     # Running calculations for Sharpe
     returns: List[float] = field(default_factory=list)
@@ -578,6 +589,19 @@ class SimulationStats:
         if self.markets_processed == 0:
             return 0.0
         return self.markets_won / self.markets_processed
+
+    @property
+    def capital_roi(self) -> float:
+        """ROI relative to actual capital deployed (not recycled total).
+
+        This is the true return on investment: how much profit was generated
+        per dollar of actual capital committed at peak.  When funds are
+        recycled via redemption, this is higher than total_roi because the
+        same capital is used multiple times.
+        """
+        if self.peak_exposure <= 0:
+            return 0.0
+        return self.total_pnl / self.peak_exposure
 
     @property
     def sharpe_ratio(self) -> float:
@@ -597,6 +621,11 @@ class SimulationStats:
         annualization_factor = (35000 ** 0.5)
         return (mean_return / std_return) * annualization_factor
 
+    def update_exposure(self, current_exposure: float) -> None:
+        """Track peak capital exposure for capital efficiency metrics."""
+        if current_exposure > self.peak_exposure:
+            self.peak_exposure = current_exposure
+
     def add_result(self, result: MarketResult) -> None:
         """Add a market result to aggregate stats."""
         self.markets_processed += 1
@@ -609,10 +638,17 @@ class SimulationStats:
         self.total_pnl += result.pnl
         self.total_cost += result.total_cost
 
+        # Track capital recovered from settlement (winning shares = USDC back)
+        if result.winner == "up":
+            self.capital_redeemed += result.up_shares
+        elif result.winner == "down":
+            self.capital_redeemed += result.down_shares
+
         if result.total_cost > 0:
             self.returns.append(result.roi)
 
         self.total_roi = self.total_pnl / self.total_cost if self.total_cost > 0 else 0
+        self.capital_turnover = self.total_cost / self.peak_exposure if self.peak_exposure > 0 else 0
         self.last_update = time.time()
 
     def to_dict(self) -> Dict[str, Any]:
@@ -627,6 +663,10 @@ class SimulationStats:
             "total_pnl": self.total_pnl,
             "total_cost": self.total_cost,
             "total_roi": self.total_roi,
+            "peak_exposure": self.peak_exposure,
+            "capital_redeemed": self.capital_redeemed,
+            "capital_roi": self.capital_roi,
+            "capital_turnover": self.capital_turnover,
             "sharpe_ratio": self.sharpe_ratio,
         }
 

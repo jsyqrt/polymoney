@@ -6,6 +6,7 @@ Provides:
 - SimulatedExecutor for paper trading with depth-based fill simulation
 - LiveExecutor for real order execution via Polymarket CLOB
 - FillManager for real-time fill tracking and position reconciliation
+- PositionRedeemer for automatic redemption of settled positions
 """
 
 from polymoney.execution.executor import (
@@ -15,6 +16,7 @@ from polymoney.execution.executor import (
     OrderResult,
     OrderResultStatus,
 )
+from polymoney.execution.redeemer import PositionRedeemer
 
 __all__ = [
     "ExecutionOrder",
@@ -22,4 +24,5 @@ __all__ = [
     "OrderExecutor",
     "OrderResult",
     "OrderResultStatus",
+    "PositionRedeemer",
 ]

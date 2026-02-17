@@ -113,6 +113,35 @@ T+2h: 挑战期结束，若无争议则自动接受结果
 
 **注意**：结算期间资金锁定，无争议市场需 2+ 小时，有争议市场需 4-5 天。
 
+### 2.6 结算后赎回 (Redemption)
+
+市场结算后，获胜的条件代币**不会自动**转换为 USDC，需要主动调用 CTF 合约的 `redeemPositions` 函数：
+
+```
+赎回流程：
+1. UMA 预言机调用 reportPayouts() 报告获胜结果
+2. 用户调用 redeemPositions() 销毁条件代币，换回 USDC
+3. 合约发出 PayoutRedemption 事件
+
+参数：
+- collateralToken: USDC 地址
+- parentCollectionId: bytes32(0)（Polymarket 固定值）
+- conditionId: 市场的条件 ID
+- indexSets: [1, 2]（二元市场两个结果）
+```
+
+**重要限制**：
+- py-clob-client **没有**赎回接口（GitHub Issue #139，截至 2026-02 仍 open）
+- 对于 Safe/Magic 钱包，不能直接调用合约，需通过 `execTransaction` 或 Relayer
+- 社区方案：[polymarket-apis](https://github.com/qualiaenjoyer/polymarket-apis) 支持所有钱包类型的赎回
+- 无 Gas 方案：通过 Builder Relayer API 可免 Gas 赎回（支持 Magic/Safe 钱包）
+
+**Polymoney 自动赎回**：
+- `PositionRedeemer` 模块自动检测可赎回头寸（Data API: `GET /positions?redeemable=true`）
+- 市场结算后立即触发赎回，配合后台定时扫描捕捉遗漏
+- 优先使用无 Gas 赎回（Gasless），失败回退到 Gas 赎回
+- 确保资金自动循环利用
+
 ---
 
 ## 3. 市场类型与特征
