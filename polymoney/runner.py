@@ -280,15 +280,20 @@ class TradingRunner:
                 signature_type=pm_config.signature_type,
             )
 
-            # Validate wallet — derive address to confirm key is valid
+            # Validate wallet and set up API credentials
             try:
-                # py-clob-client derives the address from the private key
-                # on construction. Attempt a read-only API call to verify connectivity.
-                api_keys = client.derive_api_key()
-                logger.info(f"CLOB client initialized (API key derived)")
+                # For Magic wallets (signature_type=1), create API creds automatically
+                if pm_config.signature_type == 1:
+                    api_creds = client.create_or_derive_api_creds()
+                    client.set_api_creds(api_creds)
+                    logger.info(f"CLOB client initialized with auto-derived API credentials for Magic wallet")
+                else:
+                    # For EOA wallets, derive API key
+                    api_keys = client.derive_api_key()
+                    logger.info(f"CLOB client initialized (API key derived)")
             except Exception as e:
                 logger.warning(
-                    f"CLOB client initialized but API key derivation failed: {e}. "
+                    f"CLOB client initialized but API credential setup failed: {e}. "
                     f"You may need to create API credentials on Polymarket."
                 )
 
