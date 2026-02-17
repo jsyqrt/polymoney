@@ -955,11 +955,16 @@ class PositionArbitrageStrategy(BaseStrategy):
         pair_budget = self.batch_size * 2  # Total per order pair
         
         # Minimum order cost enforces the Polymarket minimum order size.
-        # Convert min_order_shares (default 5) to dollars using the cheaper
-        # side's limit price (worst case).  This ensures every order exceeds
-        # the exchange minimum, e.g. 5 shares × $0.30 = $1.50.
-        min_price = min(up_limit, down_limit)
-        min_order_cost = max(self.min_order_shares * min_price, self.batch_size * 0.5)
+        # CRITICAL: compute per-side using each side's OWN limit price.
+        # Using min(up, down) was a bug — the expensive side needs MORE dollars
+        # to reach min_order_shares.  E.g. with UP=0.54, DOWN=0.40, min_shares=5:
+        #   UP needs 5×0.54=$2.70, DOWN needs 5×0.40=$2.00.
+        #   Using min_price=$0.40 gave both sides $2.00 floor, producing only
+        #   3.7 UP shares → rejected by Polymarket (minimum: 5).
+        min_order_cost_up = max(self.min_order_shares * up_limit, self.batch_size * 0.5)
+        min_order_cost_down = max(self.min_order_shares * down_limit, self.batch_size * 0.5)
+        # Loop guard: continue while we can afford at least the cheaper side
+        min_order_cost = min(min_order_cost_up, min_order_cost_down)
         while available >= min_order_cost and orders_created < max_orders_per_tick:
             # Calculate current imbalance
             gap_shares = abs(up_shares_total - down_shares_total)
@@ -989,7 +994,8 @@ class PositionArbitrageStrategy(BaseStrategy):
             # ECR recovery: skip if this side is blocked by recovery constraint
             primary_blocked = ecr_recovery_side is not None and primary_side != ecr_recovery_side
             primary_cost_ratio = up_cost_ratio if primary_side == "up" else down_cost_ratio
-            primary_order_budget = max(pair_budget * primary_cost_ratio, min_order_cost)
+            primary_min_cost = min_order_cost_up if primary_side == "up" else min_order_cost_down
+            primary_order_budget = max(pair_budget * primary_cost_ratio, primary_min_cost)
             if not primary_blocked and primary_count < max_pending_per_side and available >= primary_order_budget:
                 # Proportional order sizing: scale cost by price ratio for balanced shares.
                 order_cost = min(available, primary_order_budget)
@@ -1022,7 +1028,8 @@ class PositionArbitrageStrategy(BaseStrategy):
             # ECR recovery: skip if this side is blocked by recovery constraint
             secondary_blocked = ecr_recovery_side is not None and secondary_side != ecr_recovery_side
             secondary_cost_ratio = up_cost_ratio if secondary_side == "up" else down_cost_ratio
-            secondary_order_budget = max(pair_budget * secondary_cost_ratio, min_order_cost)
+            secondary_min_cost = min_order_cost_up if secondary_side == "up" else min_order_cost_down
+            secondary_order_budget = max(pair_budget * secondary_cost_ratio, secondary_min_cost)
             if not secondary_blocked and secondary_count < max_pending_per_side and available >= secondary_order_budget:
                 # Phase 3: Don't buy low probability side
                 if phase == 3 and secondary_limit < self.low_prob_threshold:

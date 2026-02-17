@@ -27,8 +27,10 @@ strategy:
   # batch_size = position_size × batch_ratio (auto-calculated).
   # Default 0.001 (1/1000): for $100 budget → $0.10 per order.
   # Very small batches give fine-grained averaging and precise ECR convergence.
-  # NOTE: For real Polymarket trading, minimum is ~$2.50 (5-share minimum).
-  # The strategy applies a floor of $0.10 for safety.
+  # NOTE: In live trading, the per-side min_order_cost (min_order_shares × side_price)
+  # dominates when batch_size is small. E.g. at price $0.50, min cost = 5×0.50 = $2.50,
+  # so effective order size is $2.50 regardless of batch_size=$0.10.
+  # For faster position building in live trading, consider --batch-ratio 0.025.
   batch_ratio: 0.001
 
   # Explicit batch_size override (uncomment to disable auto-calculation):
