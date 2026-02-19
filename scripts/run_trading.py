@@ -6,6 +6,7 @@ Commands:
     list       List available Polymarket 15-minute markets
     backtest   Backtest strategy on historical market data
     run        Paper or live trading (default command)
+    claim      Check and redeem unredeemed tokens to recover USDC balance
 
 Usage:
     # Paper trading (default)
@@ -25,6 +26,10 @@ Usage:
     # Backtest
     python scripts/run_trading.py backtest --slug btc-updown-15m-XXXXXXX
     python scripts/run_trading.py backtest --count 5
+
+    # Claim unredeemed tokens
+    python scripts/run_trading.py claim          # check + redeem all
+    python scripts/run_trading.py claim --dry-run # check only, don't redeem
 
 Output:
     simulation_results/
@@ -323,6 +328,107 @@ async def cmd_backtest(args, yaml_config):
 
 
 # =============================================================================
+# claim (check and redeem unredeemed tokens)
+# =============================================================================
+
+async def cmd_claim(args):
+    """Check for unredeemed tokens and claim them to recover USDC balance."""
+    from polymoney.core.config import PolymarketConfig
+    from polymoney.execution.redeemer import PositionRedeemer
+
+    pm_config = PolymarketConfig()
+    if not pm_config.private_key:
+        print("ERROR: POLYMARKET_PRIVATE_KEY is required.")
+        print("Set it in .env or as an environment variable.")
+        sys.exit(1)
+
+    redeemer = PositionRedeemer(
+        private_key=pm_config.private_key,
+        funder=pm_config.funder,
+        signature_type=pm_config.signature_type,
+    )
+
+    if not redeemer.is_available:
+        print("ERROR: polymarket-apis is required for redemption.")
+        print("Install with: pip install polymarket-apis")
+        sys.exit(1)
+
+    print("=" * 60)
+    print("  POLYMONEY — TOKEN CLAIM")
+    print("=" * 60)
+    print()
+
+    # Fetch redeemable positions
+    print("Scanning for unredeemed tokens...")
+    positions = await redeemer.get_redeemable_positions()
+
+    if not positions:
+        print("No unredeemed tokens found. Balance is fully available.")
+        return
+
+    # Group by condition
+    by_condition: dict = {}
+    for pos in positions:
+        by_condition.setdefault(pos.condition_id, []).append(pos)
+
+    total_value = sum(p.current_value for p in positions)
+
+    print(f"Found {len(positions)} unredeemed position(s) "
+          f"across {len(by_condition)} market(s):")
+    print()
+
+    for i, (cid, cid_positions) in enumerate(by_condition.items(), 1):
+        title = cid_positions[0].title or cid[:20] + "..."
+        value = sum(p.current_value for p in cid_positions)
+        outcomes = ", ".join(
+            f"{p.outcome}: {p.size:.2f} shares" for p in cid_positions
+        )
+        print(f"  {i}. {title}")
+        print(f"     Value: ${value:.2f}  ({outcomes})")
+        print(f"     Condition: {cid[:32]}...")
+        print()
+
+    print(f"  Total redeemable: ${total_value:.2f}")
+    print()
+
+    if args.dry_run:
+        print("Dry run — no redemptions performed.")
+        return
+
+    # Redeem all
+    print("Redeeming...")
+    print()
+
+    total_redeemed = 0.0
+    total_failed = 0
+
+    for cid, cid_positions in by_condition.items():
+        title = cid_positions[0].title or cid[:20] + "..."
+
+        for pos in cid_positions:
+            result = await redeemer.redeem_position(pos)
+            if result.success:
+                total_redeemed += result.value_redeemed
+                print(f"  OK  {title} ({pos.outcome}): "
+                      f"${result.value_redeemed:.2f} "
+                      f"[tx={result.tx_hash or 'n/a'}]")
+            else:
+                total_failed += 1
+                print(f"  FAIL {title} ({pos.outcome}): {result.error}")
+
+            # Rate limit between redemptions
+            await asyncio.sleep(2.0)
+
+    print()
+    print("-" * 60)
+    print(f"  Redeemed : ${total_redeemed:.2f}")
+    if total_failed > 0:
+        print(f"  Failed   : {total_failed} position(s)")
+    print(f"  Total    : {len(positions) - total_failed}/{len(positions)} successful")
+    print("-" * 60)
+
+
+# =============================================================================
 # run (paper / live trading)
 # =============================================================================
 
@@ -460,6 +566,8 @@ Examples:
   python scripts/run_trading.py -m btc,eth -d 10h         # custom
   python scripts/run_trading.py list                       # show markets
   python scripts/run_trading.py backtest --count 5         # backtest
+  python scripts/run_trading.py claim                      # redeem tokens
+  python scripts/run_trading.py claim --dry-run            # check only
 """,
     )
     sub = parser.add_subparsers(dest="command")
@@ -483,12 +591,20 @@ Examples:
     p_run = sub.add_parser("run", help="Paper or live trading")
     add_run_args(p_run)
 
+    # --- claim ---
+    p_claim = sub.add_parser("claim", help="Check and redeem unredeemed tokens")
+    p_claim.add_argument(
+        "--dry-run", action="store_true",
+        help="Only check, don't actually redeem",
+    )
+
     # Common args on the top-level parser too (for shorthand usage)
     add_run_args(parser)
     add_common_args(parser)
     add_common_args(p_list)
     add_common_args(p_bt)
     add_common_args(p_run)
+    add_common_args(p_claim)
 
     args = parser.parse_args()
 
@@ -511,6 +627,8 @@ Examples:
         asyncio.run(cmd_list(args))
     elif args.command == "backtest":
         asyncio.run(cmd_backtest(args, yaml_config))
+    elif args.command == "claim":
+        asyncio.run(cmd_claim(args))
     elif args.command == "run":
         asyncio.run(cmd_run(args, yaml_config))
     elif args.command is None:

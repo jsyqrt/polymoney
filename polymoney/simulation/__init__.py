@@ -1,14 +1,14 @@
 """
-Simulation module for live paper trading.
+Simulation module — shared types, configuration, and status tools.
 
-This module provides:
-- LiveRunner: Real-time multi-market simulation runner
-- StatusCLI: Command-line status query tool
-- Metrics output and state persistence
+Provides:
+- SimulationConfig: Unified configuration for paper and live trading
+- SimulationStats: Aggregate statistics for a trading session
+- MarketResult: Per-market settlement results
+- SimStatusCLI: Command-line status query tool
 """
 
 from polymoney.simulation.live_runner import (
-    LiveRunner,
     SimulationConfig,
     SimulationStats,
     MarketResult,
@@ -16,7 +16,6 @@ from polymoney.simulation.live_runner import (
 from polymoney.simulation.status_cli import SimStatusCLI
 
 __all__ = [
-    "LiveRunner",
     "SimulationConfig",
     "SimulationStats",
     "MarketResult",

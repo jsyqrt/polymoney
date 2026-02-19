@@ -6,7 +6,7 @@ Bridges the gap between the OrderExecutor and the StrategyEngine by:
 - Applying fills to position tracking (MarketContext)
 - Reconciling local positions with exchange state
 - Logging trades for audit and analysis
-- Simulating redemption delays (capital locked until redeemed)
+- Tracking pending redemptions (capital locked until redeemed)
 """
 
 import json
@@ -58,22 +58,6 @@ class PositionState:
         return self.min_shares / max_s
 
 
-@dataclass
-class PendingRedemption:
-    """Capital locked in a settled market awaiting redemption.
-
-    Models the real-world delay between settlement detection and USDC
-    availability in the wallet.  During this window, the capital is not
-    available for new positions but is no longer at market risk.
-    """
-
-    market_id: str
-    settlement_value: float  # USDC to be recovered (winning shares)
-    total_cost: float        # Original cost of the position
-    settled_at: float        # time.time() when settlement was detected
-    release_at: float        # time.time() when capital becomes available
-
-
 class FillManager:
     """
     Manages fill events and position tracking.
@@ -83,22 +67,17 @@ class FillManager:
     2. Notifies registered callbacks (for strategy/engine)
     3. Logs trades to JSONL for audit
     4. Provides position reconciliation interface
-    5. Tracks pending redemptions (capital locked during settlement)
+    5. Tracks pending redemptions (capital locked until redeemed)
     """
 
     def __init__(
         self,
         trade_log_path: Optional[Path] = None,
-        redemption_delay: float = 0.0,
     ):
         """
         Args:
             trade_log_path: Path to JSONL file for trade logging.
                            None disables logging.
-            redemption_delay: Seconds to hold settled capital before releasing.
-                             0 = instant release (live mode uses real redemption).
-                             >0 = simulated delay (paper mode, models real latency).
-                             Recommended: 30-120s for realistic simulation.
         """
         self._positions: Dict[str, PositionState] = {}
         self._callbacks: List[FillCallback] = []
@@ -106,10 +85,9 @@ class FillManager:
         self._total_fills = 0
         self._total_cancellations = 0
 
-        # Redemption simulation
-        self._redemption_delay = redemption_delay
-        self._pending_redemptions: List[PendingRedemption] = []
-        self._total_redemptions: int = 0
+        # Pending redemptions: market_id -> total_cost locked until redeemed.
+        # Capital in this dict is NOT available for new positions.
+        self._pending_redemptions: Dict[str, float] = {}
         self._total_redeemed_value: float = 0.0
 
     def register_market(self, market_id: str) -> None:
@@ -124,10 +102,9 @@ class FillManager:
     ) -> PositionState:
         """Remove and return final position state for a market.
 
-        If a redemption_delay is configured and a winner is provided,
-        the settlement value is queued as a pending redemption.  The
-        locked capital counts toward exposure until the delay elapses,
-        preventing the system from over-allocating to new markets.
+        When a winner is known (market settled), the position's cost is moved
+        to pending redemptions.  This locks the capital until redemption
+        succeeds and ``release_redemption`` is called.
 
         Args:
             market_id: Market slug to unregister.
@@ -138,24 +115,37 @@ class FillManager:
         """
         pos = self._positions.pop(market_id, PositionState(market_id=market_id))
 
-        if self._redemption_delay > 0 and winner:
-            settlement_value = pos.up_shares if winner == "up" else pos.down_shares
-            if settlement_value > 0:
-                now = time.time()
-                pending = PendingRedemption(
-                    market_id=market_id,
-                    settlement_value=settlement_value,
-                    total_cost=pos.total_cost,
-                    settled_at=now,
-                    release_at=now + self._redemption_delay,
-                )
-                self._pending_redemptions.append(pending)
-                logger.info(
-                    f"[{market_id}] Redemption queued: ${settlement_value:.2f} "
-                    f"available in {self._redemption_delay:.0f}s"
-                )
+        if winner and pos.total_cost > 0:
+            self._pending_redemptions[market_id] = pos.total_cost
+            logger.info(
+                f"[{market_id}] Capital locked pending redemption: "
+                f"${pos.total_cost:.2f}"
+            )
 
         return pos
+
+    def release_redemption(self, market_id: str) -> None:
+        """Release capital locked by a pending redemption.
+
+        Called after successful redemption (real or simulated) to make
+        the capital available for new positions again.
+        """
+        cost = self._pending_redemptions.pop(market_id, 0.0)
+        if cost > 0:
+            self._total_redeemed_value += cost
+            logger.info(
+                f"[{market_id}] Redemption released: ${cost:.2f} now available"
+            )
+
+    @property
+    def has_pending_redemptions(self) -> bool:
+        """Whether there are any markets awaiting redemption."""
+        return len(self._pending_redemptions) > 0
+
+    @property
+    def pending_redemption_count(self) -> int:
+        """Number of markets awaiting redemption."""
+        return len(self._pending_redemptions)
 
     def add_callback(self, callback: FillCallback) -> None:
         """Add a fill notification callback."""
@@ -267,45 +257,16 @@ class FillManager:
     def get_total_exposure(self) -> float:
         """Get total capital committed: active positions + pending redemptions.
 
-        Pending redemptions lock capital until the redemption delay elapses.
-        This prevents the system from entering new markets with capital that
-        hasn't actually been recovered yet.
+        Pending redemptions lock capital until the redemption completes.
+        This prevents the system from entering new markets with capital
+        that hasn't actually been recovered yet.
         """
-        self._flush_matured_redemptions()
         active = sum(p.total_cost for p in self._positions.values())
-        pending = sum(r.total_cost for r in self._pending_redemptions)
+        pending = sum(self._pending_redemptions.values())
         return active + pending
-
-    def get_pending_redemption_value(self) -> float:
-        """Get total value locked in pending redemptions."""
-        self._flush_matured_redemptions()
-        return sum(r.settlement_value for r in self._pending_redemptions)
-
-    def _flush_matured_redemptions(self) -> None:
-        """Release redemptions whose delay has elapsed."""
-        if not self._pending_redemptions:
-            return
-
-        now = time.time()
-        matured = [r for r in self._pending_redemptions if now >= r.release_at]
-
-        for r in matured:
-            self._total_redemptions += 1
-            self._total_redeemed_value += r.settlement_value
-            logger.info(
-                f"[{r.market_id}] Redemption complete: "
-                f"${r.settlement_value:.2f} USDC released "
-                f"(waited {now - r.settled_at:.0f}s)"
-            )
-
-        if matured:
-            self._pending_redemptions = [
-                r for r in self._pending_redemptions if now < r.release_at
-            ]
 
     def get_stats(self) -> Dict[str, Any]:
         """Get aggregate fill statistics."""
-        self._flush_matured_redemptions()
         return {
             "total_fills": self._total_fills,
             "total_cancellations": self._total_cancellations,

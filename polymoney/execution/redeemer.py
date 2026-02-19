@@ -5,11 +5,18 @@ After a prediction market resolves, winning conditional tokens must be
 explicitly redeemed to recover USDC collateral. This module automates
 that process so funds can be recycled into new markets.
 
-Two redemption backends are supported:
-  1. Gasless (PolymarketGaslessWeb3Client) - no gas fees, uses Builder Relayer
-     Supports: Magic (sig_type=1) and Safe (sig_type=2) wallets
-  2. Gas (PolymarketWeb3Client) - pays POL gas, direct on-chain tx
-     Supports: all wallet types including EOA (sig_type=0)
+Provides two redeemer implementations:
+
+  PositionRedeemer (live mode):
+    Two redemption backends via polymarket-apis:
+    1. Gasless (PolymarketGaslessWeb3Client) - no gas fees, uses Builder Relayer
+       Supports: Magic (sig_type=1) and Safe (sig_type=2) wallets
+    2. Gas (PolymarketWeb3Client) - pays POL gas, direct on-chain tx
+       Supports: all wallet types including EOA (sig_type=0)
+
+  PaperRedeemer (paper mode):
+    Simulates redemption with a configurable delay to model the real-world
+    latency between settlement detection and USDC availability.
 
 Detection of redeemable positions uses the Polymarket Data API directly
 (GET https://data-api.polymarket.com/positions?redeemable=true) so that
@@ -19,14 +26,16 @@ Usage in TradingRunner:
     redeemer = PositionRedeemer(private_key, funder, signature_type)
     await redeemer.start_background_scan(interval=300)  # every 5 min
     ...
-    await redeemer.redeem_market(condition_id)           # on settlement
+    results = await redeemer.redeem_market(condition_id)  # on settlement
+    if not all(r.success for r in results):
+        # handle failure - stop trading
     ...
     await redeemer.stop()
 """
 
 import asyncio
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -35,7 +44,6 @@ from polymoney.core.logging import get_logger
 
 logger = get_logger("execution.redeemer")
 
-# Polymarket Data API base URL
 DATA_API_BASE = "https://data-api.polymarket.com"
 
 
@@ -70,7 +78,7 @@ class PositionRedeemer:
     Automatic position redemption for settled Polymarket markets.
 
     Detects redeemable positions via the Data API, then redeems them
-    using polymarket-apis (gasless when possible).
+    using polymarket-apis (gasless when possible, falls back to gas).
     """
 
     def __init__(
@@ -92,7 +100,6 @@ class PositionRedeemer:
         self._signature_type = signature_type
         self._scan_interval = scan_interval
 
-        # Wallet address (derived from private key or funder)
         self._proxy_address: Optional[str] = funder
         self._eoa_address: Optional[str] = None
 
@@ -188,7 +195,6 @@ class PositionRedeemer:
             List of redeemable positions.
         """
         if not self._proxy_address:
-            # Need to init clients to derive address
             if not self._init_clients():
                 logger.error("Cannot detect redeemable positions: no wallet address")
                 return []
@@ -301,7 +307,7 @@ class PositionRedeemer:
         try:
             result = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: self._gasless_client.redeem_position(
+                lambda: self._gasless_client.redeem(
                     condition_id=cid,
                     amounts=amounts,
                     neg_risk=position.negative_risk,
@@ -336,7 +342,7 @@ class PositionRedeemer:
         try:
             result = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: self._web3_client.redeem_position(
+                lambda: self._web3_client.redeem(
                     condition_id=cid,
                     amounts=amounts,
                     neg_risk=position.negative_risk,
@@ -368,7 +374,9 @@ class PositionRedeemer:
     # Targeted redemption (called after settlement)
     # ------------------------------------------------------------------
 
-    async def redeem_market(self, condition_id: str) -> List[RedemptionResult]:
+    async def redeem_market(
+        self, condition_id: str, settlement_value: float = 0.0
+    ) -> List[RedemptionResult]:
         """
         Redeem all positions for a specific settled market.
 
@@ -376,6 +384,7 @@ class PositionRedeemer:
 
         Args:
             condition_id: The condition ID of the settled market.
+            settlement_value: Expected value to recover (used by PaperRedeemer).
 
         Returns:
             List of redemption results (one per position/outcome).
@@ -448,7 +457,6 @@ class PositionRedeemer:
 
     async def _scan_loop(self, interval: float) -> None:
         """Periodically scan for and redeem outstanding positions."""
-        # Wait a bit before the first scan to let the system start up
         await asyncio.sleep(30.0)
 
         while self._running:
@@ -470,7 +478,6 @@ class PositionRedeemer:
         if not positions:
             return
 
-        # Group by condition_id to avoid duplicate redemptions
         by_condition: Dict[str, List[RedeemablePosition]] = {}
         for pos in positions:
             by_condition.setdefault(pos.condition_id, []).append(pos)
@@ -509,9 +516,82 @@ class PositionRedeemer:
         """Check if redemption capability is available."""
         if self._clients_initialized:
             return self._web3_client is not None or self._gasless_client is not None
-        # Optimistic: check if package is importable
         try:
             import polymarket_apis  # noqa: F401
             return True
         except ImportError:
             return False
+
+
+class PaperRedeemer:
+    """
+    Simulated redeemer for paper trading mode.
+
+    Mimics the real redemption process with a configurable delay to model
+    the real-world latency between settlement detection and USDC availability.
+    Always succeeds (no external dependencies required).
+
+    The delay models: settlement → Data API reflects → redeem tx confirms → USDC credited.
+    Typical real-world latency is 30-120 seconds.
+    """
+
+    def __init__(self, redemption_delay: float = 60.0):
+        """
+        Args:
+            redemption_delay: Seconds to simulate between settlement and capital release.
+                             0 = instant (unrealistic), 60 = typical real-world latency.
+        """
+        self._delay = redemption_delay
+        self.total_redeemed: int = 0
+        self.total_value_redeemed: float = 0.0
+        self.total_failures: int = 0
+
+    @property
+    def is_available(self) -> bool:
+        return True
+
+    async def redeem_market(
+        self, condition_id: str, settlement_value: float = 0.0
+    ) -> List[RedemptionResult]:
+        """
+        Simulate redemption with delay.
+
+        Args:
+            condition_id: The condition ID of the settled market.
+            settlement_value: USDC value of winning tokens to recover.
+
+        Returns:
+            List with a single successful RedemptionResult.
+        """
+        if self._delay > 0:
+            logger.info(
+                f"Paper redeem: simulating {self._delay:.0f}s redemption delay "
+                f"(condition={condition_id[:16]}..., value=${settlement_value:.2f})"
+            )
+            await asyncio.sleep(self._delay)
+
+        self.total_redeemed += 1
+        self.total_value_redeemed += settlement_value
+
+        logger.info(
+            f"Paper redeem complete: ${settlement_value:.2f} recovered "
+            f"(condition={condition_id[:16]}...)"
+        )
+
+        return [RedemptionResult(
+            condition_id=condition_id,
+            success=True,
+            value_redeemed=settlement_value,
+        )]
+
+    async def start_background_scan(self, **kwargs) -> None:
+        """No-op for paper mode (no real positions to scan)."""
+        pass
+
+    async def stop(self) -> None:
+        """Log final stats."""
+        if self.total_redeemed > 0:
+            logger.info(
+                f"Paper redeemer stopped: {self.total_redeemed} redeemed, "
+                f"${self.total_value_redeemed:.2f} recovered"
+            )

@@ -8,8 +8,7 @@ Wires together:
 - FillManager (fill tracking and position reconciliation)
 - Metrics output (status.json, metrics.jsonl, results.jsonl)
 
-Replaces the monolithic LiveRunner with a clean, modular architecture
-that supports both paper trading (SimulatedExecutor) and real trading
+Supports both paper trading (SimulatedExecutor) and real trading
 (LiveExecutor) through the same code path.
 
 Usage:
@@ -43,7 +42,7 @@ from polymoney.execution.executor import (
     OrderResultStatus,
 )
 from polymoney.execution.fill_manager import FillManager
-from polymoney.execution.redeemer import PositionRedeemer
+from polymoney.execution.redeemer import PaperRedeemer, PositionRedeemer
 from polymoney.execution.simulated import SimulatedExecutor
 from polymoney.execution.live import LiveExecutor
 from polymoney.simulation.live_runner import (
@@ -103,13 +102,9 @@ class TradingRunner:
             )
 
         # Fill manager
-        # In paper mode, simulate redemption delay so capital isn't instantly reusable.
-        # In live mode, delay=0 because the real PositionRedeemer handles it.
         trade_log = config.output_dir / "trades.jsonl"
-        redemption_delay = config.redemption_delay if mode != "live" else 0.0
         self.fill_manager = FillManager(
             trade_log_path=trade_log,
-            redemption_delay=redemption_delay,
         )
 
         # Risk management
@@ -130,8 +125,16 @@ class TradingRunner:
             enabled=alert_config.enable_alerts,
         )
 
-        # Position redeemer (live mode only, initialized in _init_clob_client)
-        self.redeemer: Optional[PositionRedeemer] = None
+        # Position redeemer (initialized below for paper, in _init_clob_client for live)
+        if mode == "live":
+            self.redeemer = None  # will be set in _init_clob_client
+        else:
+            self.redeemer = PaperRedeemer(
+                redemption_delay=getattr(config, "redemption_delay", 60.0)
+            )
+
+        # Safety flag: set True if any redemption fails, blocks new market entry
+        self._redeem_failed = False
 
         # Active market contexts: slug -> MarketContext
         self._contexts: Dict[str, MarketContext] = {}
@@ -358,6 +361,21 @@ class TradingRunner:
         slug = event.market_slug
 
         if slug in self._contexts:
+            return
+
+        # Safety: block new markets if a previous redemption failed
+        if self._redeem_failed:
+            logger.warning(
+                f"Skipping {slug}: trading suspended due to redemption failure"
+            )
+            return
+
+        # Block new markets while redemptions are pending (capital not yet recovered)
+        if self.fill_manager.has_pending_redemptions:
+            logger.info(
+                f"Skipping {slug}: {self.fill_manager.pending_redemption_count} "
+                f"redemption(s) pending, waiting for capital recovery"
+            )
             return
 
         # Check exposure limits
@@ -641,40 +659,68 @@ class TradingRunner:
                 f"PnL=${result.pnl:.2f}, ROI={result.roi * 100:.1f}%"
             )
 
-            # Automatic redemption: convert winning tokens -> USDC
+            # Automatic redemption: recover capital from settled market
             if self.redeemer is not None and result.condition_id:
-                asyncio.create_task(
-                    self._auto_redeem(result.condition_id, slug)
+                settlement_value = (
+                    result.up_shares if winner == "up" else result.down_shares
                 )
+                asyncio.create_task(
+                    self._auto_redeem(result.condition_id, slug, settlement_value)
+                )
+            else:
+                # No redeemer available — release capital immediately
+                self.fill_manager.release_redemption(slug)
         else:
             logger.warning(f"Market {slug} ended without winner")
 
-    async def _auto_redeem(self, condition_id: str, slug: str) -> None:
+    async def _auto_redeem(
+        self, condition_id: str, slug: str, settlement_value: float
+    ) -> None:
         """
         Attempt automatic redemption after settlement.
 
         Runs as a fire-and-forget task so it doesn't block the main loop.
         Retries up to 3 times with exponential backoff if the Data API
         hasn't yet reflected the settlement.
+
+        SAFETY: If all retries fail, sets _redeem_failed flag which
+        blocks new market entry and triggers graceful shutdown.
         """
         max_retries = 3
+
         for attempt in range(max_retries):
             try:
-                results = await self.redeemer.redeem_market(condition_id)
+                results = await self.redeemer.redeem_market(
+                    condition_id, settlement_value=settlement_value
+                )
+
                 if results:
                     successes = [r for r in results if r.success]
+                    failures = [r for r in results if not r.success]
                     total_value = sum(r.value_redeemed for r in successes)
-                    if successes:
+
+                    if successes and not failures:
+                        # Full success
+                        self.fill_manager.release_redemption(slug)
                         logger.info(
-                            f"Auto-redeem {slug}: {len(successes)}/{len(results)} "
-                            f"positions redeemed, ${total_value:.2f} recovered"
+                            f"Auto-redeem {slug}: {len(successes)} position(s) "
+                            f"redeemed, ${total_value:.2f} recovered"
                         )
+                        return
+                    elif successes:
+                        # Partial success
+                        logger.warning(
+                            f"Auto-redeem {slug}: partial — "
+                            f"{len(successes)} ok, {len(failures)} failed"
+                        )
+                        # Treat partial as failure — capital not fully recovered
                     else:
+                        # All failed
                         logger.warning(
                             f"Auto-redeem {slug}: all {len(results)} attempts failed"
                         )
                 else:
-                    # Positions may not be reflected yet, retry
+                    # No positions found yet — may not be reflected in Data API
                     if attempt < max_retries - 1:
                         wait = 30 * (2 ** attempt)
                         logger.info(
@@ -683,10 +729,61 @@ class TradingRunner:
                         )
                         await asyncio.sleep(wait)
                         continue
+
+                # If we got results but had failures, retry
+                if attempt < max_retries - 1:
+                    wait = 30 * (2 ** attempt)
+                    logger.info(
+                        f"Auto-redeem {slug}: retrying in {wait}s "
+                        f"(attempt {attempt + 1}/{max_retries})"
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+
                 break
             except Exception as e:
                 logger.error(f"Auto-redeem {slug} error: {e}", exc_info=True)
+                if attempt < max_retries - 1:
+                    wait = 30 * (2 ** attempt)
+                    await asyncio.sleep(wait)
+                    continue
                 break
+
+        # All retries exhausted — trigger safety stop
+        await self._on_redeem_failure(slug)
+
+    async def _on_redeem_failure(self, slug: str) -> None:
+        """Handle redemption failure by stopping all trading.
+
+        Capital from the settled market is still locked. New market entry
+        is blocked immediately to prevent building positions without
+        sufficient available funds.
+        """
+        self._redeem_failed = True
+        pending = self.fill_manager.pending_redemption_count
+        locked_value = sum(self.fill_manager._pending_redemptions.values())
+
+        msg = (
+            f"REDEMPTION FAILED for {slug}. "
+            f"Trading suspended: {pending} redemption(s) pending, "
+            f"${locked_value:.2f} locked. "
+            f"Manual intervention required — redeem positions via "
+            f"Polymarket UI or restart after resolving the issue."
+        )
+        logger.critical(msg)
+
+        # Send alert
+        try:
+            await self.alert_manager.send_alert(
+                title="Redemption Failure — Trading Stopped",
+                message=msg,
+                level="critical",
+            )
+        except Exception:
+            pass
+
+        # Graceful shutdown
+        await self.stop(timeout=30.0)
 
     # ------------------------------------------------------------------
     # Metrics and output

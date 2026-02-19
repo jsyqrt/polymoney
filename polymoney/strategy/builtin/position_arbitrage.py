@@ -1139,16 +1139,25 @@ class PositionArbitrageStrategy(BaseStrategy):
             shares_needed = capped_shares
             order_cost = max_order_cost
         
-        # ECR check: reject rebalancing if it would push ECR past threshold
+        # ECR check: reject rebalancing only if it would WORSEN the position.
+        # Allow rebalancing that improves ECR even if the result is still above threshold,
+        # because going from e.g. 1.71 → 1.17 is a major improvement worth taking.
         projected_ecr = self.calculate_projected_ecr(underweight_side, shares_needed, order_price)
+        current_ecr = self.effective_cost_rate
         if projected_ecr > 0 and projected_ecr >= self.ecr_threshold:
-            logger.warning(
-                f"[{self.name}] REBALANCING REJECTED: would push ECR to {projected_ecr:.2%} "
-                f"(threshold {self.ecr_threshold:.2%}). "
-                f"Skipping {shares_needed:.1f} {underweight_side} shares."
-            )
-            self._last_rebalancing_rejection_time = datetime.now()
-            return None
+            if current_ecr > 0 and projected_ecr < current_ecr:
+                logger.info(
+                    f"[{self.name}] REBALANCING: accepting despite projected ECR {projected_ecr:.2%} > "
+                    f"threshold {self.ecr_threshold:.2%} (improves from current {current_ecr:.2%})"
+                )
+            else:
+                logger.warning(
+                    f"[{self.name}] REBALANCING REJECTED: would push ECR to {projected_ecr:.2%} "
+                    f"(threshold {self.ecr_threshold:.2%}, current {current_ecr:.2%}). "
+                    f"Skipping {shares_needed:.1f} {underweight_side} shares."
+                )
+                self._last_rebalancing_rejection_time = datetime.now()
+                return None
         
         logger.info(
             f"[{self.name}] REBALANCING: {underweight_side.upper()} {shares_needed:.1f} shares "
