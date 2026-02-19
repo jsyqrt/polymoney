@@ -395,36 +395,58 @@ async def cmd_claim(args):
         print("Dry run — no redemptions performed.")
         return
 
-    # Redeem all
-    print("Redeeming...")
+    # Redeem — one call per condition_id (combines both outcomes atomically)
+    print("Redeeming (one tx per condition, retries on 429)...")
     print()
 
     total_redeemed = 0.0
     total_failed = 0
+    total_conditions = len(by_condition)
 
-    for cid, cid_positions in by_condition.items():
+    for i, (cid, cid_positions) in enumerate(by_condition.items(), 1):
         title = cid_positions[0].title or cid[:20] + "..."
+        neg_risk = cid_positions[0].negative_risk
 
+        # Combine amounts: [yes_shares, no_shares]
+        amounts = [0.0, 0.0]
+        cond_value = 0.0
         for pos in cid_positions:
-            result = await redeemer.redeem_position(pos)
-            if result.success:
-                total_redeemed += result.value_redeemed
-                print(f"  OK  {title} ({pos.outcome}): "
-                      f"${result.value_redeemed:.2f} "
-                      f"[tx={result.tx_hash or 'n/a'}]")
-            else:
-                total_failed += 1
-                print(f"  FAIL {title} ({pos.outcome}): {result.error}")
+            amounts[pos.outcome_index] = pos.size
+            cond_value += pos.current_value
 
-            # Rate limit between redemptions
-            await asyncio.sleep(2.0)
+        outcomes_str = ", ".join(
+            f"{p.outcome}: {p.size:.2f}" for p in cid_positions
+        )
+
+        result = await redeemer.redeem_condition(
+            condition_id=cid,
+            amounts=amounts,
+            neg_risk=neg_risk,
+            label=title,
+            value=cond_value,
+        )
+
+        if result.success:
+            total_redeemed += result.value_redeemed
+            print(f"  [{i}/{total_conditions}] OK  {title}")
+            print(f"       ${result.value_redeemed:.2f} ({outcomes_str})")
+            if result.tx_hash:
+                print(f"       tx={result.tx_hash}")
+        else:
+            total_failed += 1
+            print(f"  [{i}/{total_conditions}] FAIL {title}")
+            print(f"       {result.error}")
+
+        # Delay between conditions to avoid rate limiting
+        if i < total_conditions:
+            await asyncio.sleep(3.0)
 
     print()
     print("-" * 60)
     print(f"  Redeemed : ${total_redeemed:.2f}")
     if total_failed > 0:
-        print(f"  Failed   : {total_failed} position(s)")
-    print(f"  Total    : {len(positions) - total_failed}/{len(positions)} successful")
+        print(f"  Failed   : {total_failed} condition(s)")
+    print(f"  Total    : {total_conditions - total_failed}/{total_conditions} conditions successful")
     print("-" * 60)
 
 

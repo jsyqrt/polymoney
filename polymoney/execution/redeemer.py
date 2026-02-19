@@ -257,115 +257,197 @@ class PositionRedeemer:
         """
         cid = position.condition_id
 
-        # Check cooldown
-        last_attempt = self._recently_redeemed.get(cid, 0)
-        if time.time() - last_attempt < self._redeem_cooldown:
+        # Check cooldown (only successful redemptions trigger cooldown)
+        last_success = self._recently_redeemed.get(cid, 0)
+        if time.time() - last_success < self._redeem_cooldown:
             return RedemptionResult(
                 condition_id=cid,
                 success=False,
-                error="Recently attempted, in cooldown",
+                error="Recently redeemed, in cooldown",
             )
 
+        amounts = [0, 0]
+        amounts[position.outcome_index] = position.size
+
+        return await self._execute_redeem(
+            condition_id=cid,
+            amounts=amounts,
+            neg_risk=position.negative_risk,
+            label=f"{position.title} ({position.outcome}, {position.size:.2f} shares)",
+            value=position.current_value,
+        )
+
+    async def redeem_condition(
+        self,
+        condition_id: str,
+        amounts: List[float],
+        neg_risk: bool = False,
+        label: str = "",
+        value: float = 0.0,
+    ) -> RedemptionResult:
+        """
+        Redeem both outcomes of a condition in a single call.
+
+        This is more efficient than calling redeem_position twice because
+        the CTF contract processes both outcomes atomically.
+
+        Args:
+            condition_id: Market condition ID.
+            amounts: [yes_shares, no_shares] to redeem.
+            neg_risk: Whether this is a negative-risk market.
+            label: Human-readable label for logging.
+            value: Expected USDC value to recover.
+        """
+        last_success = self._recently_redeemed.get(condition_id, 0)
+        if time.time() - last_success < self._redeem_cooldown:
+            return RedemptionResult(
+                condition_id=condition_id,
+                success=False,
+                error="Recently redeemed, in cooldown",
+            )
+
+        return await self._execute_redeem(
+            condition_id=condition_id,
+            amounts=amounts,
+            neg_risk=neg_risk,
+            label=label or condition_id[:16] + "...",
+            value=value,
+        )
+
+    async def _execute_redeem(
+        self,
+        condition_id: str,
+        amounts: List[float],
+        neg_risk: bool,
+        label: str,
+        value: float,
+    ) -> RedemptionResult:
+        """Core redemption logic with gasless-first strategy and 429 retry."""
         if not self._init_clients():
             return RedemptionResult(
-                condition_id=cid,
+                condition_id=condition_id,
                 success=False,
                 error="polymarket-apis not available",
             )
 
-        # Build amounts array: [yes_shares, no_shares]
-        amounts = [0, 0]
-        amounts[position.outcome_index] = position.size
-
-        self._recently_redeemed[cid] = time.time()
-
-        # Try gasless first
+        # Try gasless first (with 429 retry)
         if self._gasless_client is not None:
-            result = await self._redeem_gasless(position, amounts)
+            result = await self._redeem_gasless(
+                condition_id, amounts, neg_risk, label, value
+            )
             if result.success:
+                self._recently_redeemed[condition_id] = time.time()
                 return result
             logger.warning(
-                f"Gasless redeem failed for {cid}: {result.error}. "
-                f"Falling back to gas-based redeem."
+                f"Gasless redeem failed for {condition_id[:16]}...: "
+                f"{result.error}. Falling back to gas-based redeem."
             )
 
         # Fall back to gas-based
         if self._web3_client is not None:
-            return await self._redeem_with_gas(position, amounts)
+            result = await self._redeem_with_gas(
+                condition_id, amounts, neg_risk, label, value
+            )
+            if result.success:
+                self._recently_redeemed[condition_id] = time.time()
+            return result
 
         return RedemptionResult(
-            condition_id=cid,
+            condition_id=condition_id,
             success=False,
             error="No redemption client available",
         )
 
     async def _redeem_gasless(
-        self, position: RedeemablePosition, amounts: List[int]
+        self,
+        condition_id: str,
+        amounts: List[float],
+        neg_risk: bool,
+        label: str,
+        value: float,
     ) -> RedemptionResult:
-        """Redeem via the gasless relayer (no POL gas needed)."""
-        cid = position.condition_id
-        try:
-            result = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self._gasless_client.redeem(
-                    condition_id=cid,
-                    amounts=amounts,
-                    neg_risk=position.negative_risk,
-                ),
-            )
-            tx_hash = str(result) if result else None
-            logger.info(
-                f"Gasless redeem OK: {position.title} "
-                f"({position.outcome}, {position.size:.2f} shares) "
-                f"tx={tx_hash}"
-            )
-            self.total_redeemed += 1
-            self.total_value_redeemed += position.current_value
-            return RedemptionResult(
-                condition_id=cid,
-                success=True,
-                tx_hash=tx_hash,
-                value_redeemed=position.current_value,
-            )
-        except Exception as e:
-            return RedemptionResult(
-                condition_id=cid,
-                success=False,
-                error=f"Gasless redeem error: {e}",
-            )
+        """Redeem via the gasless relayer with retry on 429 rate limiting."""
+        max_retries = 4
+        for attempt in range(max_retries):
+            try:
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self._gasless_client.redeem_position(
+                        condition_id=condition_id,
+                        amounts=amounts,
+                        neg_risk=neg_risk,
+                    ),
+                )
+                tx_hash = str(result) if result else None
+                logger.info(f"Gasless redeem OK: {label} tx={tx_hash}")
+                self.total_redeemed += 1
+                self.total_value_redeemed += value
+                return RedemptionResult(
+                    condition_id=condition_id,
+                    success=True,
+                    tx_hash=tx_hash,
+                    value_redeemed=value,
+                )
+            except Exception as e:
+                err_str = str(e)
+                if "429" in err_str and attempt < max_retries - 1:
+                    wait = 5 * (2 ** attempt)  # 5s, 10s, 20s
+                    logger.info(
+                        f"Gasless relayer rate-limited (429), "
+                        f"retry in {wait}s ({attempt + 1}/{max_retries})"
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                return RedemptionResult(
+                    condition_id=condition_id,
+                    success=False,
+                    error=f"Gasless redeem error: {e}",
+                )
+        return RedemptionResult(
+            condition_id=condition_id,
+            success=False,
+            error="Gasless redeem: max retries exhausted (429)",
+        )
 
     async def _redeem_with_gas(
-        self, position: RedeemablePosition, amounts: List[int]
+        self,
+        condition_id: str,
+        amounts: List[float],
+        neg_risk: bool,
+        label: str,
+        value: float,
     ) -> RedemptionResult:
         """Redeem via direct on-chain tx (pays POL gas)."""
-        cid = position.condition_id
         try:
             result = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: self._web3_client.redeem(
-                    condition_id=cid,
+                lambda: self._web3_client.redeem_position(
+                    condition_id=condition_id,
                     amounts=amounts,
-                    neg_risk=position.negative_risk,
+                    neg_risk=neg_risk,
                 ),
             )
             tx_hash = str(result) if result else None
-            logger.info(
-                f"Gas redeem OK: {position.title} "
-                f"({position.outcome}, {position.size:.2f} shares) "
-                f"tx={tx_hash}"
-            )
+            logger.info(f"Gas redeem OK: {label} tx={tx_hash}")
             self.total_redeemed += 1
-            self.total_value_redeemed += position.current_value
+            self.total_value_redeemed += value
             return RedemptionResult(
-                condition_id=cid,
+                condition_id=condition_id,
                 success=True,
                 tx_hash=tx_hash,
-                value_redeemed=position.current_value,
+                value_redeemed=value,
             )
         except Exception as e:
             self.total_failures += 1
+            err_str = str(e)
+            if "insufficient funds" in err_str:
+                return RedemptionResult(
+                    condition_id=condition_id,
+                    success=False,
+                    error="No POL for gas fees (use gasless with Builder keys instead)",
+                )
             return RedemptionResult(
-                condition_id=cid,
+                condition_id=condition_id,
                 success=False,
                 error=f"Gas redeem error: {e}",
             )
