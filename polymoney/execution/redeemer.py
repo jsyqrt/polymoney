@@ -8,29 +8,16 @@ that process so funds can be recycled into new markets.
 Provides two redeemer implementations:
 
   PositionRedeemer (live mode):
-    Two redemption backends via polymarket-apis:
-    1. Gasless (PolymarketGaslessWeb3Client) - no gas fees, uses Builder Relayer
-       Supports: Magic (sig_type=1) and Safe (sig_type=2) wallets
-    2. Gas (PolymarketWeb3Client) - pays POL gas, direct on-chain tx
-       Supports: all wallet types including EOA (sig_type=0)
+    Two redemption backends:
+    1. Gasless via Builder Relayer (py-builder-relayer-client) - no gas fees.
+       Requires Builder API credentials (key, secret, passphrase).
+    2. Gas via polymarket-apis (PolymarketWeb3Client) - pays POL gas.
 
   PaperRedeemer (paper mode):
-    Simulates redemption with a configurable delay to model the real-world
-    latency between settlement detection and USDC availability.
+    Simulates redemption with a configurable delay.
 
 Detection of redeemable positions uses the Polymarket Data API directly
-(GET https://data-api.polymarket.com/positions?redeemable=true) so that
-the core detection path has zero extra package dependencies.
-
-Usage in TradingRunner:
-    redeemer = PositionRedeemer(private_key, funder, signature_type)
-    await redeemer.start_background_scan(interval=300)  # every 5 min
-    ...
-    results = await redeemer.redeem_market(condition_id)  # on settlement
-    if not all(r.success for r in results):
-        # handle failure - stop trading
-    ...
-    await redeemer.stop()
+(GET https://data-api.polymarket.com/positions?redeemable=true).
 """
 
 import asyncio
@@ -45,6 +32,33 @@ from polymoney.core.logging import get_logger
 logger = get_logger("execution.redeemer")
 
 DATA_API_BASE = "https://data-api.polymarket.com"
+
+# Polygon mainnet contract addresses
+CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+NEG_RISK_ADAPTER = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
+USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+
+CTF_REDEEM_ABI = [{
+    "name": "redeemPositions",
+    "type": "function",
+    "inputs": [
+        {"name": "collateralToken", "type": "address"},
+        {"name": "parentCollectionId", "type": "bytes32"},
+        {"name": "conditionId", "type": "bytes32"},
+        {"name": "indexSets", "type": "uint256[]"},
+    ],
+    "outputs": [],
+}]
+
+NEG_RISK_REDEEM_ABI = [{
+    "name": "redeemPositions",
+    "type": "function",
+    "inputs": [
+        {"name": "conditionId", "type": "bytes32"},
+        {"name": "amounts", "type": "uint256[]"},
+    ],
+    "outputs": [],
+}]
 
 
 @dataclass
@@ -87,25 +101,24 @@ class PositionRedeemer:
         funder: Optional[str] = None,
         signature_type: int = 0,
         scan_interval: float = 300.0,
+        builder_api_key: Optional[str] = None,
+        builder_secret: Optional[str] = None,
+        builder_passphrase: Optional[str] = None,
     ):
-        """
-        Args:
-            private_key: Wallet private key (hex string with or without 0x prefix)
-            funder: Proxy/funder wallet address (required for Magic/Safe wallets)
-            signature_type: 0=EOA, 1=Magic, 2=Safe/Gnosis
-            scan_interval: Seconds between background scans for redeemable positions
-        """
         self._private_key = private_key
         self._funder = funder
         self._signature_type = signature_type
         self._scan_interval = scan_interval
+        self._builder_api_key = builder_api_key
+        self._builder_secret = builder_secret
+        self._builder_passphrase = builder_passphrase
 
         self._proxy_address: Optional[str] = funder
         self._eoa_address: Optional[str] = None
 
-        # Web3 clients (lazy-initialized)
-        self._web3_client = None
-        self._gasless_client = None
+        # Clients (lazy-initialized)
+        self._web3_client = None      # polymarket-apis: gas-based
+        self._relay_client = None     # py-builder-relayer-client: gasless
         self._clients_initialized = False
 
         # Background scan state
@@ -126,16 +139,16 @@ class PositionRedeemer:
     # ------------------------------------------------------------------
 
     def _init_clients(self) -> bool:
-        """
-        Lazy-initialize polymarket-apis clients.
+        """Lazy-initialize redemption clients.
 
         Returns True if at least one client was initialized.
         """
         if self._clients_initialized:
-            return self._web3_client is not None or self._gasless_client is not None
+            return self._web3_client is not None or self._relay_client is not None
 
         self._clients_initialized = True
 
+        # Gas-based client (polymarket-apis) — fallback, requires POL
         try:
             from polymarket_apis import PolymarketWeb3Client
 
@@ -161,20 +174,43 @@ class PositionRedeemer:
             logger.error(f"Failed to initialize Web3 redeemer: {e}")
             return False
 
-        # Try gasless client for Magic/Safe wallets (no gas fees)
-        if self._signature_type in (1, 2):
+        # Gasless client (official Builder Relayer) — preferred
+        if self._builder_api_key and self._builder_secret and self._builder_passphrase:
             try:
-                from polymarket_apis import PolymarketGaslessWeb3Client
+                from py_builder_relayer_client.client import RelayClient
+                from py_builder_signing_sdk import (
+                    BuilderApiKeyCreds,
+                    BuilderConfig,
+                )
 
-                self._gasless_client = PolymarketGaslessWeb3Client(
-                    private_key=self._private_key,
-                    signature_type=self._signature_type,
+                builder_config = BuilderConfig(
+                    local_builder_creds=BuilderApiKeyCreds(
+                        key=self._builder_api_key,
+                        secret=self._builder_secret,
+                        passphrase=self._builder_passphrase,
+                    )
                 )
-                logger.info("Gasless redeemer initialized (no gas fees)")
-            except Exception as e:
+                self._relay_client = RelayClient(
+                    "https://relayer-v2.polymarket.com",
+                    137,
+                    self._private_key,
+                    builder_config,
+                )
+                logger.info("Builder RelayClient initialized (gasless)")
+            except ImportError:
                 logger.warning(
-                    f"Gasless redeemer unavailable, falling back to gas mode: {e}"
+                    "py-builder-relayer-client not installed. "
+                    "Install with: pip install py-builder-relayer-client "
+                    "py-builder-signing-sdk"
                 )
+            except Exception as e:
+                logger.warning(f"Builder RelayClient init failed: {e}")
+        else:
+            logger.info(
+                "No Builder API credentials — gasless redeem unavailable. "
+                "Set POLYMARKET_BUILDER_API_KEY / SECRET / PASSPHRASE, "
+                "or fund wallet with POL for gas-based redeem."
+            )
 
         return True
 
@@ -322,7 +358,7 @@ class PositionRedeemer:
         label: str,
         value: float,
     ) -> RedemptionResult:
-        """Core redemption logic with gasless-first strategy and 429 retry."""
+        """Core redemption logic: gasless (RelayClient) first, gas fallback."""
         if not self._init_clients():
             return RedemptionResult(
                 condition_id=condition_id,
@@ -330,20 +366,22 @@ class PositionRedeemer:
                 error="polymarket-apis not available",
             )
 
-        # Try gasless first (with 429 retry)
-        if self._gasless_client is not None:
+        # Try gasless via Builder Relayer first
+        if self._relay_client is not None:
             result = await self._redeem_gasless(
                 condition_id, amounts, neg_risk, label, value
             )
             if result.success:
                 self._recently_redeemed[condition_id] = time.time()
                 return result
+            if result.error == "RATE_LIMITED":
+                return result
             logger.warning(
                 f"Gasless redeem failed for {condition_id[:16]}...: "
                 f"{result.error}. Falling back to gas-based redeem."
             )
 
-        # Fall back to gas-based
+        # Fall back to gas-based (requires POL)
         if self._web3_client is not None:
             result = await self._redeem_with_gas(
                 condition_id, amounts, neg_risk, label, value
@@ -358,6 +396,43 @@ class PositionRedeemer:
             error="No redemption client available",
         )
 
+    @staticmethod
+    def _encode_redeem_tx(
+        condition_id: str, neg_risk: bool, amounts: List[float]
+    ) -> dict:
+        """Build a raw redeemPositions transaction for the Builder Relayer."""
+        from web3 import Web3
+
+        cid_hex = condition_id[2:] if condition_id.startswith("0x") else condition_id
+        cid_bytes = bytes.fromhex(cid_hex)
+
+        if neg_risk:
+            raw_amounts = [int(a * 1e6) for a in amounts]
+            contract = Web3().eth.contract(
+                address=Web3.to_checksum_address(NEG_RISK_ADAPTER),
+                abi=NEG_RISK_REDEEM_ABI,
+            )
+            data = contract.encode_abi(
+                abi_element_identifier="redeemPositions",
+                args=[cid_bytes, raw_amounts],
+            )
+            return {"to": NEG_RISK_ADAPTER, "data": data, "value": "0"}
+
+        contract = Web3().eth.contract(
+            address=Web3.to_checksum_address(CTF_ADDRESS),
+            abi=CTF_REDEEM_ABI,
+        )
+        data = contract.encode_abi(
+            abi_element_identifier="redeemPositions",
+            args=[
+                Web3.to_checksum_address(USDC_ADDRESS),
+                b"\x00" * 32,
+                cid_bytes,
+                [1, 2],
+            ],
+        )
+        return {"to": CTF_ADDRESS, "data": data, "value": "0"}
+
     async def _redeem_gasless(
         self,
         condition_id: str,
@@ -366,48 +441,52 @@ class PositionRedeemer:
         label: str,
         value: float,
     ) -> RedemptionResult:
-        """Redeem via the gasless relayer with retry on 429 rate limiting."""
-        max_retries = 4
-        for attempt in range(max_retries):
-            try:
-                result = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: self._gasless_client.redeem_position(
-                        condition_id=condition_id,
-                        amounts=amounts,
-                        neg_risk=neg_risk,
-                    ),
-                )
-                tx_hash = str(result) if result else None
-                logger.info(f"Gasless redeem OK: {label} tx={tx_hash}")
-                self.total_redeemed += 1
-                self.total_value_redeemed += value
-                return RedemptionResult(
-                    condition_id=condition_id,
-                    success=True,
-                    tx_hash=tx_hash,
-                    value_redeemed=value,
-                )
-            except Exception as e:
-                err_str = str(e)
-                if "429" in err_str and attempt < max_retries - 1:
-                    wait = 5 * (2 ** attempt)  # 5s, 10s, 20s
-                    logger.info(
-                        f"Gasless relayer rate-limited (429), "
-                        f"retry in {wait}s ({attempt + 1}/{max_retries})"
-                    )
-                    await asyncio.sleep(wait)
-                    continue
+        """Redeem via Builder Relayer (single attempt, gasless).
+
+        The relayer limit is 25 req/min. No retry here — caller controls pacing.
+        """
+        try:
+            tx = self._encode_redeem_tx(condition_id, neg_risk, amounts)
+
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self._relay_client.execute(
+                    [tx], f"Redeem {label}"
+                ),
+            )
+
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: response.wait()
+            )
+
+            tx_hash = None
+            if isinstance(result, dict):
+                tx_hash = result.get("transactionHash") or result.get("hash")
+            if result and not tx_hash:
+                tx_hash = str(result)
+
+            logger.info(f"Gasless redeem OK: {label} tx={tx_hash}")
+            self.total_redeemed += 1
+            self.total_value_redeemed += value
+            return RedemptionResult(
+                condition_id=condition_id,
+                success=True,
+                tx_hash=tx_hash,
+                value_redeemed=value,
+            )
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str:
                 return RedemptionResult(
                     condition_id=condition_id,
                     success=False,
-                    error=f"Gasless redeem error: {e}",
+                    error="RATE_LIMITED",
                 )
-        return RedemptionResult(
-            condition_id=condition_id,
-            success=False,
-            error="Gasless redeem: max retries exhausted (429)",
-        )
+            return RedemptionResult(
+                condition_id=condition_id,
+                success=False,
+                error=f"Gasless redeem error: {e}",
+            )
 
     async def _redeem_with_gas(
         self,
@@ -597,7 +676,7 @@ class PositionRedeemer:
     def is_available(self) -> bool:
         """Check if redemption capability is available."""
         if self._clients_initialized:
-            return self._web3_client is not None or self._gasless_client is not None
+            return self._web3_client is not None or self._relay_client is not None
         try:
             import polymarket_apis  # noqa: F401
             return True

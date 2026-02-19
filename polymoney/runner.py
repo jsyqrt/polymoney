@@ -333,6 +333,9 @@ class TradingRunner:
                     private_key=pm_config.private_key,
                     funder=pm_config.funder,
                     signature_type=pm_config.signature_type,
+                    builder_api_key=pm_config.builder_api_key,
+                    builder_secret=pm_config.builder_secret,
+                    builder_passphrase=pm_config.builder_passphrase,
                 )
                 if self.redeemer.is_available:
                     logger.info("Position redeemer initialized for automatic redemption")

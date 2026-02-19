@@ -22,6 +22,11 @@ class PolymarketConfig(BaseSettings):
     funder: Optional[str] = Field(default=None, description="Proxy/funder address")
     signature_type: int = Field(default=0, description="Signature type (0=EOA, 1=Magic, 2=Browser)")
 
+    # Builder API credentials for gasless relayer
+    builder_api_key: Optional[str] = Field(default=None, description="Builder API key")
+    builder_secret: Optional[str] = Field(default=None, description="Builder API secret")
+    builder_passphrase: Optional[str] = Field(default=None, description="Builder API passphrase")
+
     model_config = SettingsConfigDict(env_prefix="POLYMARKET_")
 
 

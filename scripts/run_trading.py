@@ -346,6 +346,9 @@ async def cmd_claim(args):
         private_key=pm_config.private_key,
         funder=pm_config.funder,
         signature_type=pm_config.signature_type,
+        builder_api_key=pm_config.builder_api_key,
+        builder_secret=pm_config.builder_secret,
+        builder_passphrase=pm_config.builder_passphrase,
     )
 
     if not redeemer.is_available:
@@ -395,58 +398,108 @@ async def cmd_claim(args):
         print("Dry run — no redemptions performed.")
         return
 
-    # Redeem — one call per condition_id (combines both outcomes atomically)
-    print("Redeeming (one tx per condition, retries on 429)...")
-    print()
-
-    total_redeemed = 0.0
-    total_failed = 0
-    total_conditions = len(by_condition)
-
-    for i, (cid, cid_positions) in enumerate(by_condition.items(), 1):
+    # Build work items: one per condition_id
+    work_items = []
+    for cid, cid_positions in by_condition.items():
         title = cid_positions[0].title or cid[:20] + "..."
         neg_risk = cid_positions[0].negative_risk
-
-        # Combine amounts: [yes_shares, no_shares]
         amounts = [0.0, 0.0]
         cond_value = 0.0
         for pos in cid_positions:
             amounts[pos.outcome_index] = pos.size
             cond_value += pos.current_value
-
         outcomes_str = ", ".join(
             f"{p.outcome}: {p.size:.2f}" for p in cid_positions
         )
+        work_items.append({
+            "cid": cid, "title": title, "neg_risk": neg_risk,
+            "amounts": amounts, "value": cond_value,
+            "outcomes_str": outcomes_str,
+        })
 
+    # Relayer limit: 25 req/min. Space requests ~5s apart → 12 req/min.
+    print(f"Redeeming {len(work_items)} condition(s) "
+          f"(relayer limit: 25 req/min)...")
+    print()
+
+    total_redeemed = 0.0
+    succeeded = []
+    rate_limited = []
+    other_failed = []
+
+    for i, item in enumerate(work_items, 1):
         result = await redeemer.redeem_condition(
-            condition_id=cid,
-            amounts=amounts,
-            neg_risk=neg_risk,
-            label=title,
-            value=cond_value,
+            condition_id=item["cid"],
+            amounts=item["amounts"],
+            neg_risk=item["neg_risk"],
+            label=item["title"],
+            value=item["value"],
         )
 
         if result.success:
             total_redeemed += result.value_redeemed
-            print(f"  [{i}/{total_conditions}] OK  {title}")
-            print(f"       ${result.value_redeemed:.2f} ({outcomes_str})")
-            if result.tx_hash:
-                print(f"       tx={result.tx_hash}")
+            succeeded.append(item)
+            print(f"  [{i}/{len(work_items)}] OK  {item['title']}")
+            print(f"       ${result.value_redeemed:.2f} "
+                  f"({item['outcomes_str']})")
+        elif result.error == "RATE_LIMITED":
+            rate_limited.append(item)
+            print(f"  [{i}/{len(work_items)}] 429 {item['title']}  "
+                  f"(rate-limited, will retry)")
         else:
-            total_failed += 1
-            print(f"  [{i}/{total_conditions}] FAIL {title}")
+            other_failed.append((item, result.error))
+            print(f"  [{i}/{len(work_items)}] FAIL {item['title']}")
             print(f"       {result.error}")
 
-        # Delay between conditions to avoid rate limiting
-        if i < total_conditions:
-            await asyncio.sleep(3.0)
+        if i < len(work_items):
+            await asyncio.sleep(5.0)
 
+    # Retry pass for rate-limited conditions after quota reset
+    if rate_limited:
+        wait_sec = 65
+        print()
+        print(f"  {len(rate_limited)} condition(s) rate-limited. "
+              f"Waiting {wait_sec}s for quota reset...")
+        await asyncio.sleep(wait_sec)
+        print(f"  Retrying {len(rate_limited)} condition(s)...")
+        print()
+
+        for i, item in enumerate(rate_limited[:], 1):
+            result = await redeemer.redeem_condition(
+                condition_id=item["cid"],
+                amounts=item["amounts"],
+                neg_risk=item["neg_risk"],
+                label=item["title"],
+                value=item["value"],
+            )
+
+            if result.success:
+                total_redeemed += result.value_redeemed
+                succeeded.append(item)
+                rate_limited.remove(item)
+                print(f"  [retry {i}] OK  {item['title']}")
+                print(f"       ${result.value_redeemed:.2f} "
+                      f"({item['outcomes_str']})")
+            else:
+                print(f"  [retry {i}] FAIL {item['title']}")
+                print(f"       {result.error}")
+
+            if i < len(rate_limited) + 1:
+                await asyncio.sleep(5.0)
+
+    # Summary
+    total_failed = len(rate_limited) + len(other_failed)
     print()
     print("-" * 60)
-    print(f"  Redeemed : ${total_redeemed:.2f}")
-    if total_failed > 0:
-        print(f"  Failed   : {total_failed} condition(s)")
-    print(f"  Total    : {total_conditions - total_failed}/{total_conditions} conditions successful")
+    print(f"  Redeemed : ${total_redeemed:.2f}  "
+          f"({len(succeeded)}/{len(work_items)} conditions)")
+    if rate_limited:
+        print(f"  Rate-limited : {len(rate_limited)} condition(s) "
+              f"— run again in ~1 min")
+    if other_failed:
+        print(f"  Other fails  : {len(other_failed)} condition(s)")
+        for item, err in other_failed:
+            print(f"    - {item['title']}: {err}")
     print("-" * 60)
 
 
