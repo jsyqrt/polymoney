@@ -294,7 +294,7 @@ class PositionArbitrageStrategy(BaseStrategy):
         # Market skew filter: reject entering markets where one side dominates
         # If max(up_price, down_price) > max_skew_threshold, skip new orders
         # This prevents one-sided position building in extremely skewed markets
-        self.max_skew_threshold = self.params.get("max_skew_threshold", 0.85)
+        self.max_skew_threshold = self.params.get("max_skew_threshold", 0.90)
         self._skew_rejection_logged = False  # avoid log spam
         
         # Phase 3 directional tilt: allow buying the probable winner even
@@ -875,13 +875,23 @@ class PositionArbitrageStrategy(BaseStrategy):
         # In such markets, only the cheap side limit orders fill, creating dangerous
         # one-sided exposure. Rebalancing (above) still runs for existing positions.
         # Uses hysteresis: activate at max_skew_threshold, deactivate at threshold - 5%
-        # Exception: Phase 3 with directional tilt bypasses the skew guard to allow
-        # buying the probable winner.
+        #
+        # Bypasses (allow trading despite skew):
+        #   1. Phase 3 directional tilt (existing)
+        #   2. Phase 2+ with confirmed strong trend (≥70% confidence matching dominant side)
+        #      — other risk controls (ECR, imbalance guard) still protect against bad fills
         max_price = max(price_data.up_price, price_data.down_price)
         skew_deactivate = self.max_skew_threshold - 0.05  # 5% hysteresis band
         phase3_tilt_active = (phase == 3 and self.enable_phase3_tilt
                               and max_price >= self.phase3_tilt_min_prob)
-        if not phase3_tilt_active:
+        trend_bypass_active = False
+        if phase >= 2 and self.enable_trend_detection:
+            dominant = "up" if price_data.up_price > price_data.down_price else "down"
+            t_side, t_conf = self._trend_detector.get_trend()
+            if t_side == dominant and t_conf >= 0.70:
+                trend_bypass_active = True
+        skew_bypass = phase3_tilt_active or trend_bypass_active
+        if not skew_bypass:
             if max_price > self.max_skew_threshold or (self._skew_rejection_logged and max_price > skew_deactivate):
                 if not self._skew_rejection_logged:
                     dominant_side = "UP" if price_data.up_price > price_data.down_price else "DOWN"
@@ -892,7 +902,8 @@ class PositionArbitrageStrategy(BaseStrategy):
                 logger.info(f"[{self.name}] SKEW GUARD off ({max_price:.0%})")
                 self._skew_rejection_logged = False
         elif self._skew_rejection_logged:
-            logger.info(f"[{self.name}] SKEW GUARD bypassed: P3 tilt ({max_price:.0%})")
+            bypass_reason = "P3 tilt" if phase3_tilt_active else f"trend {t_conf:.0%}"
+            logger.info(f"[{self.name}] SKEW GUARD bypassed: {bypass_reason} ({max_price:.0%})")
             self._skew_rejection_logged = False
         
         # Calculate limit prices

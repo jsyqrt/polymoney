@@ -174,9 +174,11 @@ simulation:
   min_price_threshold: 0.05
 
   # Maximum entry skew: skip markets where max(up, down) exceeds this at entry.
-  # Relaxed from 65% to 75%: moderately skewed markets are handled by the
-  # strategy's "trend patience" mode (cheap-side only buying).
-  max_entry_skew: 0.75
+  # Relaxed from 75% to 85%: the strategy's trend-adaptive pricing, SKEW GUARD
+  # bypass (Phase 2+ with trend), and ECR controls handle skewed markets safely.
+  # Previous 75% was too restrictive — after any mid-session restart, most active
+  # 15-min markets already exceed 75% and the bot sat idle with nothing to trade.
+  max_entry_skew: 0.85
 
 # ---------------------------------------------------------------------------
 # Global Fund Management

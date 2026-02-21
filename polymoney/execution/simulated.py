@@ -117,7 +117,7 @@ class SimulatedExecutor(OrderExecutor):
         )
 
         if fill_result:
-            fill_price, filled_size = fill_result
+            fill_price, filled_size, _stale = fill_result
 
             # Fee model: taker orders (FAK/FOK) pay fees; maker orders (GTC)
             # pay 0% and may receive rebates (modeled as slight share increase).
@@ -205,6 +205,7 @@ class SimulatedExecutor(OrderExecutor):
         events: List[FillEvent] = []
         remaining: List[PendingOrder] = []
         now = time.time()
+        stale_fills_this_tick: Dict[str, int] = {"up": 0, "down": 0}
 
         for order in state.pending_orders:
             market_price = up_price if order.side == "up" else down_price
@@ -220,18 +221,25 @@ class SimulatedExecutor(OrderExecutor):
                 remaining.append(order)
                 continue
 
-            # Attempt fill
+            # Attempt fill — limit stale-model fills to 1 per side per tick
+            # to prevent unrealistic burst fills when orderbook data is stale
+            max_stale = 1
             fill_result = self._simulate_fill(
                 state, order.side, order.size, order.price, market_price,
                 market_id, is_taker=order.is_taker,
+                stale_fills_used=stale_fills_this_tick.get(order.side, 0),
+                max_stale_fills=max_stale,
             )
 
             if fill_result:
-                fill_price, filled_size = fill_result
+                fill_price, filled_size, used_stale_model = fill_result
 
                 # Fee model: taker pays fees; maker (GTC) pays nothing
                 if order.is_taker:
                     filled_size = apply_taker_fee_to_shares(filled_size, fill_price)
+
+                if used_stale_model:
+                    stale_fills_this_tick[order.side] = stale_fills_this_tick.get(order.side, 0) + 1
 
                 if filled_size < order.size - 0.01:
                     # Partial fill
@@ -492,7 +500,9 @@ class SimulatedExecutor(OrderExecutor):
         market_price: float,
         market_id: str,
         is_taker: bool = False,
-    ) -> Optional[Tuple[float, float]]:
+        stale_fills_used: int = 0,
+        max_stale_fills: int = 1,
+    ) -> Optional[Tuple[float, float, bool]]:
         """
         Simulate an order fill using orderbook depth or spread model.
         
@@ -507,7 +517,7 @@ class SimulatedExecutor(OrderExecutor):
         the fill executes immediately against available asks.
         
         Returns:
-            (fill_price, filled_size) or None if no fill.
+            (fill_price, filled_size, used_stale_model) or None if no fill.
         """
         book = self._get_orderbook(state, side)
 
@@ -541,7 +551,7 @@ class SimulatedExecutor(OrderExecutor):
                 avg_fill_price, filled_size = result
                 noise = random.uniform(-0.0005, 0.0005)
                 avg_fill_price = max(0.01, min(0.99, avg_fill_price * (1 + noise)))
-                return (avg_fill_price, filled_size)
+                return (avg_fill_price, filled_size, False)
 
             # No direct fill from same-side book. For maker orders, also check
             # if the opposite book's bid depth provides additional liquidity.
@@ -553,11 +563,15 @@ class SimulatedExecutor(OrderExecutor):
                         opp_book, size, limit_price
                     )
                     if mirrored_fill:
-                        return mirrored_fill
+                        return (*mirrored_fill, False)
 
             return None  # Limit below all asks
 
         # --- Spread-based model (no primary depth data) ---
+        # Rate-limit stale-model fills to prevent unrealistic burst fills
+        if stale_fills_used >= max_stale_fills:
+            return None
+
         spread_tolerance = self._get_effective_spread(state, side)
         price_diff = (
             (market_price - limit_price) / market_price
@@ -570,7 +584,6 @@ class SimulatedExecutor(OrderExecutor):
         size_slippage = min(0.005, order_value * 0.0001)
 
         if limit_price >= market_price:
-            # Aggressive (taker) — fill at market + slippage
             fill_price = min(market_price * (1 + size_slippage), 0.99)
             state.fill_tracker.record(
                 side=side,
@@ -583,7 +596,7 @@ class SimulatedExecutor(OrderExecutor):
                 fill_source="taker",
                 slug=market_id,
             )
-            return (fill_price, size)
+            return (fill_price, size, True)
 
         elif price_diff <= spread_tolerance:
             # Maker order within spread — probabilistic fill
@@ -634,7 +647,7 @@ class SimulatedExecutor(OrderExecutor):
             )
 
             if filled:
-                return (limit_price, size)
+                return (limit_price, size, True)
 
         return None
 

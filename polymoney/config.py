@@ -217,7 +217,7 @@ class StrategyConfig:
             "stale_order_threshold": sim.get("stale_order_threshold", 0.20),
             "min_trading_time": sim.get("min_trading_time", 300.0),
             "min_price_threshold": sim.get("min_price_threshold", 0.05),
-            "max_entry_skew": sim.get("max_entry_skew", 0.75),
+            "max_entry_skew": sim.get("max_entry_skew", 0.85),
             "max_concurrent_markets": fm.get("max_concurrent_markets", 6),
             "max_total_exposure": fm.get("max_total_exposure", 500.0),
             "redemption_delay": fm.get("redemption_delay", 60.0),

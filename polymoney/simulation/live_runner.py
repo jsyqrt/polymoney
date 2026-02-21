@@ -439,7 +439,7 @@ class SimulationConfig:
     # Market validity parameters
     min_trading_time: float = 300.0  # 5 minutes minimum before settlement
     min_price_threshold: float = 0.05  # Skip markets where one side < 5%
-    max_entry_skew: float = 0.75     # Skip markets where max(up, down) > 75% at entry
+    max_entry_skew: float = 0.85     # Skip markets where max(up, down) > 85% at entry
 
     # Global fund management parameters
     max_concurrent_markets: int = 6       # Max markets trading simultaneously
