@@ -281,7 +281,7 @@ class PositionArbitrageStrategy(BaseStrategy):
         # Urgency pricing parameters
         self.enable_urgency_pricing = self.params.get("enable_urgency_pricing", True)
         self.urgency_weight = self.params.get("urgency_weight", 1.5)
-        self.urgency_price_factor = self.params.get("urgency_price_factor", 0.5)
+        self.urgency_price_factor = self.params.get("urgency_price_factor", 0.25)
         self.market_duration = self.params.get("market_duration", 900)  # 15 minutes
         
         # Enhanced rebalancing parameters
@@ -311,6 +311,15 @@ class PositionArbitrageStrategy(BaseStrategy):
         # refusing to trade in skewed markets entirely.
         self.trend_patience_threshold = self.params.get("trend_patience_threshold", 0.65)
         self._trend_patience_logged = False  # avoid log spam
+        
+        # Directional recovery: when ECR > 1.0 and shares are balanced (normal
+        # recovery can't help), bet on the probable winner.  Each share bought
+        # below market price has positive EV = prob_win - limit_price.  Only
+        # activates with confirmed trend + high probability.
+        self.enable_directional_recovery = self.params.get("enable_directional_recovery", True)
+        self.directional_recovery_min_prob = self.params.get("directional_recovery_min_prob", 0.62)
+        self.directional_recovery_min_trend = self.params.get("directional_recovery_min_trend", 0.40)
+        self.directional_recovery_max_ratio = self.params.get("directional_recovery_max_ratio", 1.5)
 
         # Internal position tracking
         self.up_position = InternalPosition()
@@ -331,6 +340,8 @@ class PositionArbitrageStrategy(BaseStrategy):
         self._current_phase = 0  # Track phase transitions for logging
         self._ecr_violations = 0
         self._ecr_recovery_side: Optional[str] = None  # "up"/"down" when in Tier 1/2 recovery
+        self._directional_recovery_side: Optional[str] = None  # "up"/"down" for directional bet
+        self._directional_recovery_logged = False
         self._last_rebalancing_time: Optional[datetime] = None
         self._last_rebalancing_rejection_time: Optional[datetime] = None
         self._rebalancing_events: List[Dict[str, Any]] = []
@@ -497,38 +508,40 @@ class PositionArbitrageStrategy(BaseStrategy):
         """
         Get progressive ECR tolerance for Phase 1 with skew awareness.
         
-        Base behavior: decays from 1.5 (start) to 1.1 (end of Phase 1).
+        Phase 1 is the position-building phase.  We need to be lenient enough
+        to allow building positions when only one side has filled (ECR is
+        temporarily high), but strict enough to prevent locking in losing
+        positions.
+        
+        Base behavior: decays from 1.20 (start) to 1.02 (end of Phase 1).
+        This is much tighter than the previous 1.5→1.1 range.  The old range
+        allowed initial fills with combined cost > $1, which was the primary
+        source of losses.
         
         Skew adjustment: in highly skewed markets, one-sided fills are more
-        likely, so the ECR cap is tightened proportionally to skew intensity.
-        At 75% skew (max_entry_skew), the cap is reduced by 20% (e.g. 1.5→1.3
-        at start, 1.1→1.02 at end).  This prevents entering Phase 2 with a
-        dangerously high ECR that's hard to recover from.
+        likely, so the ECR cap is tightened further.
         
         Returns:
             Maximum allowed ECR for Phase 1 orders.
         """
         if self.market_start_time is None:
-            return 1.5
+            return 1.10
         
         elapsed = (datetime.now() - self.market_start_time).total_seconds()
         progress = min(1.0, elapsed / self.phase1_end)  # 0 → 1 over Phase 1
-        base_limit = 1.5 - 0.4 * progress  # 1.5 → 1.1
+        base_limit = 1.20 - 0.18 * progress  # 1.20 → 1.02
         
         # Skew adjustment: tighten ECR cap in skewed markets
         if self.current_up_price is not None and self.current_down_price is not None:
             max_price = max(self.current_up_price, self.current_down_price)
-            # Skew intensity: 0 at 50% (balanced), 1 at max_entry_skew (75%)
             skew_start = 0.50
             skew_end = self.params.get("max_entry_skew", 0.75)
             if max_price > skew_start and skew_end > skew_start:
                 skew_intensity = min(1.0, (max_price - skew_start) / (skew_end - skew_start))
-                # Reduce the cap by up to 20% of (cap - 1.0)
-                # At skew_intensity=1: 1.5 → 1.3 at start, 1.1 → 1.02 at end
                 reduction = skew_intensity * 0.40 * (base_limit - 1.0)
                 base_limit -= reduction
         
-        return max(1.02, base_limit)  # Never go below 1.02 (2% margin)
+        return max(1.01, base_limit)
 
     def get_market_phase(self) -> int:
         """Get current market phase (1, 2, or 3)."""
@@ -689,6 +702,8 @@ class PositionArbitrageStrategy(BaseStrategy):
         self._skew_rejection_logged = False
         self._trend_patience_logged = False
         self._phase3_tilt_logged = False
+        self._directional_recovery_side = None
+        self._directional_recovery_logged = False
         # Reset adaptive target spread data
         self._last_up_spread = 0.0
         self._last_down_spread = 0.0
@@ -729,6 +744,16 @@ class PositionArbitrageStrategy(BaseStrategy):
             logger.debug(f"[{self.name}] Invalid price sum: {price_sum:.2f} (up={price_data.up_price:.2f}, down={price_data.down_price:.2f})")
             return []
         
+        # Minimum spread requirement: if the market is too efficient (price sum
+        # very close to 1.0), there's no room for our target discount.
+        # e.g. if target_cost = 0.96, we need price_sum - target_cost = 0.04 of
+        # room.  If price_sum = 0.99, we can only get 0.03 discount — not enough.
+        effective_target = self._get_adaptive_target_cost()
+        min_required_discount = 1.0 - effective_target  # e.g. 0.04 for target=0.96
+        available_discount = price_sum - effective_target
+        if available_discount < min_required_discount * 0.5:
+            return []
+        
         self.current_up_price = price_data.up_price
         self.current_down_price = price_data.down_price
 
@@ -742,27 +767,23 @@ class PositionArbitrageStrategy(BaseStrategy):
                 timestamp=price_data.timestamp.timestamp(),
             )
         
-        # Update risk state
         current_risk = self.risk_state
         if current_risk != self._risk_state:
             self._risk_state = current_risk
-            logger.info(f"[{self.name}] Risk state changed to: {current_risk} (ECR: {self.effective_cost_rate:.2%})")
+            logger.info(f"[{self.name}] Risk: {current_risk} ECR={self.effective_cost_rate:.2%}")
         
-        # Track phase transitions
         current_phase = self.get_market_phase()
         if current_phase != self._current_phase:
             self._current_phase = current_phase
             ecr = self.effective_cost_rate
             ecr_str = f"{ecr:.2%}" if ecr != float("inf") else "-"
             fills = self.up_position.shares + self.down_position.shares
-            if current_phase == 3:
-                logger.info(
-                    f"[{self.name}] === PHASE 3 (settlement protection) === "
-                    f"ECR={ecr_str}, fills={fills:.0f}. "
-                    f"{'Profitable — locking position.' if ecr < 1.0 else 'Unprofitable — recovery-only orders.'}"
-                )
-            else:
-                logger.info(f"[{self.name}] Phase transition → Phase {current_phase} (ECR={ecr_str}, fills={fills:.0f})")
+            logger.info(
+                f"[{self.name}] Phase {current_phase} | ECR={ecr_str} fills={fills:.0f}"
+                + (" [profitable]" if current_phase == 3 and ecr < 1.0
+                   else " [recovery]" if current_phase == 3
+                   else "")
+            )
         
         # === Simple balance rule ===
         # From first principles: the ONLY thing that matters is balanced shares
@@ -783,29 +804,31 @@ class PositionArbitrageStrategy(BaseStrategy):
         min_cost_for_ecr = self.batch_size * 4
         
         self._ecr_recovery_side = None  # default: allow both sides
+        self._directional_recovery_side = None  # reset each tick
         
         if self.enable_ecr_stoploss and total_cost >= min_cost_for_ecr:
             ecr = self.effective_cost_rate
             up_shares = self.up_position.shares
             down_shares = self.down_position.shares
             
-            # Use ecr_threshold (configurable, default 1.05) as the activation
-            # point — it already represents "ECR level worth worrying about".
-            # target_cost (0.96) is just our desired buy price, not a risk gate.
-            # Also require meaningful share imbalance (5%) to avoid triggering
-            # on floating-point noise when shares are nearly equal.
             max_shares = max(up_shares, down_shares)
             meaningful_imbalance = max_shares > 0 and abs(up_shares - down_shares) / max_shares > 0.05
             
             if ecr != float("inf") and ecr > self.ecr_threshold and meaningful_imbalance:
                 minority_side = "up" if up_shares < down_shares else "down"
                 self._ecr_recovery_side = minority_side
-                if self._ecr_violations <= 3:
+                if self._ecr_violations == 0:
                     logger.info(
-                        f"[{self.name}] BALANCE: ECR={ecr:.2%} > threshold={self.ecr_threshold:.0%}. "
-                        f"Minority side only ({minority_side.upper()})."
+                        f"[{self.name}] BALANCE: ECR={ecr:.2%}>{self.ecr_threshold:.0%}, "
+                        f"minority only ({minority_side.upper()})"
                     )
                 self._ecr_violations += 1
+            
+            # Directional recovery: ECR > 1.0 but shares are balanced —
+            # rebalancing won't help.  Bet on probable winner if trend is clear.
+            elif (ecr != float("inf") and ecr > 1.0 and not meaningful_imbalance
+                  and self.enable_directional_recovery and phase >= 2):
+                self._directional_recovery_side = self._evaluate_directional_recovery()
         
         # Check for rebalancing opportunity (use severe threshold for market orders)
         # Only rebalance when BOTH sides have positions - don't rebalance during initial building
@@ -862,23 +885,14 @@ class PositionArbitrageStrategy(BaseStrategy):
             if max_price > self.max_skew_threshold or (self._skew_rejection_logged and max_price > skew_deactivate):
                 if not self._skew_rejection_logged:
                     dominant_side = "UP" if price_data.up_price > price_data.down_price else "DOWN"
-                    logger.info(
-                        f"[{self.name}] SKEW GUARD: Market too skewed ({dominant_side}={max_price:.1%}), "
-                        f"threshold={self.max_skew_threshold:.1%}. Suspending new limit orders."
-                    )
+                    logger.info(f"[{self.name}] SKEW GUARD: {dominant_side}={max_price:.0%}, pausing orders")
                     self._skew_rejection_logged = True
                 return signals
             elif self._skew_rejection_logged:
-                logger.info(
-                    f"[{self.name}] SKEW GUARD: Market skew reduced ({max_price:.1%} < {skew_deactivate:.1%}). "
-                    f"Resuming limit orders."
-                )
+                logger.info(f"[{self.name}] SKEW GUARD off ({max_price:.0%})")
                 self._skew_rejection_logged = False
         elif self._skew_rejection_logged:
-            logger.info(
-                f"[{self.name}] SKEW GUARD bypassed: Phase 3 directional tilt active "
-                f"(prob={max_price:.1%})"
-            )
+            logger.info(f"[{self.name}] SKEW GUARD bypassed: P3 tilt ({max_price:.0%})")
             self._skew_rejection_logged = False
         
         # Calculate limit prices
@@ -892,11 +906,6 @@ class PositionArbitrageStrategy(BaseStrategy):
         available = self.position_size - total_cost - pending_cost
 
         if available < self.batch_size:
-            logger.debug(
-                f"[{self.name}] No budget: total_cost=${total_cost:.2f}, "
-                f"pending_cost=${pending_cost:.2f} ({len(self.pending_orders)} orders), "
-                f"available=${available:.2f} < batch=${self.batch_size:.2f}"
-            )
             return signals
 
         phase = self.get_market_phase()
@@ -913,17 +922,10 @@ class PositionArbitrageStrategy(BaseStrategy):
         if in_trend_zone:
             if not self._trend_patience_logged:
                 dominant_side = "UP" if price_data.up_price > price_data.down_price else "DOWN"
-                logger.info(
-                    f"[{self.name}] TREND FOLLOWING: {dominant_side} dominant ({max_price:.1%}). "
-                    f"Tight limit on {dominant_side} (buy before it gets pricier), "
-                    f"wide limit on other side (wait for pullback)."
-                )
+                logger.info(f"[{self.name}] TREND: {dominant_side}={max_price:.0%}, asymmetric pricing")
                 self._trend_patience_logged = True
         elif self._trend_patience_logged:
-            logger.info(
-                f"[{self.name}] TREND FOLLOWING: Market rebalanced ({max_price:.1%} < "
-                f"{trend_deactivate:.1%}). Resuming symmetric pricing."
-            )
+            logger.info(f"[{self.name}] TREND off ({max_price:.0%}), symmetric pricing")
             self._trend_patience_logged = False
         
         # === LOOP-BASED ORDER CREATION ===
@@ -1077,12 +1079,6 @@ class PositionArbitrageStrategy(BaseStrategy):
             if not created:
                 break
         
-        if signals:
-            logger.debug(
-                f"[{self.name}] Created {len(signals)} orders: " +
-                ", ".join(f"{s.token_type}@{s.target_price:.1%}" for s in signals)
-            )
-
         return signals
     
     def _generate_rebalancing_order(self, price_data: PriceData) -> Optional[OrderSignal]:
@@ -1146,38 +1142,25 @@ class PositionArbitrageStrategy(BaseStrategy):
         order_cost = shares_needed * order_price
         if order_cost > max_order_cost and max_order_cost > 0:
             capped_shares = max_order_cost / order_price
-            logger.info(
-                f"[{self.name}] REBALANCING: Capping from {shares_needed:.1f} to {capped_shares:.1f} shares "
-                f"(${order_cost:.2f} → ${max_order_cost:.2f}, cap={self.market_order_size_cap:.0%})"
-            )
             shares_needed = capped_shares
             order_cost = max_order_cost
         
-        # ECR check: reject rebalancing only if it would WORSEN the position.
-        # Allow rebalancing that improves ECR even if the result is still above threshold,
-        # because going from e.g. 1.71 → 1.17 is a major improvement worth taking.
         projected_ecr = self.calculate_projected_ecr(underweight_side, shares_needed, order_price)
         current_ecr = self.effective_cost_rate
         if projected_ecr > 0 and projected_ecr >= self.ecr_threshold:
             if current_ecr > 0 and projected_ecr < current_ecr:
-                logger.info(
-                    f"[{self.name}] REBALANCING: accepting despite projected ECR {projected_ecr:.2%} > "
-                    f"threshold {self.ecr_threshold:.2%} (improves from current {current_ecr:.2%})"
-                )
+                pass  # Allow: improving ECR even if still above threshold
             else:
-                logger.warning(
-                    f"[{self.name}] REBALANCING REJECTED: would push ECR to {projected_ecr:.2%} "
-                    f"(threshold {self.ecr_threshold:.2%}, current {current_ecr:.2%}). "
-                    f"Skipping {shares_needed:.1f} {underweight_side} shares."
+                logger.debug(
+                    f"[{self.name}] Rebal rejected: ECR {current_ecr:.2%}→{projected_ecr:.2%}"
                 )
                 self._last_rebalancing_rejection_time = datetime.now()
                 return None
         
         logger.info(
-            f"[{self.name}] REBALANCING: {underweight_side.upper()} {shares_needed:.1f} shares "
-            f"limit ${order_price:.4f} (market ${market_price:.4f}, -0.2%) "
-            f"balance {self.balance_ratio:.0%} → ~{target_ratio:.0%} "
-            f"(projected ECR: {projected_ecr:.2%})"
+            f"[{self.name}] REBAL: {underweight_side.upper()} {shares_needed:.0f}sh "
+            f"@{order_price:.3f} bal={self.balance_ratio:.0%}→~{target_ratio:.0%} "
+            f"ECR={current_ecr:.2%}→{projected_ecr:.2%}"
         )
         
         return self._create_signal(underweight_side, order_price, order_cost)
@@ -1212,19 +1195,22 @@ class PositionArbitrageStrategy(BaseStrategy):
         total_offset = price_sum - effective_target  # Total discount needed (e.g., 0.02)
         max_price = max(up_price, down_price)
         
-        # === Trend patience: asymmetric offset allocation ===
-        # When market is moderately skewed, allocate offset asymmetrically:
-        # - Dominant side (trending, expensive): gets LESS offset → tighter limit
-        # - Minority side (declining, cheap): gets MORE offset → wider limit
+        skip_urgency = False
+        
+        # === Trend-adaptive pricing ===
+        # In skewed markets, price asymmetrically based on trend confidence:
         #
-        # Example: UP=70%, DOWN=30%, target=0.98, total_offset=0.02
-        #   Proportional: UP_offset=0.014, DOWN_offset=0.006 (both 2% from market)
-        #   Asymmetric:   UP_offset=0.005, DOWN_offset=0.015
-        #     → UP limit = 0.695 (0.7% below market, fills easily)
-        #     → DOWN limit = 0.285 (5% below market, waits for pullback)
-        #     → Total = 0.695 + 0.285 = 0.98 ✓
+        # Low confidence (< 30%): proportional (same % discount both sides)
+        # Medium confidence (30-70%): asymmetric allocation (current logic)
+        # High confidence (70%+, Phase 2+): maker-aggressive on trending side
+        #   → Trending side: 0.5% below market (fills on bid-ask bounce)
+        #   → Other side: absorbs ALL remaining discount (rarely fills)
+        #   → Pair sum = effective_target (unchanged)
+        #
+        # This prevents the asymmetric fill problem: in an uptrend, DOWN
+        # fills easily at its discounted price while UP never fills, creating
+        # dangerous one-sided exposure to the losing side.
         if max_price > self.trend_patience_threshold:
-            # Determine dominant (trending) and minority (declining) sides
             if up_price >= down_price:
                 dominant_price, minority_price = up_price, down_price
                 dominant_is_up = True
@@ -1232,31 +1218,50 @@ class PositionArbitrageStrategy(BaseStrategy):
                 dominant_price, minority_price = down_price, up_price
                 dominant_is_up = False
             
-            # How skewed is the market? 0 at threshold, 1 at skew guard
             skew_intensity = (max_price - self.trend_patience_threshold) / \
                              (self.max_skew_threshold - self.trend_patience_threshold)
             skew_intensity = min(1.0, max(0.0, skew_intensity))
             
-            # Dominant side gets less offset (tighter limit):
-            #   At skew_intensity=0 (65%): 50% share (normal proportional)
-            #   At skew_intensity=1 (85%): 20% share (very tight)
-            dominant_share = 0.50 - 0.30 * skew_intensity  # 0.50 → 0.20
+            # Check if trend is strong enough AND confirmed for maker-aggressive
+            phase = self.get_market_phase()
+            trend_side, trend_confidence = (
+                self._trend_detector.get_trend()
+                if self.enable_trend_detection else ("neutral", 0.0)
+            )
+            dominant_side = "up" if dominant_is_up else "down"
+            trend_confirmed = (
+                trend_confidence >= 0.70
+                and trend_side == dominant_side
+                and phase >= 2
+            )
             
-            dominant_offset = total_offset * dominant_share
-            minority_offset = total_offset * (1.0 - dominant_share)
+            if trend_confirmed:
+                skip_urgency = True
+                # High-confidence trend: maker-aggressive on trending side.
+                # 0.5% below market fills on normal bid-ask bounce within
+                # seconds, even in a strong trend.  All remaining discount
+                # goes to the declining side, making it very conservative.
+                maker_discount = 0.005
+                dominant_limit = dominant_price * (1 - maker_discount)
+                minority_limit = effective_target - dominant_limit
+                # Floor: minority must stay above low_prob_threshold
+                if minority_limit < self.low_prob_threshold:
+                    minority_limit = self.low_prob_threshold
+                    dominant_limit = effective_target - minority_limit
+            else:
+                # Medium-confidence: asymmetric allocation (original logic)
+                dominant_share = 0.50 - 0.30 * skew_intensity
+                dominant_offset = total_offset * dominant_share
+                minority_offset = total_offset * (1.0 - dominant_share)
+                dominant_limit = dominant_price - dominant_offset
+                minority_limit = minority_price - minority_offset
             
             if dominant_is_up:
-                up_limit = up_price - dominant_offset
-                down_limit = down_price - minority_offset
+                up_limit = dominant_limit
+                down_limit = minority_limit
             else:
-                down_limit = down_price - dominant_offset
-                up_limit = up_price - minority_offset
-            
-            logger.debug(
-                f"[{self.name}] Trend patience pricing (skew={skew_intensity:.0%}): "
-                f"UP {up_price:.2f}→{up_limit:.3f} ({(up_price-up_limit)/up_price:.1%} off), "
-                f"DOWN {down_price:.2f}→{down_limit:.3f} ({(down_price-down_limit)/down_price:.1%} off)"
-            )
+                down_limit = dominant_limit
+                up_limit = minority_limit
         else:
             # Normal: proportional scaling (same % discount on both sides)
             base_scale = effective_target / price_sum
@@ -1282,7 +1287,11 @@ class PositionArbitrageStrategy(BaseStrategy):
                         up_limit -= shift_amount * 0.5
         
         # === Urgency adjustment (on top of trend adjustment) ===
-        if self.enable_urgency_pricing:
+        # Skip urgency when maker-aggressive pricing is active: urgency pushes
+        # both limits toward market, then the hard ceiling scales them down
+        # proportionally — redistributing discount away from the trending side,
+        # which defeats the purpose of maker-aggressive pricing.
+        if self.enable_urgency_pricing and not skip_urgency:
             urgency = self._calculate_combined_urgency()
             
             if urgency > 0:
@@ -1296,26 +1305,61 @@ class PositionArbitrageStrategy(BaseStrategy):
                 up_limit = up_limit + up_offset * offset_reduction
                 down_limit = down_limit + down_offset * offset_reduction
                 
-                # Lagging side boost: move even closer to market price
+                # Lagging side boost: move closer to market price (but capped
+                # at 1% below market to preserve arbitrage margin)
                 lagging_side = self.get_lagging_side()
                 if urgency > 0.7 and lagging_side != "balanced":
                     if lagging_side == "up":
-                        # Boost up_limit toward market price
-                        up_limit = min(up_price * 0.995, up_limit + (up_price - up_limit) * 0.5)
+                        up_limit = min(up_price * 0.99, up_limit + (up_price - up_limit) * 0.3)
                     else:
-                        # Boost down_limit toward market price
-                        down_limit = min(down_price * 0.995, down_limit + (down_price - down_limit) * 0.5)
+                        down_limit = min(down_price * 0.99, down_limit + (down_price - down_limit) * 0.3)
         
-        # Ensure limits stay positive and maintain arbitrage condition
-        up_limit = max(0.01, up_limit)
-        down_limit = max(0.01, down_limit)
+        # Safety floor: never go below low_prob_threshold (e.g. 0.05).
+        # Orders below this price are not worth placing — tokens at <5% are
+        # nearly worthless and carry extreme settlement risk.
+        up_limit = max(self.low_prob_threshold, up_limit)
+        down_limit = max(self.low_prob_threshold, down_limit)
         
-        # Safety: ensure total limit < 1 for arbitrage profit potential
-        if up_limit + down_limit >= 1.0:
-            # Scale down proportionally
-            scale = 0.99 / (up_limit + down_limit)
+        # HARD CEILING: urgency/trend adjustments must never erode the pair
+        # discount beyond effective_target.  This is the #1 cause of ECR > 1.0:
+        # urgency pricing would push limits close to market, making pair cost
+        # approach 1.0 and guaranteeing losses.
+        pair_cost = up_limit + down_limit
+        if pair_cost > effective_target:
+            scale = effective_target / pair_cost
             up_limit *= scale
             down_limit *= scale
+        
+        # === ECR-aware counterpart cap ===
+        # When one side already has fills, cap the OTHER side's limit so that
+        # avg_filled_price + new_limit <= effective_target.  This prevents
+        # the scenario: UP fills at 0.62, then DOWN limit set to 0.40,
+        # giving pair cost = 1.02 (loss).
+        # Exception: directional recovery side is exempt (uses EV-based pricing).
+        dr_side = self._directional_recovery_side
+        if self.up_position.shares > 0 and self.down_position.shares > 0:
+            up_avg = self.up_position.avg_price
+            down_avg = self.down_position.avg_price
+            if dr_side != "down":
+                max_down = effective_target - up_avg
+                if max_down > 0.01 and down_limit > max_down:
+                    down_limit = max_down
+            if dr_side != "up":
+                max_up = effective_target - down_avg
+                if max_up > 0.01 and up_limit > max_up:
+                    up_limit = max_up
+        
+        # === Directional recovery: aggressive pricing ===
+        # When betting on the probable winner, the hedging-based limit price
+        # (3-5% below market) is too conservative — it requires a pullback
+        # to fill, which contradicts the confirmed uptrend.  Instead, use
+        # maker-aggressive pricing: 0.5% below market.  This sits just below
+        # the ask and fills on normal bid-ask bounce within seconds.
+        # Still a maker order (0% fee), but much more likely to fill.
+        if dr_side == "up":
+            up_limit = max(up_price * 0.995, self.low_prob_threshold)
+        elif dr_side == "down":
+            down_limit = max(down_price * 0.995, self.low_prob_threshold)
         
         return up_limit, down_limit
 
@@ -1365,6 +1409,13 @@ class PositionArbitrageStrategy(BaseStrategy):
         if recovery_exempt is not None:
             return recovery_exempt
 
+        # --- 5b. Directional recovery (ECR > 1.0, balanced, strong trend) --------
+        directional_result = self._check_directional_recovery(
+            side, up, down, phase, limit_price, order_cost, current_ecr, market_price
+        )
+        if directional_result is not None:
+            return directional_result
+
         # --- 6. ECR protection per phase ----------------------------------------
         if not self._check_ecr_protection(side, up, down, phase, limit_price, order_cost,
                                           current_ecr, predicted_ecr):
@@ -1392,16 +1443,14 @@ class PositionArbitrageStrategy(BaseStrategy):
         return True, market_price
 
     def _check_imbalance_guard(self, side: str, up: float, down: float) -> bool:
-        """Block overweight-side orders when imbalance exceeds 3×."""
+        """Block overweight-side orders when imbalance exceeds the cap."""
         if up > 0 and down > 0:
             max_s, min_s = max(up, down), min(up, down)
             ratio = max_s / min_s if min_s > 0 else float("inf")
             overweight = "up" if up > down else "down"
-            if ratio > 3.0 and side == overweight:
-                logger.debug(
-                    f"[{self.name}] Imbalance guard: blocking {side.upper()} "
-                    f"(ratio={ratio:.1f}×, UP={up:.1f}, DOWN={down:.1f})"
-                )
+            # Directional recovery uses its own cap (directional_recovery_max_ratio)
+            cap = self.directional_recovery_max_ratio if self._directional_recovery_side == side else 3.0
+            if ratio > cap and side == overweight:
                 return False
         return True
 
@@ -1427,18 +1476,10 @@ class PositionArbitrageStrategy(BaseStrategy):
                 balanced_ecr = (order_cost * 2) / hedged
                 threshold = self._get_phase1_ecr_limit()
                 if balanced_ecr > threshold:
-                    logger.debug(
-                        f"[{self.name}] Initial rejected {side.upper()}@{limit_price:.1%}"
-                        f"(${order_cost:.2f}): balanced ECR {balanced_ecr:.2%} > {threshold:.0%}"
-                    )
                     return False
 
         single_threshold = self._get_phase1_ecr_limit() if phase == 1 else 1.0
         if predicted_ecr != float("inf") and predicted_ecr >= single_threshold:
-            logger.debug(
-                f"[{self.name}] Initial rejected {side.upper()}@{limit_price:.1%}"
-                f"(${order_cost:.2f}): predicted ECR {predicted_ecr:.1%} >= {single_threshold:.0%}"
-            )
             return False
         return True
 
@@ -1461,23 +1502,11 @@ class PositionArbitrageStrategy(BaseStrategy):
         minority = "up" if up < down else "down"
 
         if current_ecr == float("inf") and predicted_ecr == float("inf"):
-            logger.debug(
-                f"[{self.name}] Recovery rejected {side.upper()}: "
-                f"would stay single-sided (ECR ∞)"
-            )
             return False
 
         if side == minority:
-            logger.debug(
-                f"[{self.name}] Recovery order: {side.upper()} "
-                f"(balance={balance:.2f}, ECR {current_ecr:.2f}→{predicted_ecr:.2f})"
-            )
             return True
 
-        logger.debug(
-            f"[{self.name}] Recovery blocked majority {side.upper()} "
-            f"(balance={balance:.2f})"
-        )
         return False
 
     def _check_recovery_exemption(self, side: str, phase: int,
@@ -1494,21 +1523,95 @@ class PositionArbitrageStrategy(BaseStrategy):
 
         if phase == 3:
             if current_ecr < 1.0:
-                logger.debug(f"[{self.name}] Phase 3 recovery rejected — already profitable")
                 return False
             if predicted_ecr >= current_ecr:
-                logger.debug(f"[{self.name}] Phase 3 recovery rejected — wouldn't improve ECR")
                 return False
             return True
 
-        if predicted_ecr <= current_ecr + 0.02:
-            return True  # Improves or maintains ECR
+        if predicted_ecr < current_ecr:
+            return True
 
-        logger.debug(
-            f"[{self.name}] Recovery exemption rejected {side.upper()}: "
-            f"ECR {current_ecr:.1%}→{predicted_ecr:.1%}"
-        )
         return False
+
+    def _evaluate_directional_recovery(self) -> Optional[str]:
+        """
+        Determine if directional recovery should activate and which side to bet on.
+        
+        Called when ECR > 1.0 with balanced shares (rebalancing won't help).
+        Returns the side to buy ("up"/"down") or None if conditions aren't met.
+        
+        Conditions:
+        - Probable winner's price >= directional_recovery_min_prob (default 0.62)
+        - Trend confidence >= directional_recovery_min_trend (default 0.40)
+        - Trend direction matches the probable winner (not a reversal)
+        """
+        if not self.enable_trend_detection:
+            return None
+        if self.current_up_price is None or self.current_down_price is None:
+            return None
+        
+        probable_winner = "up" if self.current_up_price >= self.current_down_price else "down"
+        win_prob = max(self.current_up_price, self.current_down_price)
+        
+        if win_prob < self.directional_recovery_min_prob:
+            return None
+        
+        trend_side, trend_confidence = self._trend_detector.get_trend()
+        
+        # Trend must confirm the probable winner AND be strong enough
+        if trend_side != probable_winner or trend_confidence < self.directional_recovery_min_trend:
+            return None
+        
+        if not self._directional_recovery_logged:
+            logger.info(
+                f"[{self.name}] DIRECTIONAL: ECR>{self.effective_cost_rate:.2%}, "
+                f"balanced, betting {probable_winner.upper()} "
+                f"(prob={win_prob:.0%}, trend={trend_confidence:.0%})"
+            )
+            self._directional_recovery_logged = True
+        
+        return probable_winner
+    
+    def _check_directional_recovery(self, side: str, up: float, down: float,
+                                    phase: int, limit_price: float, order_cost: float,
+                                    current_ecr: float, market_price: float
+                                    ) -> Optional[bool]:
+        """
+        Gate for directional recovery orders.
+        
+        When ECR > 1.0 and shares are balanced, buying the probable winner at
+        below-market price has positive per-share EV even without hedging.
+        
+        Guards:
+        - Only the probable winner side (set by _evaluate_directional_recovery)
+        - Positive per-share EV: limit_price < market_price (probability)
+        - Position cap: don't exceed directional_recovery_max_ratio of minority shares
+        
+        Returns True/False for directional orders, None to continue normal flow.
+        """
+        if self._directional_recovery_side is None:
+            return None  # Not in directional recovery mode
+        
+        if side != self._directional_recovery_side:
+            return False  # Block the losing side
+        
+        # Positive EV check: we pay limit_price, expected return is market_price
+        # (which approximates the win probability in binary markets).
+        # EV per share = market_price - limit_price > 0
+        if limit_price >= market_price:
+            return False
+        
+        # Position cap: don't go too heavy directional (include pending orders)
+        min_shares = min(up, down) if up > 0 and down > 0 else 0
+        max_shares_allowed = min_shares * self.directional_recovery_max_ratio if min_shares > 0 else 0
+        pending_side = sum(o.shares for o in self.pending_orders if o.side == side)
+        current_side_total = (up if side == "up" else down) + pending_side
+        new_shares = order_cost / limit_price if limit_price > 0 else 0
+        
+        if max_shares_allowed > 0 and current_side_total + new_shares > max_shares_allowed:
+            return False
+        
+        return True
 
     def _check_ecr_protection(self, side: str, up: float, down: float,
                               phase: int, limit_price: float, order_cost: float,
@@ -1517,35 +1620,20 @@ class PositionArbitrageStrategy(BaseStrategy):
         if phase == 1:
             cap = self._get_phase1_ecr_limit()
             if predicted_ecr >= cap:
-                logger.debug(
-                    f"[{self.name}] Phase 1 ECR cap: {side.upper()}@{limit_price:.1%} "
-                    f"rejected (predicted {predicted_ecr:.1%} >= {cap:.0%})"
-                )
                 return False
         else:
-            ecr_tolerance = 0.02
-            improves = (side == "up" and up < down) or (side == "down" and down < up)
+            improves_balance = (side == "up" and up < down) or (side == "down" and down < up)
 
-            if improves:
-                if predicted_ecr > current_ecr + ecr_tolerance:
-                    logger.debug(
-                        f"[{self.name}] Balance order rejected {side.upper()}: "
-                        f"ECR {current_ecr:.1%}→{predicted_ecr:.1%}"
-                    )
+            if predicted_ecr >= 1.0:
+                if improves_balance and current_ecr > 1.0 and predicted_ecr < current_ecr:
+                    pass  # Allow: recovering from bad ECR
+                else:
                     return False
-            else:
-                if predicted_ecr > current_ecr + ecr_tolerance:
-                    logger.debug(
-                        f"[{self.name}] Order rejected {side.upper()}: "
-                        f"ECR worsens {current_ecr:.1%}→{predicted_ecr:.1%}"
-                    )
-                    return False
-                if predicted_ecr >= 1.0:
-                    logger.debug(
-                        f"[{self.name}] Order rejected {side.upper()}: "
-                        f"ECR would exceed 100% ({predicted_ecr:.1%})"
-                    )
-                    return False
+
+            ecr_tolerance = 0.01
+            if predicted_ecr > current_ecr + ecr_tolerance:
+                return False
+
         return True
 
     def _check_phase3(self, side: str, market_price: float,
@@ -1583,41 +1671,20 @@ class PositionArbitrageStrategy(BaseStrategy):
                 if ev > 0:
                     if not self._phase3_tilt_logged:
                         logger.info(
-                            f"[{self.name}] PHASE 3 TILT: buying {side.upper()} "
-                            f"(prob={win_prob:.1%}, EV=+{ev:.3f}/share). "
-                            f"Allowing directional imbalance."
+                            f"[{self.name}] P3 TILT: {side.upper()} prob={win_prob:.0%} EV=+{ev:.3f}"
                         )
                         self._phase3_tilt_logged = True
                     return True
-                else:
-                    logger.debug(
-                        f"[{self.name}] Phase 3 tilt: {side.upper()} negative EV "
-                        f"(prob={win_prob:.1%}, price={limit_price:.4f})"
-                    )
-
         # --- Standard hedging logic ---
         if current_ecr < 1.0:
             if predicted_ecr < current_ecr and side == lagging:
-                logger.debug(
-                    f"[{self.name}] Phase 3: improving profitable ECR "
-                    f"{current_ecr:.2%}→{predicted_ecr:.2%} ({side.upper()})"
-                )
                 return True
-            logger.debug(
-                f"[{self.name}] Phase 3: profitable ECR={current_ecr:.2%}, "
-                f"{'would worsen' if predicted_ecr >= current_ecr else 'not lagging side'}"
-            )
             return False
 
         if predicted_ecr >= current_ecr:
-            logger.debug(
-                f"[{self.name}] Phase 3: {side.upper()} wouldn't improve ECR "
-                f"({current_ecr:.2%}→{predicted_ecr:.2%})"
-            )
             return False
 
         if lagging != "balanced" and side != lagging:
-            logger.debug(f"[{self.name}] Phase 3: leading {side.upper()} paused")
             return False
 
         return True
@@ -1651,12 +1718,6 @@ class PositionArbitrageStrategy(BaseStrategy):
         if size < self.min_order_shares:
             required_cost = self.min_order_shares * price
             if required_cost > cost * 3:
-                # Cost would need to triple — something is wrong, skip
-                logger.debug(
-                    f"[{self.name}] Skipping {side.upper()} order: "
-                    f"{size:.1f} shares < min {self.min_order_shares}, "
-                    f"scaling would require ${required_cost:.2f} (too much)"
-                )
                 return None
             size = float(self.min_order_shares)
             cost = size * price
@@ -1691,8 +1752,8 @@ class PositionArbitrageStrategy(BaseStrategy):
 
         logger.info(
             f"[{self.name}] Settlement: {outcome} | "
-            f"UP {up_shares:.1f}, DOWN {down_shares:.1f} | "
-            f"Cost ${total_cost:.2f}, Value ${final_value:.2f}, PnL ${pnl:.2f}"
+            f"UP={up_shares:.0f} DOWN={down_shares:.0f} | "
+            f"Cost=${total_cost:.2f} Val=${final_value:.2f} PnL=${pnl:+.2f}"
         )
 
         return total_cost, pnl, outcome
