@@ -559,15 +559,23 @@ class MarketDataProvider:
 
     async def _settlement_check_loop(self) -> None:
         """
-        Check for settlements based on WS prices.
+        Check for settlements using two methods:
         
-        Uses multi-confirmation (3 consecutive checks = 15s) to avoid
-        false settlements from price spikes.
+        1. WS price confirmation: if one side >= 0.97 and the other <= 0.04
+           for 3 consecutive checks (~15s), declare settlement.
+        2. HTTP fallback: for markets past their settlement_time + grace
+           period, query the Gamma Markets API directly to check closure.
+           This catches cases where WS prices stall or never reach the
+           extreme thresholds (e.g., UP=0.985 but <0.99).
         """
+        http_check_interval = 30.0  # seconds between HTTP settlement checks
+        last_http_check = 0.0
+
         while self._running:
             try:
                 markets_to_settle: List[Tuple[str, str]] = []
                 checked_slugs: Set[str] = set()
+                now = time.time()
 
                 for slug in list(self._active_markets):
                     checked_slugs.add(slug)
@@ -580,7 +588,7 @@ class MarketDataProvider:
                     up_p, down_p, last_update = prices
                     
                     # Skip if prices are stale (>10s old)
-                    if time.time() - last_update > 10.0:
+                    if now - last_update > 10.0:
                         self._settlement_confirmations.pop(slug, None)
                         continue
 
@@ -590,9 +598,9 @@ class MarketDataProvider:
                         continue
 
                     winner = None
-                    if up_p >= 0.99 and down_p <= 0.02:
+                    if up_p >= 0.97 and down_p <= 0.04:
                         winner = "up"
-                    elif down_p >= 0.99 and up_p <= 0.02:
+                    elif down_p >= 0.97 and up_p <= 0.04:
                         winner = "down"
 
                     if winner:
@@ -608,6 +616,14 @@ class MarketDataProvider:
                     else:
                         if slug in self._settlement_confirmations:
                             self._settlement_confirmations.pop(slug, None)
+
+                # --- HTTP fallback for overdue markets ---
+                if now - last_http_check >= http_check_interval:
+                    last_http_check = now
+                    http_settled = await self._check_overdue_settlements()
+                    for slug, winner in http_settled:
+                        if slug not in [s for s, _ in markets_to_settle]:
+                            markets_to_settle.append((slug, winner))
 
                 # Clean stale confirmations
                 stale_keys = (
@@ -633,6 +649,66 @@ class MarketDataProvider:
             except Exception as e:
                 logger.error(f"Error in settlement check: {e}")
                 await asyncio.sleep(5)
+
+    async def _check_overdue_settlements(self) -> List[Tuple[str, str]]:
+        """
+        HTTP fallback: check active markets that are past their settlement
+        time via the Gamma Markets API.
+        
+        Returns list of (slug, winner) for markets confirmed as settled.
+        """
+        results: List[Tuple[str, str]] = []
+        if not self._fetcher:
+            return results
+
+        now = time.time()
+        grace_period = 60.0  # wait 60s after settlement_time before HTTP check
+
+        for slug in list(self._active_markets):
+            meta = self._market_meta.get(slug, {})
+            settlement_time = meta.get("settlement_time")
+            if not settlement_time:
+                continue
+
+            if now < settlement_time + grace_period:
+                continue
+
+            # Market is overdue — query API for settlement status
+            try:
+                event_data = await self._fetcher.check_market_state(meta)
+                if event_data and event_data.event_type == MarketEvent.MARKET_SETTLED:
+                    winner = event_data.winner
+                    if winner:
+                        logger.info(
+                            f"HTTP settlement fallback: {slug} → "
+                            f"{winner.upper()} wins (API confirmed)"
+                        )
+                        results.append((slug, winner))
+                    else:
+                        # Market closed but no clear winner — try price-based
+                        prices = self._last_prices.get(slug)
+                        if prices:
+                            up_p, down_p, _ = prices
+                            if up_p > down_p and up_p > 0.80:
+                                logger.info(
+                                    f"HTTP settlement fallback: {slug} → "
+                                    f"UP wins (price={up_p:.2f}, closed)"
+                                )
+                                results.append((slug, "up"))
+                            elif down_p > up_p and down_p > 0.80:
+                                logger.info(
+                                    f"HTTP settlement fallback: {slug} → "
+                                    f"DOWN wins (price={down_p:.2f}, closed)"
+                                )
+                                results.append((slug, "down"))
+                            else:
+                                logger.warning(
+                                    f"HTTP settlement: {slug} closed but "
+                                    f"no clear winner (up={up_p:.2f}, "
+                                    f"down={down_p:.2f})"
+                                )
+            except Exception as e:
+                logger.debug(f"HTTP settlement check failed for {slug}: {e}")
 
     async def _orderbook_refresh_loop(self) -> None:
         """Periodically refresh orderbooks via HTTP for active markets."""

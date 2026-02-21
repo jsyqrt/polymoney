@@ -218,6 +218,8 @@ class TradingRunner:
         tasks = [
             asyncio.create_task(self._metrics_output_loop()),
         ]
+        if self.mode == "live":
+            tasks.append(asyncio.create_task(self._position_reconciliation_loop()))
         if self.config.duration_seconds > 0:
             tasks.append(asyncio.create_task(self._duration_watchdog()))
 
@@ -417,20 +419,19 @@ class TradingRunner:
         if slug in self._contexts:
             return
 
-        # Safety: block new markets if a previous redemption failed
+        # Safety: block new markets only if cash is critically low
         if self._redeem_failed:
             logger.warning(
-                f"Skipping {slug}: trading suspended due to redemption failure"
+                f"Skipping {slug}: trading suspended (critical cash shortage)"
             )
             return
 
-        # Block new markets while redemptions are pending (capital not yet recovered)
+        # Log pending redemptions but don't block — cash check below is sufficient
         if self.fill_manager.has_pending_redemptions:
-            logger.info(
-                f"Skipping {slug}: {self.fill_manager.pending_redemption_count} "
-                f"redemption(s) pending, waiting for capital recovery"
+            logger.debug(
+                f"Note: {self.fill_manager.pending_redemption_count} "
+                f"redemption(s) pending during market discovery"
             )
-            return
 
         # Block if background redeemer found unredeemed positions it can't recover
         if self._unredeemed_markets:
@@ -856,37 +857,107 @@ class TradingRunner:
             )
 
     async def _on_redeem_failure(self, slug: str) -> None:
-        """Handle redemption failure by stopping all trading.
+        """Handle redemption failure gracefully without halting all trading.
 
-        Capital from the settled market is still locked. New market entry
-        is blocked immediately to prevent building positions without
-        sufficient available funds.
+        Capital from the settled market stays locked. New market entry
+        continues if sufficient cash remains. The failed redemption is
+        scheduled for background retry with exponential backoff (5m, 15m,
+        30m). Only halts if available cash drops below safety threshold.
         """
-        self._redeem_failed = True
         pending = self.fill_manager.pending_redemption_count
         locked_value = sum(self.fill_manager._pending_redemptions.values())
 
         msg = (
             f"REDEMPTION FAILED for {slug}. "
-            f"Trading suspended: {pending} redemption(s) pending, "
-            f"${locked_value:.2f} locked. "
-            f"Manual intervention required — redeem positions via "
-            f"Polymarket UI or restart after resolving the issue."
+            f"{pending} redemption(s) pending, ${locked_value:.2f} locked. "
+            f"Scheduling background retry. "
+            f"Available cash: ${self._available_cash:.2f}"
         )
-        logger.critical(msg)
+        logger.error(msg)
 
-        # Send alert
+        # Send alert (non-critical — don't halt)
         try:
             await self.alert_manager.send_alert(
-                title="Redemption Failure — Trading Stopped",
+                title="Redemption Failure — Retrying",
                 message=msg,
-                level="critical",
+                level="warning",
             )
         except Exception:
             pass
 
-        # Graceful shutdown
-        await self.stop(timeout=30.0)
+        # Schedule background retry with longer backoff
+        asyncio.create_task(
+            self._retry_redemption(slug, locked_value)
+        )
+
+        # Only halt if cash is critically low (can't fund even one market)
+        min_cash = self.config.target_cost * 5
+        if self._available_cash < min_cash:
+            logger.critical(
+                f"Available cash ${self._available_cash:.2f} below "
+                f"minimum ${min_cash:.2f} — halting trading"
+            )
+            self._redeem_failed = True
+            await self.stop(timeout=30.0)
+
+    async def _retry_redemption(self, slug: str, expected_value: float) -> None:
+        """Background retry loop for failed redemptions with exponential backoff."""
+        delays = [300, 900, 1800]  # 5m, 15m, 30m
+        meta = None
+        for ctx_slug, ctx in list(self._contexts.items()):
+            if ctx_slug == slug:
+                meta = ctx.market
+                break
+
+        condition_id = ""
+        if meta:
+            condition_id = meta.get("condition_id", "")
+        elif slug in self.fill_manager._pending_redemptions:
+            # Try to find condition_id from results
+            for r in self._results:
+                if r.slug == slug and r.condition_id:
+                    condition_id = r.condition_id
+                    break
+
+        if not condition_id or self.redeemer is None:
+            logger.warning(
+                f"Cannot retry redemption for {slug}: "
+                f"no condition_id or redeemer"
+            )
+            return
+
+        for i, delay in enumerate(delays):
+            logger.info(
+                f"Redemption retry for {slug} in {delay}s "
+                f"(attempt {i + 1}/{len(delays)})"
+            )
+            await asyncio.sleep(delay)
+
+            if not self._running:
+                return
+
+            try:
+                results = await self.redeemer.redeem_market(
+                    condition_id, settlement_value=expected_value
+                )
+                if results:
+                    successes = [r for r in results if r.success]
+                    if successes:
+                        total_value = sum(r.value_redeemed for r in successes)
+                        self.fill_manager.release_redemption(slug)
+                        self._available_cash += total_value
+                        logger.info(
+                            f"Redemption retry SUCCESS for {slug}: "
+                            f"${total_value:.2f} recovered"
+                        )
+                        return
+            except Exception as e:
+                logger.warning(f"Redemption retry failed for {slug}: {e}")
+
+        logger.error(
+            f"All redemption retries exhausted for {slug}. "
+            f"Capital remains locked — manual intervention required."
+        )
 
     # ------------------------------------------------------------------
     # Metrics and output
@@ -971,6 +1042,125 @@ class TradingRunner:
             except Exception as e:
                 logger.error(f"Error in metrics output: {e}")
                 await asyncio.sleep(60)
+
+    async def _position_reconciliation_loop(self) -> None:
+        """
+        Periodically compare internal position tracking with on-chain state.
+        
+        Queries the Trades API for each active market's token and compares
+        total verified shares with the FillManager's internal tracking.
+        Logs discrepancies and corrects internal state when the on-chain
+        data is authoritative.
+        """
+        reconcile_interval = 120.0  # every 2 minutes
+        await asyncio.sleep(30.0)  # initial delay to let markets initialize
+
+        while self._running:
+            try:
+                if not self._clob_client:
+                    await asyncio.sleep(reconcile_interval)
+                    continue
+
+                maker_address = None
+                if hasattr(self.executor, "_maker_address"):
+                    maker_address = self.executor._maker_address
+                if not maker_address:
+                    await asyncio.sleep(reconcile_interval)
+                    continue
+
+                for slug, ctx in list(self._contexts.items()):
+                    meta = ctx.market
+                    up_token = meta.get("up_token_id", "")
+                    down_token = meta.get("down_token_id", "")
+
+                    if not up_token or not down_token:
+                        continue
+
+                    try:
+                        from py_clob_client.clob_types import TradeParams
+
+                        onchain_up = 0.0
+                        onchain_down = 0.0
+
+                        for side, token_id in [("up", up_token), ("down", down_token)]:
+                            params = TradeParams(
+                                maker_address=maker_address,
+                                asset_id=token_id,
+                            )
+                            resp = self._clob_client.get_trades(params=params)
+                            if not resp or not isinstance(resp, dict):
+                                continue
+
+                            total = 0.0
+                            for trade in resp.get("data", []):
+                                status = trade.get("status", "")
+                                if status in (
+                                    "TRADE_STATUS_CONFIRMED",
+                                    "TRADE_STATUS_MINED",
+                                ):
+                                    try:
+                                        total += float(trade.get("size", 0))
+                                    except (ValueError, TypeError):
+                                        continue
+
+                            if side == "up":
+                                onchain_up = total
+                            else:
+                                onchain_down = total
+
+                        pos = self.fill_manager.get_position(slug)
+                        if not pos:
+                            continue
+
+                        up_diff = pos.up_shares - onchain_up
+                        down_diff = pos.down_shares - onchain_down
+
+                        threshold = 0.5  # tolerate < 0.5 share difference
+                        if abs(up_diff) > threshold or abs(down_diff) > threshold:
+                            logger.warning(
+                                f"RECONCILIATION MISMATCH [{slug}]: "
+                                f"Internal UP={pos.up_shares:.2f} vs Chain={onchain_up:.2f} "
+                                f"(diff={up_diff:+.2f}), "
+                                f"Internal DOWN={pos.down_shares:.2f} vs Chain={onchain_down:.2f} "
+                                f"(diff={down_diff:+.2f})"
+                            )
+
+                            # Correct internal state to match on-chain (authoritative)
+                            if onchain_up < pos.up_shares and up_diff > threshold:
+                                correction = up_diff
+                                pos.up_shares = onchain_up
+                                logger.info(
+                                    f"RECONCILIATION CORRECTED [{slug}]: "
+                                    f"UP shares reduced by {correction:.2f} "
+                                    f"(phantom fills removed)"
+                                )
+                            if onchain_down < pos.down_shares and down_diff > threshold:
+                                correction = down_diff
+                                pos.down_shares = onchain_down
+                                logger.info(
+                                    f"RECONCILIATION CORRECTED [{slug}]: "
+                                    f"DOWN shares reduced by {correction:.2f} "
+                                    f"(phantom fills removed)"
+                                )
+                        else:
+                            logger.debug(
+                                f"Reconciliation OK [{slug}]: "
+                                f"UP={pos.up_shares:.2f}, DOWN={pos.down_shares:.2f}"
+                            )
+
+                    except ImportError:
+                        logger.debug("TradeParams not available for reconciliation")
+                        break
+                    except Exception as e:
+                        logger.debug(f"Reconciliation failed for {slug}: {e}")
+
+                await asyncio.sleep(reconcile_interval)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in position reconciliation: {e}")
+                await asyncio.sleep(reconcile_interval)
 
     async def _duration_watchdog(self) -> None:
         """Stop after configured duration."""

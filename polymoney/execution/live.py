@@ -2,19 +2,25 @@
 LiveExecutor - Real order execution via Polymarket CLOB API.
 
 Submits and manages real orders on Polymarket using py-clob-client.
-Tracks fills by polling order status from the exchange.
+Tracks fills by polling order status AND verifying via Trades API.
 
 Requires:
 - Configured ClobClient with valid private key
 - Market registration with correct token IDs
 - FillManager for fill tracking and reconciliation
+
+Fill verification:
+  When get_order() reports size_matched > 0, the executor cross-checks
+  against get_trades() to obtain the actual execution price and confirm
+  the fill on-chain.  Fills that lack confirmed trades within a timeout
+  window are treated as phantom fills and discarded.
 """
 
 import asyncio
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from polymoney.core.logging import get_logger
 from polymoney.execution.executor import (
@@ -27,6 +33,10 @@ from polymoney.execution.executor import (
 )
 
 logger = get_logger("execution.live")
+
+# Phantom fill verification timeout: if get_order() reports a fill but
+# no confirmed trades appear within this window, treat it as phantom.
+_FILL_VERIFY_TIMEOUT = 30.0  # seconds
 
 
 @dataclass
@@ -43,6 +53,10 @@ class LivePendingOrder:
     created_at: float = 0.0
     last_checked: float = 0.0
     is_taker: bool = False
+    # Fill verification: tracks unverified fills detected by get_order()
+    # but not yet confirmed by get_trades().
+    unverified_fill_size: float = 0.0
+    unverified_since: float = 0.0
 
 
 class LiveExecutor(OrderExecutor):
@@ -54,6 +68,7 @@ class LiveExecutor(OrderExecutor):
     - Order submission (POST /order)
     - Order cancellation (DELETE /order)
     - Order status polling (GET /order)
+    - Trade verification (GET /trades) for accurate fill prices
     
     Token ID resolution:
     - Markets are registered with up_token_id and down_token_id
@@ -62,7 +77,8 @@ class LiveExecutor(OrderExecutor):
     Fill tracking:
     - Polls order status every 2s for active orders
     - Recently submitted orders polled more frequently (500ms for 5s)
-    - Reports fills back via check_fills() return value
+    - Verifies fills via get_trades() for actual execution prices
+    - Discards phantom fills (size_matched reported but no on-chain trades)
     """
 
     def __init__(self, clob_client=None):
@@ -78,11 +94,41 @@ class LiveExecutor(OrderExecutor):
         self._pending: Dict[str, LivePendingOrder] = {}  # order_id -> order
         self._max_retries = 3
         self._retry_delay = 1.0  # seconds, exponential backoff
+        self._maker_address: Optional[str] = None
+        # Cache of recently verified trades to avoid re-fetching
+        self._verified_trades: Dict[str, float] = {}  # order_id -> verified_size
 
     def set_client(self, clob_client) -> None:
         """Set or update the CLOB client."""
         self._client = clob_client
-        logger.info("CLOB client configured for live execution")
+        self._maker_address = self._extract_maker_address(clob_client)
+        logger.info(
+            f"CLOB client configured for live execution"
+            f" (maker={self._maker_address[:10]}...)" if self._maker_address else ""
+        )
+
+    @staticmethod
+    def _extract_maker_address(client) -> Optional[str]:
+        """Extract the maker wallet address from the CLOB client."""
+        if client is None:
+            return None
+        try:
+            # py-clob-client stores the funder address (proxy wallet)
+            # or derives it from the private key
+            if hasattr(client, "funder") and client.funder:
+                return client.funder
+            if hasattr(client, "creds") and client.creds:
+                # L2 header-based auth stores the address
+                if hasattr(client.creds, "api_key"):
+                    pass  # api_key is not the address
+            # Derive from private key as fallback
+            if hasattr(client, "key") and client.key:
+                from eth_account import Account
+                acct = Account.from_key(client.key)
+                return acct.address
+        except Exception as e:
+            logger.warning(f"Could not extract maker address: {e}")
+        return None
 
     @property
     def is_ready(self) -> bool:
@@ -213,7 +259,15 @@ class LiveExecutor(OrderExecutor):
         """
         Poll exchange for fill updates on pending orders.
         
-        Checks order status via CLOB API and reports fills.
+        Two-phase fill detection:
+        1. get_order() detects that size_matched increased (fast, but
+           returns the limit price, not the actual fill price).
+        2. get_trades() verifies the fill on-chain and returns the real
+           execution price (slower, but authoritative).
+        
+        If get_order() reports a fill but get_trades() finds no matching
+        confirmed trades within _FILL_VERIFY_TIMEOUT, the fill is treated
+        as a phantom and discarded.
         """
         if not self._client:
             return []
@@ -235,50 +289,22 @@ class LiveExecutor(OrderExecutor):
             pending.last_checked = now
 
             try:
-                # Poll order status from exchange
+                # Phase 1: poll order status
                 order_status = self._client.get_order(pending.exchange_order_id)
                 if not order_status:
                     continue
 
                 status = order_status.get("status", "")
-                filled_size = float(order_status.get("size_matched", 0))
+                api_filled = float(order_status.get("size_matched", 0))
 
-                if status == "MATCHED" or filled_size >= pending.size - 0.01:
-                    # Fully filled
-                    avg_price = float(order_status.get("price", pending.price))
-                    events.append(FillEvent(
-                        order_id=order_id,
-                        market_id=market_id,
-                        side=pending.side,
-                        fill_price=avg_price,
-                        fill_size=filled_size,
-                        is_taker=pending.is_taker,
-                        timestamp=now,
-                    ))
-                    to_remove.append(order_id)
-                    logger.info(
-                        f"Live fill: {order_id} {pending.side.upper()} "
-                        f"{filled_size}@{avg_price}"
-                    )
-
-                elif filled_size > pending.filled_size + 0.01:
-                    # Partial fill — new shares filled since last check
-                    new_fill = filled_size - pending.filled_size
-                    avg_price = float(order_status.get("price", pending.price))
-                    events.append(FillEvent(
-                        order_id=order_id,
-                        market_id=market_id,
-                        side=pending.side,
-                        fill_price=avg_price,
-                        fill_size=new_fill,
-                        is_taker=pending.is_taker,
-                        is_partial=True,
-                        remaining_size=pending.size - filled_size,
-                        timestamp=now,
-                    ))
-                    pending.filled_size = filled_size
-
-                elif status in ("CANCELLED", "EXPIRED"):
+                if status in ("CANCELLED", "EXPIRED"):
+                    # Check if there were any partial fills before cancellation
+                    if api_filled > pending.filled_size + 0.01:
+                        fill_event = self._verify_and_build_fill(
+                            pending, api_filled, now, is_final=True
+                        )
+                        if fill_event:
+                            events.append(fill_event)
                     events.append(FillEvent(
                         order_id=order_id,
                         market_id=market_id,
@@ -290,14 +316,208 @@ class LiveExecutor(OrderExecutor):
                         timestamp=now,
                     ))
                     to_remove.append(order_id)
+                    continue
+
+                is_full = status == "MATCHED" or api_filled >= pending.size - 0.01
+                has_new_fill = api_filled > pending.filled_size + 0.01
+
+                if is_full or has_new_fill:
+                    fill_event = self._verify_and_build_fill(
+                        pending, api_filled, now, is_final=is_full
+                    )
+                    if fill_event:
+                        events.append(fill_event)
+                        if is_full:
+                            to_remove.append(order_id)
+                    elif is_full:
+                        # get_order says fully filled but trades not confirmed
+                        if pending.unverified_since == 0:
+                            pending.unverified_fill_size = api_filled
+                            pending.unverified_since = now
+                            logger.warning(
+                                f"Fill unverified: {order_id} "
+                                f"{pending.side.upper()} {api_filled:.1f} — "
+                                f"awaiting trade confirmation"
+                            )
+                        elif now - pending.unverified_since > _FILL_VERIFY_TIMEOUT:
+                            logger.error(
+                                f"PHANTOM FILL discarded: {order_id} "
+                                f"{pending.side.upper()} {api_filled:.1f} — "
+                                f"no confirmed trades after "
+                                f"{_FILL_VERIFY_TIMEOUT:.0f}s"
+                            )
+                            events.append(FillEvent(
+                                order_id=order_id,
+                                market_id=market_id,
+                                side=pending.side,
+                                fill_price=0.0,
+                                fill_size=0.0,
+                                is_cancelled=True,
+                                cancel_reason="phantom fill: no confirmed trades",
+                                timestamp=now,
+                            ))
+                            to_remove.append(order_id)
+
+                # Check phantom timeout for orders stuck in unverified state
+                elif (pending.unverified_since > 0
+                      and now - pending.unverified_since > _FILL_VERIFY_TIMEOUT):
+                    logger.error(
+                        f"PHANTOM FILL discarded: {order_id} "
+                        f"{pending.side.upper()} "
+                        f"{pending.unverified_fill_size:.1f} — "
+                        f"no confirmed trades after {_FILL_VERIFY_TIMEOUT:.0f}s"
+                    )
+                    events.append(FillEvent(
+                        order_id=order_id,
+                        market_id=market_id,
+                        side=pending.side,
+                        fill_price=0.0,
+                        fill_size=0.0,
+                        is_cancelled=True,
+                        cancel_reason="phantom fill: no confirmed trades",
+                        timestamp=now,
+                    ))
+                    to_remove.append(order_id)
 
             except Exception as e:
                 logger.warning(f"Failed to check order {order_id}: {e}")
 
         for order_id in to_remove:
             self._pending.pop(order_id, None)
+            self._verified_trades.pop(order_id, None)
 
         return events
+
+    def _verify_and_build_fill(
+        self,
+        pending: LivePendingOrder,
+        api_filled: float,
+        now: float,
+        is_final: bool,
+    ) -> Optional[FillEvent]:
+        """
+        Verify a fill via the Trades API and build a FillEvent with
+        the actual execution price.
+        
+        Returns None if trades are not yet confirmed (will be retried).
+        """
+        verified_size, vwap = self._fetch_verified_trades(pending)
+
+        if verified_size < 0.01:
+            # No confirmed trades yet
+            return None
+
+        new_fill = verified_size - pending.filled_size
+        if new_fill < 0.01:
+            return None
+
+        # Reset unverified state on successful verification
+        pending.unverified_since = 0
+        pending.unverified_fill_size = 0
+
+        is_partial = not is_final or verified_size < pending.size - 0.01
+        remaining = max(0, pending.size - verified_size)
+
+        pending.filled_size = verified_size
+        self._verified_trades[pending.order_id] = verified_size
+
+        logger.info(
+            f"Live fill (verified): {pending.order_id} "
+            f"{pending.side.upper()} {new_fill:.2f}@{vwap:.4f} "
+            f"(limit={pending.price:.4f}, improvement="
+            f"{(pending.price - vwap) / pending.price:.1%})"
+        )
+
+        return FillEvent(
+            order_id=pending.order_id,
+            market_id=pending.market_id,
+            side=pending.side,
+            fill_price=vwap,
+            fill_size=new_fill,
+            is_taker=pending.is_taker,
+            is_partial=is_partial,
+            remaining_size=remaining,
+            timestamp=now,
+        )
+
+    def _fetch_verified_trades(
+        self, pending: LivePendingOrder
+    ) -> Tuple[float, float]:
+        """
+        Fetch confirmed trades for a pending order from the Trades API.
+        
+        Returns:
+            (total_verified_size, volume_weighted_avg_price)
+            Returns (0.0, 0.0) if no confirmed trades found.
+        """
+        if not self._maker_address:
+            # Fallback: can't verify without maker address.
+            # Use the limit price (old behavior) — better than blocking.
+            logger.debug(
+                f"No maker address for trade verification, "
+                f"using limit price for {pending.order_id}"
+            )
+            api_size = pending.unverified_fill_size or pending.filled_size
+            if api_size > 0:
+                return api_size, pending.price
+            return 0.0, 0.0
+
+        try:
+            from py_clob_client.clob_types import TradeParams
+
+            params = TradeParams(
+                maker_address=self._maker_address,
+                asset_id=pending.token_id,
+                after=str(int(pending.created_at)),
+            )
+            response = self._client.get_trades(params=params)
+
+            if not response or not isinstance(response, dict):
+                return 0.0, 0.0
+
+            trades = response.get("data", [])
+            if not trades:
+                return 0.0, 0.0
+
+            total_size = 0.0
+            total_value = 0.0
+
+            for trade in trades:
+                trade_status = trade.get("status", "")
+                if trade_status not in (
+                    "TRADE_STATUS_CONFIRMED",
+                    "TRADE_STATUS_MINED",
+                    "TRADE_STATUS_MATCHED",
+                ):
+                    continue
+
+                try:
+                    size = float(trade.get("size", 0))
+                    price = float(trade.get("price", 0))
+                except (ValueError, TypeError):
+                    continue
+
+                if size > 0 and price > 0:
+                    total_size += size
+                    total_value += size * price
+
+            if total_size > 0:
+                vwap = total_value / total_size
+                return total_size, vwap
+
+            return 0.0, 0.0
+
+        except ImportError:
+            logger.debug("TradeParams not available, falling back to limit price")
+            api_size = pending.unverified_fill_size or pending.filled_size
+            if api_size > 0:
+                return api_size, pending.price
+            return 0.0, 0.0
+        except Exception as e:
+            logger.warning(
+                f"Trade verification failed for {pending.order_id}: {e}"
+            )
+            return 0.0, 0.0
 
     async def cancel_all(self, market_id: Optional[str] = None) -> int:
         """Cancel all pending live orders."""

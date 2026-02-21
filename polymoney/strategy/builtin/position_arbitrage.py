@@ -297,6 +297,13 @@ class PositionArbitrageStrategy(BaseStrategy):
         self.max_skew_threshold = self.params.get("max_skew_threshold", 0.85)
         self._skew_rejection_logged = False  # avoid log spam
         
+        # Phase 3 directional tilt: allow buying the probable winner even
+        # if it creates imbalance.  Near settlement, expected value of buying
+        # the high-probability side at below-market price is positive.
+        self.enable_phase3_tilt = self.params.get("enable_phase3_tilt", True)
+        self.phase3_tilt_min_prob = self.params.get("phase3_tilt_min_prob", 0.65)
+        self._phase3_tilt_logged = False
+        
         # Trend patience mode: when market is moderately skewed (one side > this threshold
         # but below max_skew_threshold), only buy the CHEAP side. The expensive side orders
         # are skipped entirely — we accumulate the cheap token and wait for a pullback to
@@ -681,6 +688,7 @@ class PositionArbitrageStrategy(BaseStrategy):
         self._rebalancing_events.clear()
         self._skew_rejection_logged = False
         self._trend_patience_logged = False
+        self._phase3_tilt_logged = False
         # Reset adaptive target spread data
         self._last_up_spread = 0.0
         self._last_down_spread = 0.0
@@ -844,22 +852,32 @@ class PositionArbitrageStrategy(BaseStrategy):
         # In such markets, only the cheap side limit orders fill, creating dangerous
         # one-sided exposure. Rebalancing (above) still runs for existing positions.
         # Uses hysteresis: activate at max_skew_threshold, deactivate at threshold - 5%
+        # Exception: Phase 3 with directional tilt bypasses the skew guard to allow
+        # buying the probable winner.
         max_price = max(price_data.up_price, price_data.down_price)
         skew_deactivate = self.max_skew_threshold - 0.05  # 5% hysteresis band
-        if max_price > self.max_skew_threshold or (self._skew_rejection_logged and max_price > skew_deactivate):
-            if not self._skew_rejection_logged:
-                dominant_side = "UP" if price_data.up_price > price_data.down_price else "DOWN"
+        phase3_tilt_active = (phase == 3 and self.enable_phase3_tilt
+                              and max_price >= self.phase3_tilt_min_prob)
+        if not phase3_tilt_active:
+            if max_price > self.max_skew_threshold or (self._skew_rejection_logged and max_price > skew_deactivate):
+                if not self._skew_rejection_logged:
+                    dominant_side = "UP" if price_data.up_price > price_data.down_price else "DOWN"
+                    logger.info(
+                        f"[{self.name}] SKEW GUARD: Market too skewed ({dominant_side}={max_price:.1%}), "
+                        f"threshold={self.max_skew_threshold:.1%}. Suspending new limit orders."
+                    )
+                    self._skew_rejection_logged = True
+                return signals
+            elif self._skew_rejection_logged:
                 logger.info(
-                    f"[{self.name}] SKEW GUARD: Market too skewed ({dominant_side}={max_price:.1%}), "
-                    f"threshold={self.max_skew_threshold:.1%}. Suspending new limit orders."
+                    f"[{self.name}] SKEW GUARD: Market skew reduced ({max_price:.1%} < {skew_deactivate:.1%}). "
+                    f"Resuming limit orders."
                 )
-                self._skew_rejection_logged = True
-            return signals
+                self._skew_rejection_logged = False
         elif self._skew_rejection_logged:
-            # Market returned below hysteresis band — resume trading
             logger.info(
-                f"[{self.name}] SKEW GUARD: Market skew reduced ({max_price:.1%} < {skew_deactivate:.1%}). "
-                f"Resuming limit orders."
+                f"[{self.name}] SKEW GUARD bypassed: Phase 3 directional tilt active "
+                f"(prob={max_price:.1%})"
             )
             self._skew_rejection_logged = False
         
@@ -1533,14 +1551,19 @@ class PositionArbitrageStrategy(BaseStrategy):
     def _check_phase3(self, side: str, market_price: float,
                       current_ecr: float, predicted_ecr: float) -> bool:
         """
-        Phase 3 settlement protection with conditional profit improvement.
+        Phase 3 settlement protection with directional tilt.
         
-        When ECR < 1.0 (profitable):
-          - Allow orders on the lagging side that would IMPROVE ECR further
-            (e.g. ECR 0.98 → 0.96), increasing guaranteed profit margin.
-          - Block orders that would worsen or not improve ECR.
-        When ECR >= 1.0 (unprofitable):
-          - Only allow ECR-improving orders on the lagging side (recovery mode).
+        Two modes:
+        
+        1. Hedging mode (default): protect existing position.
+           - Allow ECR-improving orders on lagging side only.
+        
+        2. Directional tilt (enable_phase3_tilt=True): buy the probable winner
+           even if it creates imbalance. Near settlement the expected value of
+           buying the high-probability side below market price is positive:
+             EV = prob_win × $1 - cost_per_share
+           So if UP is at 0.82 and we buy at 0.80, EV = 0.82 × $1 - $0.80 = +$0.02
+           This works even WITHOUT hedging from the other side.
         """
         if market_price < self.low_prob_threshold:
             logger.debug(f"[{self.name}] Phase 3: low prob {side.upper()} ({market_price:.1%})")
@@ -1548,8 +1571,32 @@ class PositionArbitrageStrategy(BaseStrategy):
 
         lagging = self.get_lagging_side()
 
+        # --- Directional tilt: buy the probable winner ---
+        if self.enable_phase3_tilt and self.current_up_price and self.current_down_price:
+            probable_winner = "up" if self.current_up_price >= self.current_down_price else "down"
+            win_prob = max(self.current_up_price, self.current_down_price)
+
+            if side == probable_winner and win_prob >= self.phase3_tilt_min_prob:
+                # Positive EV check: price we pay must be < probability of winning
+                limit_price = market_price  # approximate; actual limit set by caller
+                ev = win_prob - limit_price
+                if ev > 0:
+                    if not self._phase3_tilt_logged:
+                        logger.info(
+                            f"[{self.name}] PHASE 3 TILT: buying {side.upper()} "
+                            f"(prob={win_prob:.1%}, EV=+{ev:.3f}/share). "
+                            f"Allowing directional imbalance."
+                        )
+                        self._phase3_tilt_logged = True
+                    return True
+                else:
+                    logger.debug(
+                        f"[{self.name}] Phase 3 tilt: {side.upper()} negative EV "
+                        f"(prob={win_prob:.1%}, price={limit_price:.4f})"
+                    )
+
+        # --- Standard hedging logic ---
         if current_ecr < 1.0:
-            # Profitable — allow ECR-IMPROVING orders on lagging side only
             if predicted_ecr < current_ecr and side == lagging:
                 logger.debug(
                     f"[{self.name}] Phase 3: improving profitable ECR "
