@@ -8,8 +8,8 @@ py-clob-client>=0.1.0
 polymarket-apis>=0.1.0
 
 # Polymarket Builder Relayer (for gasless position redemption)
-py-builder-relayer-client>=0.1.0
-py-builder-signing-sdk>=0.1.0
+py-builder-relayer-client>=0.0.1
+py-builder-signing-sdk>=0.0.2
 
 # WebSocket client
 websockets>=12.0

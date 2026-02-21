@@ -23,7 +23,7 @@ Detection of redeemable positions uses the Polymarket Data API directly
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import httpx
 
@@ -133,6 +133,10 @@ class PositionRedeemer:
         self.total_redeemed: int = 0
         self.total_value_redeemed: float = 0.0
         self.total_failures: int = 0
+
+        # Callback: notified after each background scan with results.
+        # Signature: on_scan_result(unredeemed_count: int, failed_titles: List[str])
+        self.on_scan_result: Optional[Callable] = None
 
     # ------------------------------------------------------------------
     # Client initialization
@@ -637,6 +641,9 @@ class PositionRedeemer:
         """Single scan iteration: find and redeem all redeemable positions."""
         positions = await self.get_redeemable_positions()
         if not positions:
+            # No unredeemed positions — notify runner (clears any stale block)
+            if self.on_scan_result is not None:
+                self.on_scan_result(unredeemed_count=0, failed_titles=[])
             return
 
         by_condition: Dict[str, List[RedeemablePosition]] = {}
@@ -650,6 +657,7 @@ class PositionRedeemer:
             f"total value ~${total_value:.2f}"
         )
 
+        failed_titles: List[str] = []
         for cid, cid_positions in by_condition.items():
             for pos in cid_positions:
                 result = await self.redeem_position(pos)
@@ -662,7 +670,14 @@ class PositionRedeemer:
                     logger.warning(
                         f"Background redeem failed: {pos.title}: {result.error}"
                     )
+                    failed_titles.append(pos.title)
                 await asyncio.sleep(2.0)
+
+        if self.on_scan_result is not None:
+            self.on_scan_result(
+                unredeemed_count=len(failed_titles),
+                failed_titles=failed_titles,
+            )
 
     # ------------------------------------------------------------------
     # Utility

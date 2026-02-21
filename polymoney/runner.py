@@ -136,6 +136,16 @@ class TradingRunner:
         # Safety flag: set True if any redemption fails, blocks new market entry
         self._redeem_failed = False
 
+        # CLOB client reference for balance queries (set in _init_clob_client)
+        self._clob_client = None
+
+        # Available cash tracking: prevents entering markets without sufficient funds.
+        # Live mode: fetched from Polymarket API (USDC collateral balance).
+        # Paper mode: initialized from config as fallback.
+        # Between API refreshes, deducted on fills and restored on redemption.
+        self._available_cash: float = getattr(config, "initial_balance", config.max_total_exposure)
+        self._unredeemed_markets: Set[str] = set()
+
         # Active market contexts: slug -> MarketContext
         self._contexts: Dict[str, MarketContext] = {}
 
@@ -318,9 +328,23 @@ class TradingRunner:
                     f"You may need to create API credentials on Polymarket."
                 )
 
+            # Keep a reference for balance queries
+            self._clob_client = client
+
             # Set client on executor
             if isinstance(self.executor, LiveExecutor):
                 self.executor.set_client(client)
+
+            # Fetch real USDC balance from Polymarket
+            api_balance = self._fetch_usdc_balance()
+            if api_balance is not None:
+                self._available_cash = api_balance
+                logger.info(f"USDC balance from API: ${api_balance:.2f}")
+            else:
+                logger.warning(
+                    f"Could not fetch USDC balance from API, "
+                    f"using config fallback: ${self._available_cash:.2f}"
+                )
 
             logger.info(
                 f"Live executor ready: host={pm_config.host}, "
@@ -338,6 +362,7 @@ class TradingRunner:
                     builder_passphrase=pm_config.builder_passphrase,
                 )
                 if self.redeemer.is_available:
+                    self.redeemer.on_scan_result = self._on_redeemer_scan_result
                     logger.info("Position redeemer initialized for automatic redemption")
                 else:
                     logger.warning(
@@ -354,6 +379,32 @@ class TradingRunner:
                 "py-clob-client is required for live trading. "
                 "Install with: pip install py-clob-client"
             )
+
+    def _fetch_usdc_balance(self) -> Optional[float]:
+        """Query Polymarket API for the account's USDC collateral balance.
+
+        The CLOB ``/balance-allowance`` endpoint returns the on-chain ERC-20
+        balance as a string in the token's smallest unit.  USDC on Polygon has
+        6 decimals, so the raw value is divided by 1e6.
+        """
+        if self._clob_client is None:
+            return None
+        try:
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+
+            resp = self._clob_client.get_balance_allowance(
+                params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            )
+            if resp and isinstance(resp, dict):
+                raw = resp.get("balance", "0")
+                balance = float(raw) / 1e6  # USDC has 6 decimals on Polygon
+                logger.debug(f"USDC balance API raw={raw}, parsed=${balance:.6f}")
+                return balance
+            logger.warning(f"Unexpected balance API response: {resp}")
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to fetch USDC balance: {e}")
+            return None
 
     # ------------------------------------------------------------------
     # Data provider callbacks
@@ -378,6 +429,23 @@ class TradingRunner:
             logger.info(
                 f"Skipping {slug}: {self.fill_manager.pending_redemption_count} "
                 f"redemption(s) pending, waiting for capital recovery"
+            )
+            return
+
+        # Block if background redeemer found unredeemed positions it can't recover
+        if self._unredeemed_markets:
+            logger.info(
+                f"Skipping {slug}: {len(self._unredeemed_markets)} unredeemed market(s) "
+                f"from prior runs blocking new entry"
+            )
+            return
+
+        # Check available cash — need at least position_size for a new market
+        if self._available_cash < self.config.target_cost * 5:
+            logger.info(
+                f"Skipping {slug}: insufficient cash "
+                f"(${self._available_cash:.2f} available, need "
+                f"${self.config.target_cost * 5:.2f} minimum)"
             )
             return
 
@@ -557,6 +625,8 @@ class TradingRunner:
 
         # Handle immediate fills
         if result.status == OrderResultStatus.FILLED:
+            fill_cost = result.fill_size * result.fill_price
+            self._available_cash -= fill_cost
             ctx.apply_fill(side, result.fill_size, result.fill_price, is_taker)
             ctx.remove_pending_order(result.order_id)
             self.fill_manager.process_fills([
@@ -572,8 +642,9 @@ class TradingRunner:
             ])
 
         elif result.status == OrderResultStatus.PARTIALLY_FILLED:
+            fill_cost = result.fill_size * result.fill_price
+            self._available_cash -= fill_cost
             ctx.apply_fill(side, result.fill_size, result.fill_price, is_taker)
-            # Update pending order remaining size
             for p in ctx.strategy.pending_orders:
                 if p.order_id == result.order_id:
                     p.shares = result.pending_size
@@ -601,6 +672,8 @@ class TradingRunner:
             if event.is_cancelled:
                 ctx.remove_pending_order(event.order_id)
             elif event.is_partial:
+                fill_cost = event.fill_size * event.fill_price
+                self._available_cash -= fill_cost
                 ctx.apply_fill(
                     event.side, event.fill_size, event.fill_price, event.is_taker
                 )
@@ -611,6 +684,8 @@ class TradingRunner:
                         break
             else:
                 # Full fill
+                fill_cost = event.fill_size * event.fill_price
+                self._available_cash -= fill_cost
                 ctx.apply_fill(
                     event.side, event.fill_size, event.fill_price, event.is_taker
                 )
@@ -663,16 +738,17 @@ class TradingRunner:
             )
 
             # Automatic redemption: recover capital from settled market
+            settlement_value = (
+                result.up_shares if winner == "up" else result.down_shares
+            )
             if self.redeemer is not None and result.condition_id:
-                settlement_value = (
-                    result.up_shares if winner == "up" else result.down_shares
-                )
                 asyncio.create_task(
                     self._auto_redeem(result.condition_id, slug, settlement_value)
                 )
             else:
                 # No redeemer available — release capital immediately
                 self.fill_manager.release_redemption(slug)
+                self._available_cash += settlement_value
         else:
             logger.warning(f"Market {slug} ended without winner")
 
@@ -703,11 +779,13 @@ class TradingRunner:
                     total_value = sum(r.value_redeemed for r in successes)
 
                     if successes and not failures:
-                        # Full success
+                        # Full success — restore cash
                         self.fill_manager.release_redemption(slug)
+                        self._available_cash += total_value
                         logger.info(
                             f"Auto-redeem {slug}: {len(successes)} position(s) "
-                            f"redeemed, ${total_value:.2f} recovered"
+                            f"redeemed, ${total_value:.2f} recovered "
+                            f"(available: ${self._available_cash:.2f})"
                         )
                         return
                     elif successes:
@@ -755,6 +833,28 @@ class TradingRunner:
         # All retries exhausted — trigger safety stop
         await self._on_redeem_failure(slug)
 
+    def _on_redeemer_scan_result(
+        self, unredeemed_count: int, failed_titles: List[str]
+    ) -> None:
+        """Handle background redeemer scan results.
+
+        If unredeemed positions from prior runs are found and cannot be
+        redeemed, block new market entry to prevent trading without
+        sufficient available capital.
+        """
+        if unredeemed_count == 0:
+            if self._unredeemed_markets:
+                logger.info(
+                    "All prior unredeemed positions cleared — resuming trading"
+                )
+                self._unredeemed_markets.clear()
+        else:
+            self._unredeemed_markets = set(failed_titles)
+            logger.warning(
+                f"Background scan: {unredeemed_count} position(s) cannot be redeemed. "
+                f"New market entry blocked until resolved."
+            )
+
     async def _on_redeem_failure(self, slug: str) -> None:
         """Handle redemption failure by stopping all trading.
 
@@ -794,8 +894,17 @@ class TradingRunner:
 
     async def _metrics_output_loop(self) -> None:
         """Periodically output metrics."""
+        _balance_refresh_counter = 0
         while self._running:
             try:
+                # Periodically sync _available_cash with the real API balance
+                # (every 5 metrics cycles ≈ every 5 × metrics_output_interval seconds).
+                _balance_refresh_counter += 1
+                if self.mode == "live" and _balance_refresh_counter % 5 == 0:
+                    api_balance = self._fetch_usdc_balance()
+                    if api_balance is not None:
+                        self._available_cash = api_balance
+
                 # Track peak capital exposure for capital efficiency metrics
                 current_exposure = self.fill_manager.get_total_exposure()
                 self.stats.update_exposure(current_exposure)
@@ -830,19 +939,28 @@ class TradingRunner:
                     expected_pnl += market_pnl
 
                     ecr = total_cost / hedged if hedged > 0 else 0
-                    ecr_str = f"{ecr:.2f}" if hedged > 0 else "-"
+                    if hedged > 0:
+                        ecr_str = f"{ecr:.2f}"
+                    elif total_cost > 0:
+                        # Has cost but one-sided position — show which side
+                        one_side = "UP" if ctx.result.up_shares > 0 else "DOWN"
+                        ecr_str = f"1-side({one_side})"
+                    else:
+                        ecr_str = "-"
                     price_info += (
                         f" | {coin}: {price_str} ECR={ecr_str} "
                         f"({filled}/{submitted})"
                     )
 
                 total_expected = self.stats.total_pnl + expected_pnl
+                cash_str = f", Cash=${self._available_cash:.2f}" if self.mode == "live" else ""
                 logger.info(
                     f"[{self.mode.upper()}] "
                     f"Realized=${self.stats.total_pnl:.2f}, "
                     f"Expected=${total_expected:.2f}, "
                     f"Markets={self.stats.markets_processed}, "
                     f"Active={len(self._contexts)}"
+                    f"{cash_str}"
                     f"{price_info}"
                 )
 

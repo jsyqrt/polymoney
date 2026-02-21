@@ -943,8 +943,9 @@ class PositionArbitrageStrategy(BaseStrategy):
         
         # === Proportional order sizing ===
         # In a skewed market (e.g., UP=0.70 DOWN=0.30), equal dollar orders
-        # produce unbalanced shares.  Split the pair budget by price ratio
-        # so both sides get equal shares.
+        # produce unbalanced shares.  We want EQUAL SHARES on both sides,
+        # which means spending more dollars on the expensive side.
+        # Each side gets: min_order_shares * its_limit_price dollars.
         price_sum = up_limit + down_limit
         if price_sum > 0:
             up_cost_ratio = up_limit / price_sum
@@ -952,18 +953,18 @@ class PositionArbitrageStrategy(BaseStrategy):
         else:
             up_cost_ratio = down_cost_ratio = 0.5
         
-        pair_budget = self.batch_size * 2  # Total per order pair
-        
         # Minimum order cost enforces the Polymarket minimum order size.
-        # CRITICAL: compute per-side using each side's OWN limit price.
-        # Using min(up, down) was a bug — the expensive side needs MORE dollars
-        # to reach min_order_shares.  E.g. with UP=0.54, DOWN=0.40, min_shares=5:
-        #   UP needs 5×0.54=$2.70, DOWN needs 5×0.40=$2.00.
-        #   Using min_price=$0.40 gave both sides $2.00 floor, producing only
-        #   3.7 UP shares → rejected by Polymarket (minimum: 5).
-        min_order_cost_up = max(self.min_order_shares * up_limit, self.batch_size * 0.5)
-        min_order_cost_down = max(self.min_order_shares * down_limit, self.batch_size * 0.5)
-        # Loop guard: continue while we can afford at least the cheaper side
+        # Each side independently needs enough dollars to produce min_order_shares.
+        # The expensive side naturally needs more dollars.
+        min_order_cost_up = self.min_order_shares * up_limit
+        min_order_cost_down = self.min_order_shares * down_limit
+        
+        # Pair budget: enough for min_order_shares on BOTH sides.
+        # If batch_size * 2 < sum of minimums, scale up to the minimums.
+        min_pair_cost = min_order_cost_up + min_order_cost_down
+        pair_budget = max(self.batch_size * 2, min_pair_cost)
+        
+        # Loop guard: need enough for at least one side's minimum
         min_order_cost = min(min_order_cost_up, min_order_cost_down)
         while available >= min_order_cost and orders_created < max_orders_per_tick:
             # Calculate current imbalance
@@ -989,75 +990,70 @@ class PositionArbitrageStrategy(BaseStrategy):
                     break  # Stop if primary side is low probability
             
             # Primary side order (lagging side - always try)
-            # In trend following mode, asymmetric pricing in _calculate_limit_prices
-            # handles which side fills first — no need to skip any side here.
-            # ECR recovery: skip if this side is blocked by recovery constraint
             primary_blocked = ecr_recovery_side is not None and primary_side != ecr_recovery_side
             primary_cost_ratio = up_cost_ratio if primary_side == "up" else down_cost_ratio
             primary_min_cost = min_order_cost_up if primary_side == "up" else min_order_cost_down
             primary_order_budget = max(pair_budget * primary_cost_ratio, primary_min_cost)
-            if not primary_blocked and primary_count < max_pending_per_side and available >= primary_order_budget:
-                # Proportional order sizing: scale cost by price ratio for balanced shares.
-                order_cost = min(available, primary_order_budget)
+            if not primary_blocked and primary_count < max_pending_per_side and available >= primary_min_cost:
+                order_cost = max(min(available, primary_order_budget), primary_min_cost)
                 
                 if self._should_place_order(primary_side, primary_limit, order_cost):
-                    signals.append(self._create_signal(primary_side, primary_limit, order_cost))
-                    shares = order_cost / primary_limit
-                    # Add to pending_orders for tracking
-                    self._order_counter += 1
-                    self.pending_orders.append(LimitOrder(
-                        order_id=f"{primary_side}_{self._order_counter}",
-                        side=primary_side,
-                        price=primary_limit,
-                        shares=shares,
-                        cost=order_cost,
-                        created_market_price=price_data.up_price if primary_side == "up" else price_data.down_price,
-                    ))
-                    available -= order_cost
-                    if primary_side == "up":
-                        pending_up_count += 1
-                        up_shares_total += shares
-                    else:
-                        pending_down_count += 1
-                        down_shares_total += shares
-                    created = True
-                    orders_created += 1
+                    signal = self._create_signal(primary_side, primary_limit, order_cost)
+                    if signal is not None:
+                        actual_cost = signal.size * signal.target_price
+                        signals.append(signal)
+                        self._order_counter += 1
+                        self.pending_orders.append(LimitOrder(
+                            order_id=f"{primary_side}_{self._order_counter}",
+                            side=primary_side,
+                            price=primary_limit,
+                            shares=signal.size,
+                            cost=actual_cost,
+                            created_market_price=price_data.up_price if primary_side == "up" else price_data.down_price,
+                        ))
+                        available -= actual_cost
+                        if primary_side == "up":
+                            pending_up_count += 1
+                            up_shares_total += signal.size
+                        else:
+                            pending_down_count += 1
+                            down_shares_total += signal.size
+                        created = True
+                        orders_created += 1
             
             # Secondary side order (leading side)
-            # Both sides get orders — asymmetric pricing handles fill priority.
-            # ECR recovery: skip if this side is blocked by recovery constraint
             secondary_blocked = ecr_recovery_side is not None and secondary_side != ecr_recovery_side
             secondary_cost_ratio = up_cost_ratio if secondary_side == "up" else down_cost_ratio
             secondary_min_cost = min_order_cost_up if secondary_side == "up" else min_order_cost_down
             secondary_order_budget = max(pair_budget * secondary_cost_ratio, secondary_min_cost)
-            if not secondary_blocked and secondary_count < max_pending_per_side and available >= secondary_order_budget:
-                # Phase 3: Don't buy low probability side
+            if not secondary_blocked and secondary_count < max_pending_per_side and available >= secondary_min_cost:
                 if phase == 3 and secondary_limit < self.low_prob_threshold:
-                    pass  # Skip
+                    pass  # Skip low probability side in Phase 3
                 else:
-                    order_cost = min(available, secondary_order_budget)
+                    order_cost = max(min(available, secondary_order_budget), secondary_min_cost)
                     if self._should_place_order(secondary_side, secondary_limit, order_cost):
-                        signals.append(self._create_signal(secondary_side, secondary_limit, order_cost))
-                        shares = order_cost / secondary_limit
-                        # Add to pending_orders for tracking
-                        self._order_counter += 1
-                        self.pending_orders.append(LimitOrder(
-                            order_id=f"{secondary_side}_{self._order_counter}",
-                            side=secondary_side,
-                            price=secondary_limit,
-                            shares=shares,
-                            cost=order_cost,
-                            created_market_price=price_data.up_price if secondary_side == "up" else price_data.down_price,
-                        ))
-                        available -= order_cost
-                        if secondary_side == "up":
-                            pending_up_count += 1
-                            up_shares_total += shares
-                        else:
-                            pending_down_count += 1
-                            down_shares_total += shares
-                        created = True
-                        orders_created += 1
+                        signal = self._create_signal(secondary_side, secondary_limit, order_cost)
+                        if signal is not None:
+                            actual_cost = signal.size * signal.target_price
+                            signals.append(signal)
+                            self._order_counter += 1
+                            self.pending_orders.append(LimitOrder(
+                                order_id=f"{secondary_side}_{self._order_counter}",
+                                side=secondary_side,
+                                price=secondary_limit,
+                                shares=signal.size,
+                                cost=actual_cost,
+                                created_market_price=price_data.up_price if secondary_side == "up" else price_data.down_price,
+                            ))
+                            available -= actual_cost
+                            if secondary_side == "up":
+                                pending_up_count += 1
+                                up_shares_total += signal.size
+                            else:
+                                pending_down_count += 1
+                                down_shares_total += signal.size
+                            created = True
+                            orders_created += 1
             
             # Exit if no orders created this iteration
             if not created:
@@ -1596,11 +1592,27 @@ class PositionArbitrageStrategy(BaseStrategy):
 
         return True  # Balanced: allow both sides
 
-    def _create_signal(self, side: str, price: float, cost: float) -> OrderSignal:
-        """Create an order signal."""
+    def _create_signal(self, side: str, price: float, cost: float) -> Optional[OrderSignal]:
+        """Create an order signal, enforcing minimum share count."""
         token_type = TokenType.YES if side == "up" else TokenType.NO
         trade_side = TradeSide.BUY
         size = cost / price
+
+        # Enforce Polymarket minimum order size (shares).
+        # If the calculated shares are below the minimum, scale up the cost
+        # to produce exactly min_order_shares. The caller must have enough budget.
+        if size < self.min_order_shares:
+            required_cost = self.min_order_shares * price
+            if required_cost > cost * 3:
+                # Cost would need to triple — something is wrong, skip
+                logger.debug(
+                    f"[{self.name}] Skipping {side.upper()} order: "
+                    f"{size:.1f} shares < min {self.min_order_shares}, "
+                    f"scaling would require ${required_cost:.2f} (too much)"
+                )
+                return None
+            size = float(self.min_order_shares)
+            cost = size * price
 
         return OrderSignal(
             side=trade_side,
