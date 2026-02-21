@@ -78,6 +78,9 @@ class MarketSubscription:
         self.orderbook: Dict[str, Any] = {"bids": [], "asks": []}
         self.best_bid: float = 0.0
         self.best_ask: float = 1.0
+        # Throttle garbage-book log to avoid flooding
+        self._garbage_log_count: int = 0
+        self._garbage_log_threshold: int = 100
 
 
 # Type alias for event callbacks
@@ -297,10 +300,11 @@ class WebSocketManager:
             logger.info(f"Connected to WebSocket for {market_id}")
 
             # Send subscription message (official format from Polymarket docs)
-            # https://docs.polymarket.com/quickstart/websocket/WSS-Quickstart
+            # https://docs.polymarket.com/developers/CLOB/websocket/market-channel
             sub_message = {
                 "assets_ids": subscription.token_ids,
-                "type": "market",  # Channel type, not action
+                "type": "market",
+                "custom_feature_enabled": True,
             }
             await ws.send(json.dumps(sub_message))
             logger.debug(f"Sent subscription for {len(subscription.token_ids)} tokens")
@@ -443,7 +447,7 @@ class WebSocketManager:
     
     async def _process_single_message(self, market_id: str, message: Dict) -> None:
         """Process a single WebSocket message dict."""
-        msg_type = message.get("type", message.get("event_type", ""))
+        msg_type = message.get("event_type", message.get("type", ""))
 
         subscription = self._subscriptions.get(market_id)
         if not subscription:
@@ -457,6 +461,14 @@ class WebSocketManager:
             await self._handle_price_change(market_id, subscription, message)
         elif msg_type == "last_trade_price":
             await self._handle_last_trade_price(market_id, subscription, message)
+        elif msg_type == "best_bid_ask":
+            await self._handle_best_bid_ask(market_id, subscription, message)
+        elif msg_type == "market_resolved":
+            await self._handle_market_resolved(market_id, message)
+        elif msg_type == "tick_size_change":
+            pass  # informational only
+        elif msg_type == "new_market":
+            pass  # handled by HTTP scanner
         else:
             logger.debug(f"Unknown message type: {msg_type}")
 
@@ -514,10 +526,12 @@ class WebSocketManager:
             # Filter garbage orderbook data before emitting
             spread = (ask - bid) if (bid is not None and ask is not None) else 0.0
             if spread > 0.50:
-                logger.debug(
-                    f"[WS] Filtering garbage book update for {asset_id[:12]}... "
-                    f"(spread={spread:.2f})"
-                )
+                subscription._garbage_log_count += 1
+                if subscription._garbage_log_count <= 3 or subscription._garbage_log_count % subscription._garbage_log_threshold == 0:
+                    logger.debug(
+                        f"[WS] Filtering thin native book for {asset_id[:12]}... "
+                        f"(spread={spread:.2f}, count={subscription._garbage_log_count})"
+                    )
                 return
             
             if token_price.update(bid=bid, ask=ask):
@@ -710,6 +724,86 @@ class WebSocketManager:
                 spread=0.0,  # No spread info
             )
             self._emit_event("price_update", market_id, price_data)
+
+    async def _handle_best_bid_ask(
+        self, market_id: str, subscription: MarketSubscription, message: Dict
+    ) -> None:
+        """Handle best_bid_ask message (requires custom_feature_enabled).
+        
+        This is the most accurate source for effective bid/ask prices because
+        it reflects the merged orderbook (native + complementary orders).
+        For thin 15-min crypto markets, native per-token books often show
+        bid=0.01/ask=0.99 while the effective best_bid_ask has real spreads.
+        
+        Format:
+        {
+            "event_type": "best_bid_ask",
+            "market": "0x...",
+            "asset_id": "...",
+            "best_bid": "0.73",
+            "best_ask": "0.77",
+            "spread": "0.04",
+            "timestamp": "..."
+        }
+        """
+        asset_id = message.get("asset_id")
+        best_bid = message.get("best_bid")
+        best_ask = message.get("best_ask")
+
+        if not asset_id or best_bid is None or best_ask is None:
+            return
+
+        bid = float(best_bid)
+        ask = float(best_ask)
+
+        if bid <= 0 or ask <= 0 or ask <= bid:
+            return
+
+        subscription.last_update = datetime.now()
+
+        if asset_id not in subscription.token_prices:
+            subscription.token_prices[asset_id] = TokenPrice(token_id=asset_id)
+
+        token_price = subscription.token_prices[asset_id]
+        if token_price.update(bid=bid, ask=ask):
+            self._emit_event("token_price", asset_id, {
+                "token_id": asset_id,
+                "mid_price": token_price.mid_price,
+                "best_bid": token_price.best_bid,
+                "best_ask": token_price.best_ask,
+                "source": "best_bid_ask",
+            })
+
+    async def _handle_market_resolved(self, market_id: str, message: Dict) -> None:
+        """Handle market_resolved message (requires custom_feature_enabled).
+        
+        Provides definitive settlement detection directly from the exchange.
+        
+        Format:
+        {
+            "event_type": "market_resolved",
+            "market": "0x...",
+            "assets_ids": ["...", "..."],
+            "winning_asset_id": "...",
+            "winning_outcome": "Yes",
+            ...
+        }
+        """
+        winning_asset_id = message.get("winning_asset_id")
+        slug = message.get("slug", "")
+
+        logger.info(
+            f"[WS] Market resolved: {slug or market_id[:12]} "
+            f"winner_asset={winning_asset_id[:12] if winning_asset_id else 'none'}..."
+        )
+
+        self._emit_event("market_resolved", market_id, {
+            "market_id": market_id,
+            "winning_asset_id": winning_asset_id,
+            "winning_outcome": message.get("winning_outcome"),
+            "slug": slug,
+            "assets_ids": message.get("assets_ids", []),
+        })
 
     def get_health_status(self) -> Dict[str, Any]:
         """Get health status of WebSocket connections."""

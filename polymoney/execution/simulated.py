@@ -511,8 +511,11 @@ class SimulatedExecutor(OrderExecutor):
         """
         book = self._get_orderbook(state, side)
 
-        # Staleness check: if orderbook best_ask diverges >15% from WS price,
-        # the depth data is stale — fall through to spread model
+        # Staleness check: if orderbook best_ask diverges too much from WS
+        # price, the depth data is stale — fall through to spread model.
+        # Threshold is 25% for prices < 0.30 (low-priced tokens are volatile)
+        # and 20% for others (up from 15% to reduce false positives in
+        # fast-moving 15-min crypto markets with 8s REST refresh).
         if book:
             book_best_ask = book.best_ask
             if book_best_ask is not None:
@@ -521,7 +524,8 @@ class SimulatedExecutor(OrderExecutor):
                     if market_price > 0
                     else 0
                 )
-                if divergence > 0.15:
+                stale_threshold = 0.25 if market_price < 0.30 else 0.20
+                if divergence > stale_threshold:
                     logger.debug(
                         f"[{market_id}] Stale orderbook: {side.upper()} "
                         f"book_ask={book_best_ask:.4f} vs market={market_price:.4f} "
