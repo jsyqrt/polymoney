@@ -563,13 +563,12 @@ class TradingRunner:
                 f"redemption(s) pending during market discovery"
             )
 
-        # Block if background redeemer found unredeemed positions it can't recover
+        # Log unredeemed positions but don't block — user will redeem manually
         if self._unredeemed_markets:
-            logger.info(
-                f"Skipping {slug}: {len(self._unredeemed_markets)} unredeemed market(s) "
-                f"from prior runs blocking new entry"
+            logger.debug(
+                f"Note: {len(self._unredeemed_markets)} unredeemed market(s) "
+                f"from prior runs (not blocking — manual redeem)"
             )
-            return
 
         # Check available cash — need at least position_size for a new market
         if self._available_cash < self.config.target_cost * 5:
@@ -970,20 +969,20 @@ class TradingRunner:
         """Handle background redeemer scan results.
 
         If unredeemed positions from prior runs are found and cannot be
-        redeemed, block new market entry to prevent trading without
-        sufficient available capital.
+        redeemed, log the count.  Trading continues — user will redeem
+        manually.
         """
         if unredeemed_count == 0:
             if self._unredeemed_markets:
                 logger.info(
-                    "All prior unredeemed positions cleared — resuming trading"
+                    "All prior unredeemed positions cleared"
                 )
                 self._unredeemed_markets.clear()
         else:
             self._unredeemed_markets = set(failed_titles)
-            logger.warning(
+            logger.info(
                 f"Background scan: {unredeemed_count} position(s) cannot be redeemed. "
-                f"New market entry blocked until resolved."
+                f"User will redeem manually — trading continues."
             )
 
     async def _on_redeem_failure(self, slug: str) -> None:
@@ -1179,11 +1178,17 @@ class TradingRunner:
         
         Queries the Trades API for each active market's token and compares
         total verified shares with the FillManager's internal tracking.
-        Logs discrepancies and corrects internal state when the on-chain
-        data is authoritative.
+        
+        Safety: The Trades API has propagation delays — recently matched
+        trades may not appear for 30-120s.  To avoid corrupting internal
+        position state based on stale data, we apply three safety layers:
+        1. Skip markets with fills in the last 120s (cooldown).
+        2. NEVER correct a non-zero position to zero (almost always stale).
+        3. Only correct UPWARD (chain > internal = missed fills).
         """
-        reconcile_interval = 120.0  # every 2 minutes
-        await asyncio.sleep(30.0)  # initial delay to let markets initialize
+        reconcile_interval = 120.0
+        fill_cooldown = 120.0
+        await asyncio.sleep(60.0)
 
         while self._running:
             try:
@@ -1198,6 +1203,8 @@ class TradingRunner:
                     await asyncio.sleep(reconcile_interval)
                     continue
 
+                now = time.time()
+
                 for slug, ctx in list(self._contexts.items()):
                     meta = ctx.market
                     up_token = meta.get("up_token_id", "")
@@ -1206,11 +1213,31 @@ class TradingRunner:
                     if not up_token or not down_token:
                         continue
 
+                    pos = self.fill_manager.get_position(slug)
+                    if not pos:
+                        continue
+
+                    if pos.last_fill_time > 0 and (now - pos.last_fill_time) < fill_cooldown:
+                        secs = now - pos.last_fill_time
+                        logger.debug(
+                            f"Reconciliation [{slug}]: skipping — "
+                            f"last fill {secs:.0f}s ago (cooldown={fill_cooldown:.0f}s)"
+                        )
+                        continue
+
                     try:
                         from py_clob_client.clob_types import TradeParams
 
                         onchain_up = 0.0
                         onchain_down = 0.0
+                        up_has_data = False
+                        down_has_data = False
+
+                        _VALID_STATUSES = {
+                            "TRADE_STATUS_CONFIRMED",
+                            "TRADE_STATUS_MINED",
+                            "TRADE_STATUS_MATCHED",
+                        }
 
                         for side, token_id in [("up", up_token), ("down", down_token)]:
                             params = TradeParams(
@@ -1219,72 +1246,105 @@ class TradingRunner:
                             )
                             trades = self._clob_client.get_trades(params=params)
                             if not trades or not isinstance(trades, list):
+                                logger.debug(
+                                    f"Reconciliation [{slug}]: get_trades() "
+                                    f"returned empty for {side} — skipping side"
+                                )
                                 continue
 
                             total = 0.0
+                            trade_count = 0
                             for trade in trades:
-                                status = trade.get("status", "")
-                                if status in (
-                                    "TRADE_STATUS_CONFIRMED",
-                                    "TRADE_STATUS_MINED",
-                                    "TRADE_STATUS_MATCHED",
-                                ):
-                                    try:
-                                        sz = float(trade.get("size", 0))
-                                    except (ValueError, TypeError):
-                                        continue
-                                    # BUY adds shares, SELL removes shares
-                                    trade_side = trade.get("side", "BUY").upper()
-                                    if trade_side == "SELL":
-                                        total -= sz
-                                    else:
-                                        total += sz
+                                if trade.get("status", "") not in _VALID_STATUSES:
+                                    continue
+                                try:
+                                    sz = float(trade.get("size", 0))
+                                except (ValueError, TypeError):
+                                    continue
+                                trade_side = trade.get("side", "BUY").upper()
+                                if trade_side == "SELL":
+                                    total -= sz
+                                else:
+                                    total += sz
+                                trade_count += 1
+
+                            if trade_count == 0:
+                                logger.debug(
+                                    f"Reconciliation [{slug}]: "
+                                    f"no valid {side} trades in {len(trades)} results"
+                                )
+                                continue
 
                             total = max(0.0, total)
                             if side == "up":
                                 onchain_up = total
+                                up_has_data = True
                             else:
                                 onchain_down = total
-
-                        pos = self.fill_manager.get_position(slug)
-                        if not pos:
-                            continue
-
-                        up_diff = pos.up_shares - onchain_up
-                        down_diff = pos.down_shares - onchain_down
+                                down_has_data = True
 
                         threshold = 0.5
+
+                        up_diff = pos.up_shares - onchain_up if up_has_data else 0.0
+                        down_diff = pos.down_shares - onchain_down if down_has_data else 0.0
+
+                        if not up_has_data and pos.up_shares > 0:
+                            logger.debug(
+                                f"Reconciliation [{slug}]: no chain data for UP "
+                                f"(internal={pos.up_shares:.2f}) — skipping"
+                            )
+                        if not down_has_data and pos.down_shares > 0:
+                            logger.debug(
+                                f"Reconciliation [{slug}]: no chain data for DOWN "
+                                f"(internal={pos.down_shares:.2f}) — skipping"
+                            )
+
                         if abs(up_diff) > threshold or abs(down_diff) > threshold:
                             logger.warning(
                                 f"RECONCILIATION MISMATCH [{slug}]: "
-                                f"Internal UP={pos.up_shares:.2f} vs Chain={onchain_up:.2f} "
+                                f"Internal UP={pos.up_shares:.2f} vs "
+                                f"Chain={'?.??' if not up_has_data else f'{onchain_up:.2f}'} "
                                 f"(diff={up_diff:+.2f}), "
-                                f"Internal DOWN={pos.down_shares:.2f} vs Chain={onchain_down:.2f} "
+                                f"Internal DOWN={pos.down_shares:.2f} vs "
+                                f"Chain={'?.??' if not down_has_data else f'{onchain_down:.2f}'} "
                                 f"(diff={down_diff:+.2f})"
                             )
 
-                            # Correct shares AND costs proportionally
-                            if abs(up_diff) > threshold:
+                            # SAFETY: Only correct UPWARD (chain > internal).
+                            # If chain < internal, the API likely has stale data
+                            # (propagation delay). Never zero out positions.
+                            if up_has_data and onchain_up > pos.up_shares + threshold:
                                 old_up = pos.up_shares
                                 pos.up_shares = onchain_up
                                 if old_up > 0:
                                     pos.up_cost *= (onchain_up / old_up)
-                                elif onchain_up == 0:
-                                    pos.up_cost = 0.0
                                 logger.warning(
                                     f"RECONCILIATION CORRECTED [{slug}]: "
-                                    f"UP shares {old_up:.2f} → {onchain_up:.2f}"
+                                    f"UP shares {old_up:.2f} → {onchain_up:.2f} "
+                                    f"(chain has MORE — likely missed fill)"
                                 )
-                            if abs(down_diff) > threshold:
+                            elif up_has_data and up_diff > threshold:
+                                logger.info(
+                                    f"Reconciliation [{slug}]: UP internal "
+                                    f"{pos.up_shares:.2f} > chain {onchain_up:.2f} — "
+                                    f"NOT correcting (likely stale API data)"
+                                )
+
+                            if down_has_data and onchain_down > pos.down_shares + threshold:
                                 old_down = pos.down_shares
                                 pos.down_shares = onchain_down
                                 if old_down > 0:
                                     pos.down_cost *= (onchain_down / old_down)
-                                elif onchain_down == 0:
-                                    pos.down_cost = 0.0
                                 logger.warning(
                                     f"RECONCILIATION CORRECTED [{slug}]: "
-                                    f"DOWN shares {old_down:.2f} → {onchain_down:.2f}"
+                                    f"DOWN shares {old_down:.2f} → {onchain_down:.2f} "
+                                    f"(chain has MORE — likely missed fill)"
+                                )
+                            elif down_has_data and down_diff > threshold:
+                                logger.info(
+                                    f"Reconciliation [{slug}]: DOWN internal "
+                                    f"{pos.down_shares:.2f} > chain {onchain_down:.2f} — "
+                                    f"NOT correcting (likely stale API data)"
                                 )
                         else:
                             logger.debug(

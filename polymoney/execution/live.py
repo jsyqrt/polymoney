@@ -113,7 +113,7 @@ class LiveExecutor(OrderExecutor):
         if self._maker_address:
             logger.info(
                 f"CLOB client configured for live execution "
-                f"(maker={self._maker_address[:10]}...)"
+                f"(maker_address={self._maker_address})"
             )
         else:
             logger.error(
@@ -331,8 +331,9 @@ class LiveExecutor(OrderExecutor):
            execution price (slower, but authoritative).
         
         If get_order() reports a fill but get_trades() finds no matching
-        confirmed trades within _FILL_VERIFY_TIMEOUT, the fill is treated
-        as a phantom and discarded.
+        confirmed trades within _FILL_VERIFY_TIMEOUT, the fill is ACCEPTED
+        at the limit price — get_order() is authoritative and USDC balance
+        changes prove real execution.
         """
         if not self._client:
             return []
@@ -544,13 +545,15 @@ class LiveExecutor(OrderExecutor):
         pending.unverified_since = 0
         pending.unverified_fill_size = 0
 
-        logger.error(
-            f"TRADE VERIFICATION FAILED — accepting at limit price: "
+        logger.warning(
+            f"FILL ACCEPTED AT LIMIT PRICE (API propagation delay): "
             f"{pending.order_id} {pending.side.upper()} "
             f"{new_fill:.2f}@{pending.price:.4f} | "
             f"exchange_id={pending.exchange_order_id}, "
             f"associate_trades={pending.associate_trades} | "
-            f"get_trades() returned no matches after {_FILL_VERIFY_TIMEOUT:.0f}s"
+            f"maker_address={self._maker_address}, "
+            f"asset_id={pending.token_id[:20]}... | "
+            f"get_trades() had no matches after {_FILL_VERIFY_TIMEOUT:.0f}s"
         )
 
         return FillEvent(
@@ -572,12 +575,15 @@ class LiveExecutor(OrderExecutor):
 
         Uses ``associate_trades`` from ``get_order()`` — the definitive
         list of trade IDs linked to this order by the exchange itself.
-        This is deterministic: no fuzzy matching, no time windows.
 
-        Matching priority:
-        1. ``associate_trades`` from get_order() (definitive, primary)
-        2. ``taker_order_id`` == our exchange_order_id (secondary)
-        3. ``maker_orders[].order_id`` == our exchange_order_id (tertiary)
+        Strategy:
+        1. Query ``/trades`` with ``maker_address`` + ``asset_id``
+           (maker_address is required by the API and returns ALL trades
+           for that address, regardless of maker/taker role).
+        2. Match trades by ``associate_trades`` IDs, ``taker_order_id``,
+           or ``maker_orders[].order_id``.
+        3. Fallback: if bulk query finds nothing but ``associate_trades``
+           exist, fetch each trade individually by ID.
 
         Returns (total_size, vwap) or (0.0, 0.0) if nothing found yet.
         """
@@ -587,20 +593,6 @@ class LiveExecutor(OrderExecutor):
         try:
             from py_clob_client.clob_types import TradeParams
 
-            params = TradeParams(
-                maker_address=self._maker_address,
-                asset_id=pending.token_id,
-            )
-            trades = self._client.get_trades(params=params)
-
-            if not trades or not isinstance(trades, list):
-                logger.debug(
-                    f"get_trades returned empty/invalid for "
-                    f"{pending.order_id}: {type(trades)}"
-                )
-                return 0.0, 0.0
-
-            # Build a set of known trade IDs from get_order().associate_trades
             assoc_ids = set(pending.associate_trades) if pending.associate_trades else set()
             exchange_oid = pending.exchange_order_id
 
@@ -610,61 +602,106 @@ class LiveExecutor(OrderExecutor):
                 "TRADE_STATUS_MATCHED",
             }
 
-            total_size = 0.0
-            total_value = 0.0
-            matched_ids: List[str] = []
+            def _match_trades(trades: list) -> Tuple[float, float, List[str]]:
+                """Match our trades from a list using multiple identifiers."""
+                total_size = 0.0
+                total_value = 0.0
+                matched: List[str] = []
+                for trade in trades:
+                    if trade.get("status", "") not in _ACCEPTED_STATUSES:
+                        continue
+                    trade_id = trade.get("id", "")
 
-            for trade in trades:
-                trade_status = trade.get("status", "")
-                if trade_status not in _ACCEPTED_STATUSES:
-                    continue
+                    is_ours = trade_id in assoc_ids if assoc_ids else False
 
-                trade_id = trade.get("id", "")
+                    if not is_ours:
+                        taker_oid = trade.get("taker_order_id", "")
+                        if taker_oid and taker_oid == exchange_oid:
+                            is_ours = True
 
-                # Primary: match by associate_trades (definitive)
-                is_our_trade = trade_id in assoc_ids if assoc_ids else False
+                    if not is_ours:
+                        for mo in trade.get("maker_orders", []):
+                            if mo.get("order_id", "") == exchange_oid:
+                                is_ours = True
+                                break
 
-                # Secondary: match by taker_order_id (when we are taker)
-                if not is_our_trade:
-                    taker_oid = trade.get("taker_order_id", "")
-                    if taker_oid and taker_oid == exchange_oid:
-                        is_our_trade = True
+                    if not is_ours:
+                        continue
 
-                # Tertiary: match by maker_orders (when we are maker)
-                if not is_our_trade:
-                    for mo in trade.get("maker_orders", []):
-                        if mo.get("order_id", "") == exchange_oid:
-                            is_our_trade = True
-                            break
+                    try:
+                        size = float(trade.get("size", 0))
+                        price = float(trade.get("price", 0))
+                    except (ValueError, TypeError):
+                        continue
+                    if size > 0 and price > 0:
+                        total_size += size
+                        total_value += size * price
+                        matched.append(trade_id)
+                return total_size, total_value, matched
 
-                if not is_our_trade:
-                    continue
+            # --- Attempt 1: bulk query with maker_address + asset_id ---
+            params = TradeParams(
+                maker_address=self._maker_address,
+                asset_id=pending.token_id,
+            )
+            trades = self._client.get_trades(params=params)
 
-                try:
-                    size = float(trade.get("size", 0))
-                    price = float(trade.get("price", 0))
-                except (ValueError, TypeError):
-                    continue
-
-                if size > 0 and price > 0:
-                    total_size += size
-                    total_value += size * price
-                    matched_ids.append(trade_id)
-
-            if total_size > 0:
-                vwap = total_value / total_size
-                logger.info(
-                    f"Verified trades for {pending.order_id}: "
-                    f"size={total_size:.2f}, vwap={vwap:.4f}, "
-                    f"trades={matched_ids}"
+            if trades and isinstance(trades, list):
+                sz, val, ids = _match_trades(trades)
+                if sz > 0:
+                    vwap = val / sz
+                    logger.info(
+                        f"Verified trades for {pending.order_id}: "
+                        f"size={sz:.2f}, vwap={vwap:.4f}, trades={ids}"
+                    )
+                    return sz, vwap
+                trade_ids_in_response = [
+                    t.get("id", "?") for t in trades[:5]
+                ]
+                trade_statuses = [
+                    t.get("status", "?") for t in trades[:5]
+                ]
+                logger.debug(
+                    f"get_trades returned {len(trades)} trades but no match "
+                    f"for {pending.order_id} "
+                    f"(exchange_id={exchange_oid}, assoc={assoc_ids}, "
+                    f"returned_ids={trade_ids_in_response}, "
+                    f"returned_statuses={trade_statuses})"
                 )
-                return total_size, vwap
+            else:
+                logger.warning(
+                    f"get_trades returned empty for {pending.order_id} "
+                    f"(maker_address={self._maker_address}, "
+                    f"asset_id={pending.token_id[:20]}...)"
+                )
+
+            # --- Attempt 2: fetch each associate_trade by ID ---
+            if assoc_ids:
+                all_fetched: list = []
+                for tid in assoc_ids:
+                    try:
+                        id_params = TradeParams(
+                            id=tid,
+                            maker_address=self._maker_address,
+                        )
+                        id_trades = self._client.get_trades(params=id_params)
+                        if id_trades and isinstance(id_trades, list):
+                            all_fetched.extend(id_trades)
+                    except Exception as e:
+                        logger.debug(f"Fetch trade {tid} failed: {e}")
+                if all_fetched:
+                    sz, val, ids = _match_trades(all_fetched)
+                    if sz > 0:
+                        vwap = val / sz
+                        logger.info(
+                            f"Verified trades (by ID) for {pending.order_id}: "
+                            f"size={sz:.2f}, vwap={vwap:.4f}, trades={ids}"
+                        )
+                        return sz, vwap
 
             logger.debug(
-                f"No matching trades found for {pending.order_id} "
-                f"(exchange_id={exchange_oid}, "
-                f"associate_trades={pending.associate_trades}) "
-                f"among {len(trades)} trades"
+                f"No verified trades for {pending.order_id} "
+                f"(exchange_id={exchange_oid}, assoc={assoc_ids})"
             )
             return 0.0, 0.0
 

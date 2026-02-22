@@ -35,6 +35,7 @@ class PositionState:
     down_cost: float = 0.0
     orders_filled: int = 0
     orders_cancelled: int = 0
+    last_fill_time: float = 0.0
 
     @property
     def total_cost(self) -> float:
@@ -216,6 +217,7 @@ class FillManager:
             pos.down_shares += event.fill_size
             pos.down_cost += cost
         pos.orders_filled += 1
+        pos.last_fill_time = time.time()
         self._total_fills += 1
 
         logger.info(
