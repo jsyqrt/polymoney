@@ -67,6 +67,11 @@ class MarketState:
     pending_orders: List[PendingOrder] = field(default_factory=list)
     fill_tracker: FillCalibrationTracker = field(default_factory=FillCalibrationTracker)
     next_order_id: int = 0
+    # Price history for directional fill asymmetry
+    prev_up_price: float = 0.0
+    prev_down_price: float = 0.0
+    up_price_delta: float = 0.0   # positive = price rising
+    down_price_delta: float = 0.0
 
 
 class SimulatedExecutor(OrderExecutor):
@@ -119,14 +124,10 @@ class SimulatedExecutor(OrderExecutor):
         if fill_result:
             fill_price, filled_size, _stale = fill_result
 
-            # Fee model: taker orders (FAK/FOK) pay fees; maker orders (GTC)
-            # pay 0% and may receive rebates (modeled as slight share increase).
-            if order.is_taker:
+            # Fee model: any fill at or above market is effectively taker.
+            is_taker_fill = order.is_taker or order.price >= fill_price
+            if is_taker_fill:
                 filled_size = apply_taker_fee_to_shares(filled_size, fill_price)
-            elif fill_price < order.price:
-                # Maker got price improvement — no fees, model rebate as
-                # the cost savings from getting a better price
-                pass
 
             if filled_size >= order.size - 0.01:
                 # Full fill — track for liquidity competition
@@ -202,6 +203,14 @@ class SimulatedExecutor(OrderExecutor):
         if not state:
             return []
 
+        # Track price direction for asymmetric fill modeling
+        if state.prev_up_price > 0:
+            state.up_price_delta = up_price - state.prev_up_price
+        if state.prev_down_price > 0:
+            state.down_price_delta = down_price - state.prev_down_price
+        state.prev_up_price = up_price
+        state.prev_down_price = down_price
+
         events: List[FillEvent] = []
         remaining: List[PendingOrder] = []
         now = time.time()
@@ -221,8 +230,6 @@ class SimulatedExecutor(OrderExecutor):
                 remaining.append(order)
                 continue
 
-            # Attempt fill — limit stale-model fills to 1 per side per tick
-            # to prevent unrealistic burst fills when orderbook data is stale
             max_stale = 1
             fill_result = self._simulate_fill(
                 state, order.side, order.size, order.price, market_price,
@@ -234,22 +241,23 @@ class SimulatedExecutor(OrderExecutor):
             if fill_result:
                 fill_price, filled_size, used_stale_model = fill_result
 
-                # Fee model: taker pays fees; maker (GTC) pays nothing
-                if order.is_taker:
+                # Fee model: any fill at or above market price is effectively
+                # a taker fill — apply taker fee regardless of the order flag.
+                is_taker_fill = order.is_taker or order.price >= market_price
+                if is_taker_fill:
                     filled_size = apply_taker_fee_to_shares(filled_size, fill_price)
 
                 if used_stale_model:
                     stale_fills_this_tick[order.side] = stale_fills_this_tick.get(order.side, 0) + 1
 
                 if filled_size < order.size - 0.01:
-                    # Partial fill
                     events.append(FillEvent(
                         order_id=order.order_id,
                         market_id=market_id,
                         side=order.side,
                         fill_price=fill_price,
                         fill_size=filled_size,
-                        is_taker=order.is_taker,
+                        is_taker=is_taker_fill,
                         is_partial=True,
                         remaining_size=order.size - filled_size,
                         timestamp=now,
@@ -257,14 +265,13 @@ class SimulatedExecutor(OrderExecutor):
                     order.size -= filled_size
                     remaining.append(order)
                 else:
-                    # Full fill
                     events.append(FillEvent(
                         order_id=order.order_id,
                         market_id=market_id,
                         side=order.side,
                         fill_price=fill_price,
                         fill_size=filled_size,
-                        is_taker=order.is_taker,
+                        is_taker=is_taker_fill,
                         timestamp=now,
                     ))
                     # Track for liquidity competition
@@ -606,25 +613,36 @@ class SimulatedExecutor(OrderExecutor):
                 else 1.0
             )
 
-            # Cross-book liquidity boost: if the opposite orderbook has
-            # significant bid depth at the mirrored price, our maker order
-            # is more likely to be matched via complementary matching.
             cross_boost = self._estimate_cross_book_boost(
                 state, side, limit_price
             )
 
-            # Base probability calibrated against observed live fill rates:
-            # - At spread edge (proximity=0): ~15% (was 20%)
-            # - At best bid (proximity=1): ~85% (was 90%)
-            # - Cross-book liquidity adds up to +15% boost
-            base_probability = 0.15 + 0.70 * proximity + cross_boost
+            # Calibrated against live fill rates — reduced from optimistic
+            # original values to match observed maker fill difficulty:
+            # - At spread edge (proximity=0): ~8%
+            # - At best bid (proximity=1): ~55%
+            # - Cross-book liquidity adds up to +10% boost
+            base_probability = 0.08 + 0.47 * proximity + cross_boost
 
             size_penalty = (
                 1.0
                 if size <= 50
                 else max(0.5, 1.0 - (size - 50) * 0.002)
             )
-            fill_probability = min(0.95, base_probability * size_penalty)
+            fill_probability = min(0.70, base_probability * size_penalty)
+
+            # Directional asymmetry: when the token price is rising, our
+            # buy limit is moving further from market → harder to fill.
+            # When falling, the market is coming toward our limit → easier.
+            price_delta = (
+                state.up_price_delta if side == "up" else state.down_price_delta
+            )
+            if price_delta > 0.005:
+                # Price rising → penalty (market moving away from our buy)
+                fill_probability *= max(0.15, 1.0 - price_delta * 8.0)
+            elif price_delta < -0.005:
+                # Price falling → bonus (market coming toward our buy)
+                fill_probability = min(0.80, fill_probability * (1.0 + abs(price_delta) * 3.0))
 
             # Liquidity competition penalty
             competition_factor = self._liquidity_tracker.get_competition_factor(
@@ -700,19 +718,17 @@ class SimulatedExecutor(OrderExecutor):
         price level, it means more counterparties are available through
         complementary matching, increasing our fill probability.
         
-        Returns a probability boost between 0.0 and 0.15.
+        Returns a probability boost between 0.0 and 0.10.
         """
         opp_book = self._get_opposite_orderbook(state, side)
         if not opp_book or not opp_book.bids:
             return 0.0
 
         mirrored_price = 1.0 - limit_price
-        # Count bid depth at or above our mirrored price
         available = sum(
             size for price, size in opp_book.bids if price >= mirrored_price
         )
 
-        # Normalize: 100+ shares of cross-book depth → full boost
         if available <= 0:
             return 0.0
-        return min(0.15, available / 100.0 * 0.15)
+        return min(0.10, available / 100.0 * 0.10)

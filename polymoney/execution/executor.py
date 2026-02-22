@@ -35,6 +35,7 @@ class ExecutionOrder:
     price: float            # Limit price
     size: float             # Size in shares
     is_taker: bool = False  # Whether this is a taker order (crosses spread)
+    trade_side: str = "buy" # "buy" or "sell" — direction at the exchange level
     
     # Metadata for tracking
     order_id: str = ""      # Unique order ID (assigned by executor if empty)
@@ -84,6 +85,7 @@ class FillEvent:
     is_partial: bool = False  # True if order has remaining size
     remaining_size: float = 0.0
     timestamp: float = 0.0
+    is_sell: bool = False     # True for sell (position exit) fills
     
     # Cancellation events use this
     is_cancelled: bool = False

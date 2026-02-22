@@ -209,6 +209,41 @@ class MarketContext:
             self.result.down_cost += cost
             self.strategy.down_position.add(size, fill_price)
 
+    def apply_sell(
+        self, side: str, size: float, sell_price: float
+    ) -> None:
+        """Apply a sell fill — reduce position and record realized proceeds."""
+        proceeds = size * sell_price
+        pos = self.strategy.up_position if side == "up" else self.strategy.down_position
+
+        if pos.shares < size - 0.01:
+            logger.warning(
+                f"Sell size {size:.2f} > held shares {pos.shares:.2f} "
+                f"for {self.slug} {side}, capping"
+            )
+            size = pos.shares
+            proceeds = size * sell_price
+
+        if size <= 0:
+            return
+
+        # Reduce cost proportionally
+        avg = pos.avg_price
+        pos.shares -= size
+        pos.cost -= size * avg
+
+        if side == "up":
+            self.result.up_shares -= size
+            self.result.up_cost -= size * avg
+        else:
+            self.result.down_shares -= size
+            self.result.down_cost -= size * avg
+
+        logger.info(
+            f"Sell applied: {self.slug} {side.upper()} "
+            f"{size:.2f}@{sell_price:.4f} (proceeds=${proceeds:.2f})"
+        )
+
     def record_order_submitted(self) -> None:
         """Record that an order was submitted."""
         self.result.orders_submitted += 1

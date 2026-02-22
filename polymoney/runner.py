@@ -146,6 +146,11 @@ class TradingRunner:
         self._available_cash: float = getattr(config, "initial_balance", config.max_total_exposure)
         self._unredeemed_markets: Set[str] = set()
 
+        # Taker fee tracking: cumulative fees paid as taker across all fills
+        self._total_taker_fees: float = 0.0
+        self._taker_fill_count: int = 0
+        self._maker_fill_count: int = 0
+
         # Active market contexts: slug -> MarketContext
         self._contexts: Dict[str, MarketContext] = {}
 
@@ -709,13 +714,23 @@ class TradingRunner:
         self, ctx: MarketContext, signal: OrderSignal
     ) -> None:
         """Submit an order signal to the executor."""
-        # Risk check
         if self.kill_switch.is_activated:
             return
         if not self.risk_manager.can_trade(
             market_id=ctx.slug, order_cost=signal.size * signal.target_price
         ):
             return
+
+        # Balance gate: reject BUY orders we cannot afford (sell orders bring in cash)
+        signal_side_raw = signal.side if isinstance(signal.side, str) else signal.side.value
+        if signal_side_raw != "sell":
+            order_cost = signal.size * signal.target_price
+            if self.mode == "live" and order_cost > self._available_cash:
+                logger.warning(
+                    f"Order rejected: cost ${order_cost:.2f} > "
+                    f"available ${self._available_cash:.2f} for {ctx.slug}"
+                )
+                return
 
         ctx.record_order_submitted()
 
@@ -737,27 +752,34 @@ class TradingRunner:
             else False
         )
 
-        # Build execution order
+        # Determine buy vs sell from signal
+        signal_side_str = (
+            signal.side if isinstance(signal.side, str) else signal.side.value
+        )
+        is_sell = signal_side_str == "sell"
+
         order = ExecutionOrder(
             market_id=ctx.slug,
             side=side,
             price=signal.target_price,
             size=signal.size,
             is_taker=is_taker,
+            trade_side="sell" if is_sell else "buy",
             strategy_id=ctx.strategy.strategy_id,
         )
 
-        # Submit to executor
         result = await self.executor.submit_order(order)
 
-        # Link order ID back to strategy's pending list
         ctx.link_order(signal, result.order_id, is_taker)
 
-        # Handle immediate fills
         if result.status == OrderResultStatus.FILLED:
-            fill_cost = result.fill_size * result.fill_price
-            self._available_cash -= fill_cost
-            ctx.apply_fill(side, result.fill_size, result.fill_price, is_taker)
+            fill_value = result.fill_size * result.fill_price
+            if is_sell:
+                self._available_cash += fill_value
+                ctx.apply_sell(side, result.fill_size, result.fill_price)
+            else:
+                self._available_cash -= fill_value
+                ctx.apply_fill(side, result.fill_size, result.fill_price, is_taker)
             ctx.remove_pending_order(result.order_id)
             self.fill_manager.process_fills([
                 FillEvent(
@@ -767,14 +789,19 @@ class TradingRunner:
                     fill_price=result.fill_price,
                     fill_size=result.fill_size,
                     is_taker=is_taker,
+                    is_sell=is_sell,
                     timestamp=time.time(),
                 )
             ])
 
         elif result.status == OrderResultStatus.PARTIALLY_FILLED:
-            fill_cost = result.fill_size * result.fill_price
-            self._available_cash -= fill_cost
-            ctx.apply_fill(side, result.fill_size, result.fill_price, is_taker)
+            fill_value = result.fill_size * result.fill_price
+            if is_sell:
+                self._available_cash += fill_value
+                ctx.apply_sell(side, result.fill_size, result.fill_price)
+            else:
+                self._available_cash -= fill_value
+                ctx.apply_fill(side, result.fill_size, result.fill_price, is_taker)
             for p in ctx.strategy.pending_orders:
                 if p.order_id == result.order_id:
                     p.shares = result.pending_size
@@ -788,6 +815,7 @@ class TradingRunner:
                     fill_price=result.fill_price,
                     fill_size=result.fill_size,
                     is_taker=is_taker,
+                    is_sell=is_sell,
                     is_partial=True,
                     remaining_size=result.pending_size,
                     timestamp=time.time(),
@@ -801,24 +829,35 @@ class TradingRunner:
         for event in events:
             if event.is_cancelled:
                 ctx.remove_pending_order(event.order_id)
-            elif event.is_partial:
-                fill_cost = event.fill_size * event.fill_price
-                self._available_cash -= fill_cost
+                continue
+
+            fill_value = event.fill_size * event.fill_price
+            if event.is_sell:
+                self._available_cash += fill_value
+                ctx.apply_sell(event.side, event.fill_size, event.fill_price)
+            else:
+                self._available_cash -= fill_value
                 ctx.apply_fill(
                     event.side, event.fill_size, event.fill_price, event.is_taker
                 )
+
+            # Track taker/maker stats
+            if event.fill_size > 0 and not event.is_sell:
+                if event.is_taker:
+                    self._taker_fill_count += 1
+                    from polymoney.simulation.live_runner import calculate_taker_fee_rate
+                    fee_rate = calculate_taker_fee_rate(event.fill_price)
+                    self._total_taker_fees += fill_value * fee_rate
+                else:
+                    self._maker_fill_count += 1
+
+            if event.is_partial:
                 for p in ctx.strategy.pending_orders:
                     if p.order_id == event.order_id:
                         p.shares = event.remaining_size
                         p.cost = p.shares * p.price
                         break
             else:
-                # Full fill
-                fill_cost = event.fill_size * event.fill_price
-                self._available_cash -= fill_cost
-                ctx.apply_fill(
-                    event.side, event.fill_size, event.fill_price, event.is_taker
-                )
                 ctx.remove_pending_order(event.order_id)
 
         self.fill_manager.process_fills(events)
@@ -1154,13 +1193,19 @@ class TradingRunner:
 
                 total_expected = self.stats.total_pnl + expected_pnl
                 cash_str = f", Cash=${self._available_cash:.2f}" if self.mode == "live" else ""
+                total_fills = self._taker_fill_count + self._maker_fill_count
+                taker_pct = (self._taker_fill_count / total_fills * 100) if total_fills > 0 else 0
+                fee_str = (
+                    f", Fills={total_fills}(taker {taker_pct:.0f}%) fees=${self._total_taker_fees:.2f}"
+                    if total_fills > 0 else ""
+                )
                 logger.info(
                     f"[{self.mode.upper()}] "
                     f"Realized=${self.stats.total_pnl:.2f}, "
                     f"Expected=${total_expected:.2f}, "
                     f"Markets={self.stats.markets_processed}, "
                     f"Active={len(self._contexts)}"
-                    f"{cash_str}"
+                    f"{cash_str}{fee_str}"
                     f"{price_info}"
                 )
 

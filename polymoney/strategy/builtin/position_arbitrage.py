@@ -13,6 +13,8 @@ Strategy logic:
 4. Track positions and calculate metrics
 """
 
+import time
+
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -320,6 +322,32 @@ class PositionArbitrageStrategy(BaseStrategy):
         self.directional_recovery_min_prob = self.params.get("directional_recovery_min_prob", 0.62)
         self.directional_recovery_min_trend = self.params.get("directional_recovery_min_trend", 0.40)
         self.directional_recovery_max_ratio = self.params.get("directional_recovery_max_ratio", 1.5)
+
+        # Profit-taking sell parameters.
+        self.enable_profit_sell = self.params.get("enable_profit_sell", True)
+        self.sell_profit_threshold = self.params.get("sell_profit_threshold", 0.85)
+        self.sell_min_phase = self.params.get("sell_min_phase", 2)
+        self.sell_discount = self.params.get("sell_discount", 0.005)
+        self._last_sell_time: float = 0.0
+        self._sell_cooldown: float = self.params.get("sell_cooldown", 10.0)
+
+        # Sequential ordering: only place secondary (leading) side when the
+        # primary (lagging) side has enough pending or filled shares.
+        # This prevents one-sided position building from asymmetric fills.
+        self.enable_sequential_ordering = self.params.get("enable_sequential_ordering", True)
+        # Maximum allowed imbalance ratio for secondary-side orders.
+        # If (leading_shares - lagging_shares) / leading_shares > this, block secondary.
+        self.sequential_max_gap_ratio = self.params.get("sequential_max_gap_ratio", 0.30)
+
+        # Minimum maker discount: ensure limit prices are at least this %
+        # below market to avoid crossing the spread and filling as taker.
+        self.min_maker_discount = self.params.get("min_maker_discount", 0.015)
+
+        # Per-side exposure cap: maximum shares on any single side before
+        # the other side must catch up. Expressed as ratio of position_size.
+        self.max_single_side_exposure = self.params.get(
+            "max_single_side_exposure", 0.0
+        )  # 0 = disabled; set to e.g. 50 to cap at 50 shares
 
         # Internal position tracking
         self.up_position = InternalPosition()
@@ -1025,6 +1053,13 @@ class PositionArbitrageStrategy(BaseStrategy):
             primary_cost_ratio = up_cost_ratio if primary_side == "up" else down_cost_ratio
             primary_min_cost = min_order_cost_up if primary_side == "up" else min_order_cost_down
             primary_order_budget = max(pair_budget * primary_cost_ratio, primary_min_cost)
+
+            # Per-side exposure cap for primary too
+            if self.max_single_side_exposure > 0 and not primary_blocked:
+                pri_shares = up_shares_total if primary_side == "up" else down_shares_total
+                if pri_shares >= self.max_single_side_exposure:
+                    primary_blocked = True
+
             if not primary_blocked and primary_count < max_pending_per_side and available >= primary_min_cost:
                 order_cost = max(min(available, primary_order_budget), primary_min_cost)
                 
@@ -1057,6 +1092,22 @@ class PositionArbitrageStrategy(BaseStrategy):
             secondary_cost_ratio = up_cost_ratio if secondary_side == "up" else down_cost_ratio
             secondary_min_cost = min_order_cost_up if secondary_side == "up" else min_order_cost_down
             secondary_order_budget = max(pair_budget * secondary_cost_ratio, secondary_min_cost)
+
+            # Sequential ordering gate: block secondary (leading) side when
+            # the primary (lagging) side is too far behind.  This prevents
+            # one-sided position building from asymmetric fills.
+            if self.enable_sequential_ordering and not secondary_blocked:
+                leading = max(up_shares_total, down_shares_total)
+                lagging = min(up_shares_total, down_shares_total)
+                if leading > 0 and lagging < leading * (1 - self.sequential_max_gap_ratio):
+                    secondary_blocked = True
+
+            # Per-side exposure cap
+            if self.max_single_side_exposure > 0 and not secondary_blocked:
+                sec_shares = up_shares_total if secondary_side == "up" else down_shares_total
+                if sec_shares >= self.max_single_side_exposure:
+                    secondary_blocked = True
+
             if not secondary_blocked and secondary_count < max_pending_per_side and available >= secondary_min_cost:
                 if phase == 3 and secondary_limit < self.low_prob_threshold:
                     pass  # Skip low probability side in Phase 3
@@ -1089,7 +1140,16 @@ class PositionArbitrageStrategy(BaseStrategy):
             # Exit if no orders created this iteration
             if not created:
                 break
-        
+
+        # === Profit-taking sell logic ===
+        if self.enable_profit_sell and phase >= self.sell_min_phase:
+            now_ts = price_data.timestamp.timestamp() if hasattr(price_data.timestamp, 'timestamp') else time.time()
+            if now_ts - self._last_sell_time >= self._sell_cooldown:
+                sell_signals = self._generate_sell_signals(price_data)
+                if sell_signals:
+                    signals.extend(sell_signals)
+                    self._last_sell_time = now_ts
+
         return signals
     
     def _generate_rebalancing_order(self, price_data: PriceData) -> Optional[OrderSignal]:
@@ -1175,6 +1235,57 @@ class PositionArbitrageStrategy(BaseStrategy):
         )
         
         return self._create_signal(underweight_side, order_price, order_cost)
+
+    def _generate_sell_signals(self, price_data: PriceData) -> List[OrderSignal]:
+        """Generate sell signals to lock in profit before settlement.
+
+        When a side's market price is high (>= sell_profit_threshold), selling
+        that side's shares returns cash immediately, avoiding redeem risk and
+        settlement delay.  The sell price is set at a small discount below
+        market so the order sits as a maker (0% fee).
+
+        Only sells the hedged (profitable) portion — min(up, down) shares on
+        the high-price side.
+        """
+        signals: List[OrderSignal] = []
+
+        for side, pos, market_price in [
+            ("up", self.up_position, price_data.up_price),
+            ("down", self.down_position, price_data.down_price),
+        ]:
+            if pos.shares < self.min_order_shares:
+                continue
+            if market_price < self.sell_profit_threshold:
+                continue
+
+            # Only sell the hedged portion (guaranteed profit shares)
+            hedged = min(self.up_position.shares, self.down_position.shares)
+            sellable = min(pos.shares, hedged)
+            if sellable < self.min_order_shares:
+                continue
+
+            sell_price = max(market_price * (1 - self.sell_discount), 0.01)
+
+            # Verify selling is actually profitable:
+            # sell_price must exceed our average cost for this side
+            if sell_price <= pos.avg_price:
+                continue
+
+            token_type = TokenType.YES if side == "up" else TokenType.NO
+            signal = OrderSignal(
+                side=TradeSide.SELL,
+                token_type=token_type,
+                target_price=sell_price,
+                size=sellable,
+            )
+            signals.append(signal)
+            logger.info(
+                f"[{self.name}] SELL signal: {side.upper()} "
+                f"{sellable:.1f}sh @{sell_price:.3f} "
+                f"(market={market_price:.3f}, avg_cost={pos.avg_price:.3f})"
+            )
+
+        return signals
 
     def _calculate_limit_prices(self, up_price: float, down_price: float) -> Tuple[float, float]:
         """
@@ -1371,7 +1482,20 @@ class PositionArbitrageStrategy(BaseStrategy):
             up_limit = max(up_price * 0.995, self.low_prob_threshold)
         elif dr_side == "down":
             down_limit = max(down_price * 0.995, self.low_prob_threshold)
-        
+
+        # Enforce minimum maker discount: limit must be at least min_maker_discount
+        # below market price to avoid crossing the spread and filling as taker.
+        # Directional recovery is exempt (it intentionally sits close to market).
+        if self.min_maker_discount > 0:
+            if dr_side != "up":
+                maker_ceiling_up = up_price * (1 - self.min_maker_discount)
+                if up_limit > maker_ceiling_up:
+                    up_limit = maker_ceiling_up
+            if dr_side != "down":
+                maker_ceiling_down = down_price * (1 - self.min_maker_discount)
+                if down_limit > maker_ceiling_down:
+                    down_limit = maker_ceiling_down
+
         return up_limit, down_limit
 
     # ------------------------------------------------------------------
@@ -1459,8 +1583,7 @@ class PositionArbitrageStrategy(BaseStrategy):
             max_s, min_s = max(up, down), min(up, down)
             ratio = max_s / min_s if min_s > 0 else float("inf")
             overweight = "up" if up > down else "down"
-            # Directional recovery uses its own cap (directional_recovery_max_ratio)
-            cap = self.directional_recovery_max_ratio if self._directional_recovery_side == side else 3.0
+            cap = self.directional_recovery_max_ratio if self._directional_recovery_side == side else 2.0
             if ratio > cap and side == overweight:
                 return False
         return True

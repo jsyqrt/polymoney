@@ -48,7 +48,7 @@ class LivePendingOrder:
     order_id: str           # Internal order ID
     exchange_order_id: str  # Polymarket CLOB order ID
     market_id: str
-    side: str
+    side: str               # "up" or "down" — token selection
     token_id: str           # Actual Polymarket token ID
     price: float
     size: float             # Original size
@@ -56,6 +56,7 @@ class LivePendingOrder:
     created_at: float = 0.0
     last_checked: float = 0.0
     is_taker: bool = False
+    is_sell: bool = False   # True for sell (exit) orders
     # Trade IDs from get_order().associate_trades — the definitive link
     # between this order and its matched trades.
     associate_trades: List[str] = field(default_factory=list)
@@ -105,6 +106,9 @@ class LiveExecutor(OrderExecutor):
         self._verified_trades: Dict[str, float] = {}  # order_id -> verified_size
         # Fills discovered during cancel — emitted on next check_fills()
         self._deferred_fills: List[FillEvent] = []
+        # Track trade IDs already claimed by an order to prevent
+        # the same trade being attributed to multiple bot orders.
+        self._claimed_trade_ids: Dict[str, str] = {}  # trade_id -> order_id
 
     def set_client(self, clob_client) -> None:
         """Set or update the CLOB client."""
@@ -190,12 +194,13 @@ class LiveExecutor(OrderExecutor):
         for attempt in range(self._max_retries):
             try:
                 from py_clob_client.clob_types import OrderArgs
-                from py_clob_client.order_builder.constants import BUY
+                from py_clob_client.order_builder.constants import BUY, SELL
 
+                clob_side = SELL if order.trade_side == "sell" else BUY
                 order_args = OrderArgs(
                     price=order.price,
                     size=order.size,
-                    side=BUY,  # Strategy always buys tokens
+                    side=clob_side,
                     token_id=token_id,
                 )
 
@@ -220,7 +225,7 @@ class LiveExecutor(OrderExecutor):
                         f"post_order returned no orderID: {response}"
                     )
 
-                # Track pending order
+                is_sell = order.trade_side == "sell"
                 pending = LivePendingOrder(
                     order_id=order_id,
                     exchange_order_id=exchange_order_id,
@@ -232,13 +237,15 @@ class LiveExecutor(OrderExecutor):
                     created_at=time.time(),
                     last_checked=time.time(),
                     is_taker=order.is_taker,
+                    is_sell=is_sell,
                 )
                 self._pending[order_id] = pending
 
+                trade_label = "SELL" if is_sell else "BUY"
                 logger.info(
-                    f"Live order placed: {order_id} {order.side.upper()} "
-                    f"{order.size}@{order.price} token={token_id[:16]}... "
-                    f"exchange_id={exchange_order_id}"
+                    f"Live order placed: {order_id} {trade_label} "
+                    f"{order.side.upper()} {order.size}@{order.price} "
+                    f"token={token_id[:16]}... exchange_id={exchange_order_id}"
                 )
 
                 return OrderResult(
@@ -473,14 +480,20 @@ class LiveExecutor(OrderExecutor):
         verified_size, vwap = self._fetch_verified_trades(pending)
 
         if verified_size < 0.01:
-            # No confirmed trades yet
             return None
+
+        # Hard cap: verified_size must never exceed ordered amount
+        if verified_size > pending.size:
+            logger.warning(
+                f"Hard cap: verified_size {verified_size:.2f} > "
+                f"order size {pending.size:.2f} for {pending.order_id}"
+            )
+            verified_size = pending.size
 
         new_fill = verified_size - pending.filled_size
         if new_fill < 0.01:
             return None
 
-        # Reset unverified state on successful verification
         pending.unverified_since = 0
         pending.unverified_fill_size = 0
 
@@ -507,6 +520,7 @@ class LiveExecutor(OrderExecutor):
             is_partial=is_partial,
             remaining_size=remaining,
             timestamp=now,
+            is_sell=pending.is_sell,
         )
 
     def _accept_unverified_fill(
@@ -525,6 +539,8 @@ class LiveExecutor(OrderExecutor):
         using the limit price.  The periodic reconciliation loop will
         correct share counts if needed.
         """
+        # Cap api_filled at the ordered amount
+        api_filled = min(api_filled, pending.size)
         new_fill = max(0, api_filled - pending.filled_size)
         if new_fill < 0.01:
             # Rounding noise — nothing new to report
@@ -566,6 +582,7 @@ class LiveExecutor(OrderExecutor):
             is_partial=not is_final,
             remaining_size=max(0, pending.size - api_filled),
             timestamp=now,
+            is_sell=pending.is_sell,
         )
 
     def _fetch_verified_trades(
@@ -577,13 +594,14 @@ class LiveExecutor(OrderExecutor):
         list of trade IDs linked to this order by the exchange itself.
 
         Strategy:
-        1. Query ``/trades`` with ``maker_address`` + ``asset_id``
-           (maker_address is required by the API and returns ALL trades
-           for that address, regardless of maker/taker role).
+        1. Query ``/trades`` with ``maker_address`` + ``asset_id``.
         2. Match trades by ``associate_trades`` IDs, ``taker_order_id``,
            or ``maker_orders[].order_id``.
-        3. Fallback: if bulk query finds nothing but ``associate_trades``
-           exist, fetch each trade individually by ID.
+        3. Skip trades already claimed by another order (prevents double-counting
+           when multiple bot orders match against the same counterparty trade).
+        4. Cap total verified size at ``pending.size`` — the Trades API ``size``
+           field can represent the counterparty's full trade, not our portion.
+        5. Claim matched trade IDs so subsequent orders cannot re-use them.
 
         Returns (total_size, vwap) or (0.0, 0.0) if nothing found yet.
         """
@@ -595,6 +613,8 @@ class LiveExecutor(OrderExecutor):
 
             assoc_ids = set(pending.associate_trades) if pending.associate_trades else set()
             exchange_oid = pending.exchange_order_id
+            order_id = pending.order_id
+            max_size = pending.size
 
             _ACCEPTED_STATUSES = {
                 "CONFIRMED", "MINED", "MATCHED",
@@ -602,7 +622,7 @@ class LiveExecutor(OrderExecutor):
             }
 
             def _match_trades(trades: list) -> Tuple[float, float, List[str]]:
-                """Match our trades from a list using multiple identifiers."""
+                """Match our trades, skipping already-claimed ones and capping at order size."""
                 total_size = 0.0
                 total_value = 0.0
                 matched: List[str] = []
@@ -610,6 +630,11 @@ class LiveExecutor(OrderExecutor):
                     if trade.get("status", "") not in _ACCEPTED_STATUSES:
                         continue
                     trade_id = trade.get("id", "")
+
+                    # Skip trades already claimed by a different order
+                    claimed_by = self._claimed_trade_ids.get(trade_id)
+                    if claimed_by is not None and claimed_by != order_id:
+                        continue
 
                     is_ours = trade_id in assoc_ids if assoc_ids else False
 
@@ -632,11 +657,41 @@ class LiveExecutor(OrderExecutor):
                         price = float(trade.get("price", 0))
                     except (ValueError, TypeError):
                         continue
-                    if size > 0 and price > 0:
-                        total_size += size
-                        total_value += size * price
-                        matched.append(trade_id)
+                    if size <= 0 or price <= 0:
+                        continue
+
+                    # Cap contribution so total never exceeds ordered amount
+                    remaining = max_size - total_size
+                    if remaining <= 0.001:
+                        break
+                    capped = min(size, remaining)
+
+                    total_size += capped
+                    total_value += capped * price
+                    matched.append(trade_id)
                 return total_size, total_value, matched
+
+            def _finalize(sz: float, val: float, ids: List[str], tag: str) -> Tuple[float, float]:
+                """Cap, claim, log and return."""
+                if sz > max_size:
+                    logger.warning(
+                        f"Capping verified size {sz:.2f} -> {max_size:.2f} "
+                        f"for {order_id} (ordered {max_size:.2f})"
+                    )
+                    vwap = val / sz
+                    sz = max_size
+                    val = sz * vwap
+                else:
+                    vwap = val / sz if sz > 0 else 0.0
+
+                for tid in ids:
+                    self._claimed_trade_ids[tid] = order_id
+
+                logger.info(
+                    f"Verified trades{tag} for {order_id}: "
+                    f"size={sz:.2f}, vwap={vwap:.4f}, trades={ids}"
+                )
+                return sz, vwap
 
             # --- Attempt 1: bulk query with maker_address + asset_id ---
             params = TradeParams(
@@ -648,12 +703,7 @@ class LiveExecutor(OrderExecutor):
             if trades and isinstance(trades, list):
                 sz, val, ids = _match_trades(trades)
                 if sz > 0:
-                    vwap = val / sz
-                    logger.info(
-                        f"Verified trades for {pending.order_id}: "
-                        f"size={sz:.2f}, vwap={vwap:.4f}, trades={ids}"
-                    )
-                    return sz, vwap
+                    return _finalize(sz, val, ids, "")
                 trade_ids_in_response = [
                     t.get("id", "?") for t in trades[:5]
                 ]
@@ -662,14 +712,14 @@ class LiveExecutor(OrderExecutor):
                 ]
                 logger.debug(
                     f"get_trades returned {len(trades)} trades but no match "
-                    f"for {pending.order_id} "
+                    f"for {order_id} "
                     f"(exchange_id={exchange_oid}, assoc={assoc_ids}, "
                     f"returned_ids={trade_ids_in_response}, "
                     f"returned_statuses={trade_statuses})"
                 )
             else:
                 logger.warning(
-                    f"get_trades returned empty for {pending.order_id} "
+                    f"get_trades returned empty for {order_id} "
                     f"(maker_address={self._maker_address}, "
                     f"asset_id={pending.token_id[:20]}...)"
                 )
@@ -691,15 +741,10 @@ class LiveExecutor(OrderExecutor):
                 if all_fetched:
                     sz, val, ids = _match_trades(all_fetched)
                     if sz > 0:
-                        vwap = val / sz
-                        logger.info(
-                            f"Verified trades (by ID) for {pending.order_id}: "
-                            f"size={sz:.2f}, vwap={vwap:.4f}, trades={ids}"
-                        )
-                        return sz, vwap
+                        return _finalize(sz, val, ids, " (by ID)")
 
             logger.debug(
-                f"No verified trades for {pending.order_id} "
+                f"No verified trades for {order_id} "
                 f"(exchange_id={exchange_oid}, assoc={assoc_ids})"
             )
             return 0.0, 0.0
@@ -773,6 +818,11 @@ class LiveExecutor(OrderExecutor):
                 except Exception as e:
                     logger.warning(f"Could not check fills on unregister: {e}")
             self._pending.pop(oid, None)
+
+        # Clean up claimed trade IDs for this market's orders
+        stale = [tid for tid, oid in self._claimed_trade_ids.items() if oid in to_remove]
+        for tid in stale:
+            del self._claimed_trade_ids[tid]
 
     def get_pending_count(self, market_id: Optional[str] = None) -> int:
         """Get number of pending orders."""

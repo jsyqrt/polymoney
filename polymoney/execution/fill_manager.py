@@ -208,20 +208,32 @@ class FillManager:
             )
             return
 
-        # Update position
+        # Update position — sell reduces shares, buy adds
         cost = event.fill_size * event.fill_price
-        if side == "up":
-            pos.up_shares += event.fill_size
-            pos.up_cost += cost
+        if event.is_sell:
+            if side == "up":
+                avg = pos.up_cost / pos.up_shares if pos.up_shares > 0 else 0
+                pos.up_shares = max(0, pos.up_shares - event.fill_size)
+                pos.up_cost = max(0, pos.up_cost - event.fill_size * avg)
+            else:
+                avg = pos.down_cost / pos.down_shares if pos.down_shares > 0 else 0
+                pos.down_shares = max(0, pos.down_shares - event.fill_size)
+                pos.down_cost = max(0, pos.down_cost - event.fill_size * avg)
+            label = "SELL"
         else:
-            pos.down_shares += event.fill_size
-            pos.down_cost += cost
+            if side == "up":
+                pos.up_shares += event.fill_size
+                pos.up_cost += cost
+            else:
+                pos.down_shares += event.fill_size
+                pos.down_cost += cost
+            label = "Fill"
         pos.orders_filled += 1
         pos.last_fill_time = time.time()
         self._total_fills += 1
 
         logger.info(
-            f"[{event.market_id}] Fill: {event.side.upper()} "
+            f"[{event.market_id}] {label}: {event.side.upper()} "
             f"{event.fill_size:.1f}@{event.fill_price:.4f} "
             f"(ECR={pos.ecr:.4f}, bal={pos.balance_ratio:.0%})"
         )
