@@ -7,6 +7,7 @@ Supports per-token price tracking for dual-token markets (UP/DOWN).
 
 import asyncio
 import json
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -74,6 +75,9 @@ class MarketSubscription:
             tid: TokenPrice(token_id=tid) for tid in token_ids
         }
         self.last_update: Optional[datetime] = None
+        self.last_message_time: float = 0.0
+        self.state: ConnectionState = ConnectionState.DISCONNECTED
+        self.reconnect_count: int = 0
         # Legacy fields for backward compatibility
         self.orderbook: Dict[str, Any] = {"bids": [], "asks": []}
         self.best_bid: float = 0.0
@@ -269,22 +273,40 @@ class WebSocketManager:
         delay = self.reconnect_delay
 
         while self._running and market_id in self._subscriptions:
+            sub = self._subscriptions.get(market_id)
+            connected_at = time.time()
             try:
                 self._state = ConnectionState.CONNECTING
+                if sub:
+                    sub.state = ConnectionState.CONNECTING
                 await self._connect_and_subscribe(market_id)
             except websockets.ConnectionClosed as e:
                 logger.warning(f"Connection closed for {market_id}: {e}")
                 self._state = ConnectionState.RECONNECTING
+                if sub:
+                    sub.state = ConnectionState.RECONNECTING
             except (EOFError, OSError) as e:
-                # Network-level errors (proxy EOF, connection reset, etc.)
                 logger.warning(f"Network error for {market_id}: {e}")
                 self._state = ConnectionState.RECONNECTING
+                if sub:
+                    sub.state = ConnectionState.RECONNECTING
             except Exception as e:
                 logger.error(f"WebSocket error for {market_id}: {e}")
                 self._state = ConnectionState.RECONNECTING
+                if sub:
+                    sub.state = ConnectionState.RECONNECTING
 
             if self._running and market_id in self._subscriptions:
-                logger.info(f"Reconnecting to {market_id} in {delay}s...")
+                # Reset backoff if connection was stable for > 30s
+                uptime = time.time() - connected_at
+                if uptime > 30:
+                    delay = self.reconnect_delay
+                if sub:
+                    sub.reconnect_count += 1
+                logger.info(
+                    f"Reconnecting to {market_id} in {delay:.1f}s "
+                    f"(uptime was {uptime:.0f}s)..."
+                )
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, self.reconnect_max_delay)
 
@@ -297,10 +319,13 @@ class WebSocketManager:
         async with websockets.connect(self.WS_URL) as ws:
             self._ws = ws
             self._state = ConnectionState.CONNECTED
+            subscription.state = ConnectionState.CONNECTED
+            subscription.last_message_time = time.time()
             logger.info(f"Connected to WebSocket for {market_id}")
+            self._emit_event("connection_restored", market_id, {
+                "reconnect_count": subscription.reconnect_count,
+            })
 
-            # Send subscription message (official format from Polymarket docs)
-            # https://docs.polymarket.com/developers/CLOB/websocket/market-channel
             sub_message = {
                 "assets_ids": subscription.token_ids,
                 "type": "market",
@@ -309,21 +334,28 @@ class WebSocketManager:
             await ws.send(json.dumps(sub_message))
             logger.debug(f"Sent subscription for {len(subscription.token_ids)} tokens")
 
-            # Start ping task to keep connection alive (required every 10s)
             ping_task = asyncio.create_task(self._ping_loop(ws))
+            watchdog_task = asyncio.create_task(
+                self._stall_watchdog(market_id, ws)
+            )
 
             try:
-                # Process messages
                 async for message in ws:
                     if not self._running or market_id not in self._subscriptions:
                         break
+                    subscription.last_message_time = time.time()
                     await self._process_message(market_id, message)
             finally:
                 ping_task.cancel()
-                try:
-                    await ping_task
-                except asyncio.CancelledError:
-                    pass
+                watchdog_task.cancel()
+                for t in (ping_task, watchdog_task):
+                    try:
+                        await t
+                    except asyncio.CancelledError:
+                        pass
+                self._emit_event("connection_lost", market_id, {
+                    "reconnect_count": subscription.reconnect_count,
+                })
 
     async def _ping_loop(self, ws: WebSocketClientProtocol) -> None:
         """Send PING every 10 seconds to keep connection alive."""
@@ -335,6 +367,38 @@ class WebSocketManager:
             pass
         except Exception as e:
             logger.debug(f"Ping loop ended: {e}")
+
+    _STALL_TIMEOUT = 45.0  # seconds without any message → force reconnect
+
+    async def _stall_watchdog(
+        self, market_id: str, ws: WebSocketClientProtocol
+    ) -> None:
+        """Detect silent stalls — connection open but no data flowing.
+
+        If no message (including PONG) arrives within _STALL_TIMEOUT,
+        force-close the connection to trigger a reconnect cycle.
+        """
+        try:
+            while True:
+                await asyncio.sleep(15)
+                sub = self._subscriptions.get(market_id)
+                if not sub:
+                    break
+                silence = time.time() - sub.last_message_time
+                if silence > self._STALL_TIMEOUT:
+                    logger.warning(
+                        f"[WS] Silent stall detected for {market_id}: "
+                        f"no data for {silence:.0f}s — forcing reconnect"
+                    )
+                    self._emit_event("connection_stall", market_id, {
+                        "silence_seconds": silence,
+                    })
+                    await ws.close()
+                    break
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.debug(f"Stall watchdog ended: {e}")
 
     async def _process_message(self, market_id: str, raw_message: str) -> None:
         """Process an incoming WebSocket message."""
@@ -807,16 +871,21 @@ class WebSocketManager:
 
     def get_health_status(self) -> Dict[str, Any]:
         """Get health status of WebSocket connections."""
+        now = time.time()
+        markets = {}
+        for market_id, sub in self._subscriptions.items():
+            silence = (now - sub.last_message_time) if sub.last_message_time > 0 else None
+            markets[market_id] = {
+                "state": sub.state.value,
+                "last_update": sub.last_update.isoformat() if sub.last_update else None,
+                "last_message_ago_s": round(silence, 1) if silence is not None else None,
+                "reconnect_count": sub.reconnect_count,
+                "best_bid": sub.best_bid,
+                "best_ask": sub.best_ask,
+            }
         return {
             "state": self._state.value,
             "is_connected": self.is_connected,
             "subscribed_markets": len(self._subscriptions),
-            "markets": {
-                market_id: {
-                    "last_update": sub.last_update.isoformat() if sub.last_update else None,
-                    "best_bid": sub.best_bid,
-                    "best_ask": sub.best_ask,
-                }
-                for market_id, sub in self._subscriptions.items()
-            },
+            "markets": markets,
         }
