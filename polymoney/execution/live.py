@@ -103,6 +103,8 @@ class LiveExecutor(OrderExecutor):
         self._maker_address: Optional[str] = None
         # Cache of recently verified trades to avoid re-fetching
         self._verified_trades: Dict[str, float] = {}  # order_id -> verified_size
+        # Fills discovered during cancel — emitted on next check_fills()
+        self._deferred_fills: List[FillEvent] = []
 
     def set_client(self, clob_client) -> None:
         """Set or update the CLOB client."""
@@ -200,14 +202,28 @@ class LiveExecutor(OrderExecutor):
                 signed_order = self._client.create_order(order_args)
                 response = self._client.post_order(signed_order, "GTC")
 
-                exchange_order_id = ""
-                if response and isinstance(response, dict):
-                    exchange_order_id = response.get("orderID", "")
+                if not response or not isinstance(response, dict):
+                    raise RuntimeError(f"post_order returned invalid response: {response}")
+
+                if not response.get("success", True):
+                    error_msg = response.get("errorMsg", "Unknown error")
+                    logger.error(f"Order rejected by exchange: {error_msg}")
+                    return OrderResult(
+                        status=OrderResultStatus.REJECTED,
+                        order_id=order_id,
+                        error=error_msg,
+                    )
+
+                exchange_order_id = response.get("orderID", "")
+                if not exchange_order_id:
+                    raise RuntimeError(
+                        f"post_order returned no orderID: {response}"
+                    )
 
                 # Track pending order
                 pending = LivePendingOrder(
                     order_id=order_id,
-                    exchange_order_id=exchange_order_id or order_id,
+                    exchange_order_id=exchange_order_id,
                     market_id=order.market_id,
                     side=order.side,
                     token_id=token_id,
@@ -254,7 +270,11 @@ class LiveExecutor(OrderExecutor):
         )
 
     async def cancel_order(self, order_id: str) -> bool:
-        """Cancel a live order on the exchange."""
+        """Cancel a live order on the exchange.
+
+        Checks for partial fills before cancelling so no executed
+        shares are lost from position tracking.
+        """
         if not self._client:
             return False
 
@@ -263,6 +283,33 @@ class LiveExecutor(OrderExecutor):
             return False
 
         try:
+            # Check for partial fills before cancelling
+            try:
+                order_status = self._client.get_order(pending.exchange_order_id)
+                if order_status:
+                    raw = order_status.get("size_matched") or 0
+                    api_filled = float(raw)
+                    if api_filled > pending.filled_size + 0.01:
+                        new_fill = api_filled - pending.filled_size
+                        logger.warning(
+                            f"Partial fill detected on cancel: {order_id} "
+                            f"{pending.side.upper()} {new_fill:.2f} "
+                            f"(total filled={api_filled:.2f})"
+                        )
+                        self._deferred_fills.append(FillEvent(
+                            order_id=order_id,
+                            market_id=pending.market_id,
+                            side=pending.side,
+                            fill_price=pending.price,
+                            fill_size=new_fill,
+                            is_taker=pending.is_taker,
+                            is_partial=True,
+                            remaining_size=max(0, pending.size - api_filled),
+                            timestamp=time.time(),
+                        ))
+            except Exception as e:
+                logger.warning(f"Could not check fills before cancel: {e}")
+
             self._client.cancel(pending.exchange_order_id)
             del self._pending[order_id]
             logger.info(f"Live order cancelled: {order_id}")
@@ -294,6 +341,14 @@ class LiveExecutor(OrderExecutor):
         now = time.time()
         to_remove: List[str] = []
 
+        # Emit fills discovered during cancel_order
+        if self._deferred_fills:
+            deferred = [f for f in self._deferred_fills if f.market_id == market_id]
+            self._deferred_fills = [
+                f for f in self._deferred_fills if f.market_id != market_id
+            ]
+            events.extend(deferred)
+
         for order_id, pending in self._pending.items():
             if pending.market_id != market_id:
                 continue
@@ -313,7 +368,15 @@ class LiveExecutor(OrderExecutor):
                     continue
 
                 status = order_status.get("status", "")
-                api_filled = float(order_status.get("size_matched", 0))
+                raw_matched = order_status.get("size_matched") or 0
+                try:
+                    api_filled = float(raw_matched)
+                except (TypeError, ValueError):
+                    logger.error(
+                        f"Invalid size_matched value '{raw_matched}' "
+                        f"for order {order_id}, treating as 0"
+                    )
+                    api_filled = 0.0
 
                 # Update associate_trades — the definitive link to matched trades
                 assoc = order_status.get("associate_trades")
@@ -373,17 +436,19 @@ class LiveExecutor(OrderExecutor):
                             to_remove.append(order_id)
 
                 # Accept fills stuck in unverified state after timeout
+                # Use current api_filled (not stale unverified_fill_size)
                 elif (pending.unverified_since > 0
                       and now - pending.unverified_since > _FILL_VERIFY_TIMEOUT):
+                    latest_fill = max(api_filled, pending.unverified_fill_size)
                     fill_event = self._accept_unverified_fill(
-                        pending, pending.unverified_fill_size, now,
+                        pending, latest_fill, now,
                         is_final=True,
                     )
                     events.append(fill_event)
                     to_remove.append(order_id)
 
             except Exception as e:
-                logger.warning(f"Failed to check order {order_id}: {e}")
+                logger.error(f"Failed to check order {order_id}: {e}")
 
         for order_id in to_remove:
             self._pending.pop(order_id, None)
@@ -461,6 +526,18 @@ class LiveExecutor(OrderExecutor):
         """
         new_fill = max(0, api_filled - pending.filled_size)
         if new_fill < 0.01:
+            # Rounding noise — nothing new to report
+            if pending.filled_size > 0:
+                return FillEvent(
+                    order_id=pending.order_id,
+                    market_id=pending.market_id,
+                    side=pending.side,
+                    fill_price=0.0,
+                    fill_size=0.0,
+                    is_cancelled=True,
+                    cancel_reason="fill already counted, rounding noise",
+                    timestamp=now,
+                )
             new_fill = api_filled
 
         pending.filled_size = api_filled
@@ -622,14 +699,43 @@ class LiveExecutor(OrderExecutor):
         )
 
     def unregister_market(self, market_id: str) -> None:
-        """Unregister a market and cancel its orders."""
+        """Unregister a market and cancel its orders.
+
+        Checks each pending order for partial fills before removing,
+        emitting deferred FillEvents for any unreported fills.
+        """
         self._markets.pop(market_id, None)
-        # Cancel any remaining orders for this market
         to_remove = [
             oid for oid, p in self._pending.items()
             if p.market_id == market_id
         ]
         for oid in to_remove:
+            pending = self._pending.get(oid)
+            if pending and self._client:
+                try:
+                    order_status = self._client.get_order(pending.exchange_order_id)
+                    if order_status:
+                        raw = order_status.get("size_matched") or 0
+                        api_filled = float(raw)
+                        if api_filled > pending.filled_size + 0.01:
+                            new_fill = api_filled - pending.filled_size
+                            logger.warning(
+                                f"Partial fill on unregister: {oid} "
+                                f"{pending.side.upper()} {new_fill:.2f}"
+                            )
+                            self._deferred_fills.append(FillEvent(
+                                order_id=oid,
+                                market_id=pending.market_id,
+                                side=pending.side,
+                                fill_price=pending.price,
+                                fill_size=new_fill,
+                                is_taker=pending.is_taker,
+                                is_partial=True,
+                                remaining_size=max(0, pending.size - api_filled),
+                                timestamp=time.time(),
+                            ))
+                except Exception as e:
+                    logger.warning(f"Could not check fills on unregister: {e}")
             self._pending.pop(oid, None)
 
     def get_pending_count(self, market_id: Optional[str] = None) -> int:

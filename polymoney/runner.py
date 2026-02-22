@@ -1230,10 +1230,17 @@ class TradingRunner:
                                     "TRADE_STATUS_MATCHED",
                                 ):
                                     try:
-                                        total += float(trade.get("size", 0))
+                                        sz = float(trade.get("size", 0))
                                     except (ValueError, TypeError):
                                         continue
+                                    # BUY adds shares, SELL removes shares
+                                    trade_side = trade.get("side", "BUY").upper()
+                                    if trade_side == "SELL":
+                                        total -= sz
+                                    else:
+                                        total += sz
 
+                            total = max(0.0, total)
                             if side == "up":
                                 onchain_up = total
                             else:
@@ -1246,7 +1253,7 @@ class TradingRunner:
                         up_diff = pos.up_shares - onchain_up
                         down_diff = pos.down_shares - onchain_down
 
-                        threshold = 0.5  # tolerate < 0.5 share difference
+                        threshold = 0.5
                         if abs(up_diff) > threshold or abs(down_diff) > threshold:
                             logger.warning(
                                 f"RECONCILIATION MISMATCH [{slug}]: "
@@ -1256,22 +1263,28 @@ class TradingRunner:
                                 f"(diff={down_diff:+.2f})"
                             )
 
-                            # Correct internal state to match on-chain (authoritative)
-                            if onchain_up < pos.up_shares and up_diff > threshold:
-                                correction = up_diff
+                            # Correct shares AND costs proportionally
+                            if abs(up_diff) > threshold:
+                                old_up = pos.up_shares
                                 pos.up_shares = onchain_up
-                                logger.info(
+                                if old_up > 0:
+                                    pos.up_cost *= (onchain_up / old_up)
+                                elif onchain_up == 0:
+                                    pos.up_cost = 0.0
+                                logger.warning(
                                     f"RECONCILIATION CORRECTED [{slug}]: "
-                                    f"UP shares reduced by {correction:.2f} "
-                                    f"(phantom fills removed)"
+                                    f"UP shares {old_up:.2f} → {onchain_up:.2f}"
                                 )
-                            if onchain_down < pos.down_shares and down_diff > threshold:
-                                correction = down_diff
+                            if abs(down_diff) > threshold:
+                                old_down = pos.down_shares
                                 pos.down_shares = onchain_down
-                                logger.info(
+                                if old_down > 0:
+                                    pos.down_cost *= (onchain_down / old_down)
+                                elif onchain_down == 0:
+                                    pos.down_cost = 0.0
+                                logger.warning(
                                     f"RECONCILIATION CORRECTED [{slug}]: "
-                                    f"DOWN shares reduced by {correction:.2f} "
-                                    f"(phantom fills removed)"
+                                    f"DOWN shares {old_down:.2f} → {onchain_down:.2f}"
                                 )
                         else:
                             logger.debug(
@@ -1280,10 +1293,10 @@ class TradingRunner:
                             )
 
                     except ImportError:
-                        logger.debug("TradeParams not available for reconciliation")
+                        logger.warning("TradeParams not available for reconciliation")
                         break
                     except Exception as e:
-                        logger.debug(f"Reconciliation failed for {slug}: {e}")
+                        logger.warning(f"Reconciliation failed for {slug}: {e}")
 
                 await asyncio.sleep(reconcile_interval)
 

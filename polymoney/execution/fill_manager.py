@@ -113,6 +113,11 @@ class FillManager:
         Returns:
             The final PositionState for the market.
         """
+        if market_id not in self._positions:
+            logger.warning(
+                f"unregister_market called for never-registered market "
+                f"{market_id}"
+            )
         pos = self._positions.pop(market_id, PositionState(market_id=market_id))
 
         if winner and pos.total_cost > 0:
@@ -130,6 +135,12 @@ class FillManager:
         Called after successful redemption (real or simulated) to make
         the capital available for new positions again.
         """
+        if market_id not in self._pending_redemptions:
+            logger.error(
+                f"release_redemption called for non-pending market "
+                f"{market_id} — possible accounting error"
+            )
+            return
         cost = self._pending_redemptions.pop(market_id, 0.0)
         if cost > 0:
             self._total_redeemed_value += cost
@@ -170,17 +181,35 @@ class FillManager:
 
     def _handle_fill(self, event: FillEvent) -> None:
         """Process a single fill event."""
+        # Validate fill data to prevent position corruption
+        side = (event.side or "").strip().lower()
+        if side not in ("up", "down"):
+            logger.error(
+                f"INVALID FILL REJECTED — unknown side '{event.side}': "
+                f"{event.order_id} {event.fill_size}@{event.fill_price}"
+            )
+            return
+
+        if event.fill_size <= 0 or event.fill_price <= 0:
+            logger.error(
+                f"INVALID FILL REJECTED — bad size/price: "
+                f"{event.order_id} {event.side} "
+                f"size={event.fill_size}, price={event.fill_price}"
+            )
+            return
+
         pos = self._positions.get(event.market_id)
         if not pos:
-            logger.warning(
-                f"Fill for unregistered market {event.market_id}: "
-                f"{event.side} {event.fill_size}@{event.fill_price}"
+            logger.error(
+                f"Fill for UNREGISTERED market {event.market_id}: "
+                f"{event.side} {event.fill_size}@{event.fill_price} — "
+                f"THIS FILL IS LOST, position state will be wrong!"
             )
             return
 
         # Update position
         cost = event.fill_size * event.fill_price
-        if event.side == "up":
+        if side == "up":
             pos.up_shares += event.fill_size
             pos.up_cost += cost
         else:
