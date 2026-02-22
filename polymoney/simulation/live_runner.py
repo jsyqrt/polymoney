@@ -505,6 +505,9 @@ class MarketResult:
 
     # Sell tracking: cumulative cash received from selling positions
     sell_proceeds: float = 0.0
+    # Original total buy cost — never reduced by sells.
+    # Used for accurate PnL: PnL = settlement_value + sell_proceeds - total_buy_cost
+    total_buy_cost: float = 0.0
 
     # Final metrics
     pnl: float = 0.0
@@ -528,17 +531,15 @@ class MarketResult:
         """Calculate final PnL, ROI, ECR after settlement.
 
         PnL = settlement_value + sell_proceeds - total_buy_cost
-        where total_buy_cost = remaining cost + cost-basis of shares sold.
-        Since apply_sell already reduced up_cost/down_cost proportionally,
-        total_cost here is the cost of *remaining* shares only.
-        sell_proceeds captures the cash already received from selling.
+        where total_buy_cost is the original cumulative cost of all buys,
+        never reduced by sells.  `total_cost` (up_cost + down_cost) reflects
+        the cost basis of *remaining* shares only (reduced by apply_sell) and
+        is used for ECR of the residual position.
         """
         if not self.winner:
             return
 
-        remaining_cost = self.total_cost
-        total_invested = remaining_cost + self.sell_proceeds
-        if total_invested <= 0 and remaining_cost <= 0:
+        if self.total_buy_cost <= 0:
             return
 
         if self.winner == "up":
@@ -546,10 +547,10 @@ class MarketResult:
         else:
             settlement_value = self.down_shares
 
-        self.pnl = settlement_value + self.sell_proceeds - remaining_cost
-        denominator = remaining_cost + self.sell_proceeds
-        self.roi = self.pnl / denominator if denominator > 0 else 0
+        self.pnl = settlement_value + self.sell_proceeds - self.total_buy_cost
+        self.roi = self.pnl / self.total_buy_cost if self.total_buy_cost > 0 else 0
 
+        remaining_cost = self.total_cost
         min_shares = min(self.up_shares, self.down_shares)
         max_shares = max(self.up_shares, self.down_shares)
 
@@ -634,15 +635,14 @@ class SimulationStats:
             self.markets_lost += 1
 
         self.total_pnl += result.pnl
-        self.total_cost += result.total_cost
+        self.total_cost += result.total_buy_cost
 
-        # Track capital recovered from settlement (winning shares = USDC back)
         if result.winner == "up":
             self.capital_recovered += result.up_shares
         elif result.winner == "down":
             self.capital_recovered += result.down_shares
 
-        if result.total_cost > 0:
+        if result.total_buy_cost > 0:
             self.returns.append(result.roi)
 
         self.total_roi = self.total_pnl / self.total_cost if self.total_cost > 0 else 0

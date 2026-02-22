@@ -199,6 +199,7 @@ class MarketContext:
         """
         cost = size * fill_price
         self.result.orders_filled += 1
+        self.result.total_buy_cost += cost
 
         if side == "up":
             self.result.up_shares += size
@@ -337,6 +338,8 @@ class MarketContext:
                 self.result.ecr if self.result.ecr != float("inf") else 999.99
             ),
             "balance_ratio": self.result.balance_ratio,
+            "total_buy_cost": self.result.total_buy_cost,
+            "sell_proceeds": self.result.sell_proceeds,
             "orders_submitted": self.result.orders_submitted,
             "orders_filled": self.result.orders_filled,
             "current_up_price": up_p,

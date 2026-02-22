@@ -1182,8 +1182,6 @@ class TradingRunner:
                 for slug, ctx in self._contexts.items():
                     coin = ctx.coin.upper()
                     up_p, down_p = ctx.get_current_prices()
-                    filled = ctx.result.orders_filled
-                    submitted = ctx.result.orders_submitted
 
                     if ctx.prices_are_stale:
                         secs = (
@@ -1198,23 +1196,40 @@ class TradingRunner:
                         price_str = "N/A"
 
                     hedged = min(ctx.result.up_shares, ctx.result.down_shares)
-                    total_cost = ctx.result.total_cost
+                    buy_cost = ctx.result.total_buy_cost
                     sell_cash = ctx.result.sell_proceeds
-                    market_pnl = hedged + sell_cash - total_cost if hedged > 0 else sell_cash - total_cost
+                    market_pnl = hedged + sell_cash - buy_cost if buy_cost > 0 else 0.0
                     expected_pnl += market_pnl
 
-                    ecr = total_cost / hedged if hedged > 0 else 0
+                    remaining_cost = ctx.result.total_cost
+                    ecr = remaining_cost / hedged if hedged > 0 else 0
                     if hedged > 0:
                         ecr_str = f"{ecr:.2f}"
-                    elif total_cost > 0:
-                        # Has cost but one-sided position — show which side
+                    elif remaining_cost > 0:
                         one_side = "UP" if ctx.result.up_shares > 0 else "DOWN"
                         ecr_str = f"1-side({one_side})"
                     else:
                         ecr_str = "-"
+
+                    up_sh = ctx.result.up_shares
+                    down_sh = ctx.result.down_shares
+                    pos_str = f"U={up_sh:.1f}/D={down_sh:.1f}"
+
+                    pend_up = sum(
+                        o.shares for o in ctx.strategy.pending_orders
+                        if o.side == "up" and o.status == "pending"
+                    )
+                    pend_down = sum(
+                        o.shares for o in ctx.strategy.pending_orders
+                        if o.side == "down" and o.status == "pending"
+                    )
+                    pend_str = ""
+                    if pend_up > 0 or pend_down > 0:
+                        pend_str = f" pend={pend_up:.1f}/{pend_down:.1f}"
+
                     price_info += (
                         f" | {coin}: {price_str} ECR={ecr_str} "
-                        f"({filled}/{submitted})"
+                        f"{pos_str}{pend_str} PnL=${market_pnl:.2f}"
                     )
 
                 total_expected = self.stats.total_pnl + expected_pnl
@@ -1530,6 +1545,8 @@ class TradingRunner:
             "down_shares": result.down_shares,
             "up_cost": result.up_cost,
             "down_cost": result.down_cost,
+            "total_buy_cost": result.total_buy_cost,
+            "sell_proceeds": result.sell_proceeds,
             "orders_submitted": result.orders_submitted,
             "orders_filled": result.orders_filled,
         }
