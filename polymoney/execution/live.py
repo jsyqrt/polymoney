@@ -10,10 +10,11 @@ Requires:
 - FillManager for fill tracking and reconciliation
 
 Fill verification:
-  When get_order() reports size_matched > 0, the executor cross-checks
-  against get_trades() to obtain the actual execution price and confirm
-  the fill on-chain.  Fills that lack confirmed trades within a timeout
-  window are treated as phantom fills and discarded.
+  When get_order() reports size_matched > 0, the executor attempts to
+  verify the fill via get_trades() for accurate VWAP pricing.
+  If trades cannot be verified within the timeout, the fill is ACCEPTED
+  at the limit price (not discarded), because get_order() is the source
+  of truth and USDC balance changes confirm real execution.
 """
 
 import asyncio
@@ -34,8 +35,9 @@ from polymoney.execution.executor import (
 
 logger = get_logger("execution.live")
 
-# Phantom fill verification timeout: if get_order() reports a fill but
-# no confirmed trades appear within this window, treat it as phantom.
+# Trade verification timeout: if get_order() reports a fill but
+# get_trades() can't confirm it within this window, we ACCEPT the fill
+# at the limit price (get_order is the source of truth).
 _FILL_VERIFY_TIMEOUT = 30.0  # seconds
 
 
@@ -78,7 +80,7 @@ class LiveExecutor(OrderExecutor):
     - Polls order status every 2s for active orders
     - Recently submitted orders polled more frequently (500ms for 5s)
     - Verifies fills via get_trades() for actual execution prices
-    - Discards phantom fills (size_matched reported but no on-chain trades)
+    - Accepts unverified fills at limit price if trades can't be verified
     """
 
     def __init__(self, clob_client=None):
@@ -342,7 +344,6 @@ class LiveExecutor(OrderExecutor):
                         if is_full:
                             to_remove.append(order_id)
                     elif is_full:
-                        # get_order says fully filled but trades not confirmed
                         if pending.unverified_since == 0:
                             pending.unverified_fill_size = api_filled
                             pending.unverified_since = now
@@ -352,43 +353,24 @@ class LiveExecutor(OrderExecutor):
                                 f"awaiting trade confirmation"
                             )
                         elif now - pending.unverified_since > _FILL_VERIFY_TIMEOUT:
-                            logger.error(
-                                f"PHANTOM FILL discarded: {order_id} "
-                                f"{pending.side.upper()} {api_filled:.1f} — "
-                                f"no confirmed trades after "
-                                f"{_FILL_VERIFY_TIMEOUT:.0f}s"
+                            # get_order() confirms the fill but get_trades()
+                            # cannot verify it.  ACCEPT at limit price —
+                            # get_order() is the source of truth and USDC
+                            # balance changes prove the execution is real.
+                            fill_event = self._accept_unverified_fill(
+                                pending, api_filled, now, is_final=True,
                             )
-                            events.append(FillEvent(
-                                order_id=order_id,
-                                market_id=market_id,
-                                side=pending.side,
-                                fill_price=0.0,
-                                fill_size=0.0,
-                                is_cancelled=True,
-                                cancel_reason="phantom fill: no confirmed trades",
-                                timestamp=now,
-                            ))
+                            events.append(fill_event)
                             to_remove.append(order_id)
 
-                # Check phantom timeout for orders stuck in unverified state
+                # Accept fills stuck in unverified state after timeout
                 elif (pending.unverified_since > 0
                       and now - pending.unverified_since > _FILL_VERIFY_TIMEOUT):
-                    logger.error(
-                        f"PHANTOM FILL discarded: {order_id} "
-                        f"{pending.side.upper()} "
-                        f"{pending.unverified_fill_size:.1f} — "
-                        f"no confirmed trades after {_FILL_VERIFY_TIMEOUT:.0f}s"
+                    fill_event = self._accept_unverified_fill(
+                        pending, pending.unverified_fill_size, now,
+                        is_final=True,
                     )
-                    events.append(FillEvent(
-                        order_id=order_id,
-                        market_id=market_id,
-                        side=pending.side,
-                        fill_price=0.0,
-                        fill_size=0.0,
-                        is_cancelled=True,
-                        cancel_reason="phantom fill: no confirmed trades",
-                        timestamp=now,
-                    ))
+                    events.append(fill_event)
                     to_remove.append(order_id)
 
             except Exception as e:
@@ -452,19 +434,65 @@ class LiveExecutor(OrderExecutor):
             timestamp=now,
         )
 
+    def _accept_unverified_fill(
+        self,
+        pending: LivePendingOrder,
+        api_filled: float,
+        now: float,
+        is_final: bool,
+    ) -> FillEvent:
+        """Accept a fill that get_order() confirms but get_trades() cannot verify.
+
+        get_order() is the source of truth for fill status.  When it reports
+        size_matched > 0, the fill is real (USDC balance changes prove it).
+        We accept at the limit price since we can't determine VWAP.
+        """
+        new_fill = max(0, api_filled - pending.filled_size)
+        if new_fill < 0.01:
+            new_fill = api_filled
+
+        pending.filled_size = api_filled
+        pending.unverified_since = 0
+        pending.unverified_fill_size = 0
+
+        logger.warning(
+            f"Fill ACCEPTED (unverified): {pending.order_id} "
+            f"{pending.side.upper()} {new_fill:.2f}@{pending.price:.4f} "
+            f"— get_trades() could not confirm after {_FILL_VERIFY_TIMEOUT:.0f}s, "
+            f"using limit price"
+        )
+
+        return FillEvent(
+            order_id=pending.order_id,
+            market_id=pending.market_id,
+            side=pending.side,
+            fill_price=pending.price,
+            fill_size=new_fill,
+            is_taker=pending.is_taker,
+            is_partial=not is_final,
+            remaining_size=max(0, pending.size - api_filled),
+            timestamp=now,
+        )
+
     def _fetch_verified_trades(
         self, pending: LivePendingOrder
     ) -> Tuple[float, float]:
-        """
-        Fetch confirmed trades for a pending order from the Trades API.
+        """Fetch confirmed trades for a pending order from the Trades API.
 
-        ``get_trades()`` returns a **flat list** of trade dicts (it handles
-        pagination internally).  Each trade dict has keys like ``size``,
-        ``price``, ``status``, ``asset_id``, etc.
+        The CLOB ``GET /data/trades`` endpoint with L2 auth returns all
+        trades for the authenticated user.  ``maker_address`` is required
+        but returns trades where we are **either maker or taker**.  Each
+        trade has a ``trader_side`` field ("MAKER" or "TAKER") and a
+        ``taker_order_id`` we can match against our ``exchange_order_id``.
 
-        Returns:
-            (total_verified_size, volume_weighted_avg_price)
-            Returns (0.0, 0.0) if no confirmed trades found.
+        Strategy:
+        1. Query by maker_address + asset_id (no ``after`` — avoids
+           clock-skew issues that caused all trades to be missed).
+        2. Match trades by ``taker_order_id`` (taker fills) or
+           ``maker_orders[].order_id`` (maker fills) == exchange_order_id.
+        3. Compute VWAP from matched trades.
+
+        Returns (total_size, vwap) or (0.0, 0.0) if nothing found.
         """
         if not self._maker_address:
             logger.debug(
@@ -479,26 +507,51 @@ class LiveExecutor(OrderExecutor):
         try:
             from py_clob_client.clob_types import TradeParams
 
+            # Query WITHOUT after filter to avoid clock-skew exclusion.
+            # The asset_id filter keeps the result set small.
             params = TradeParams(
                 maker_address=self._maker_address,
                 asset_id=pending.token_id,
-                after=int(pending.created_at),
             )
             trades = self._client.get_trades(params=params)
 
             if not trades or not isinstance(trades, list):
+                logger.debug(
+                    f"get_trades returned empty/invalid for "
+                    f"{pending.order_id}: {type(trades)}"
+                )
                 return 0.0, 0.0
 
+            # Match trades to this specific order by order ID.
+            # taker_order_id matches when we crossed the spread (taker).
+            # maker_orders[].order_id matches when our order rested (maker).
             total_size = 0.0
             total_value = 0.0
+            exchange_oid = pending.exchange_order_id
+
+            _ACCEPTED_STATUSES = {
+                "TRADE_STATUS_CONFIRMED",
+                "TRADE_STATUS_MINED",
+                "TRADE_STATUS_MATCHED",
+            }
 
             for trade in trades:
                 trade_status = trade.get("status", "")
-                if trade_status not in (
-                    "TRADE_STATUS_CONFIRMED",
-                    "TRADE_STATUS_MINED",
-                    "TRADE_STATUS_MATCHED",
-                ):
+                if trade_status not in _ACCEPTED_STATUSES:
+                    continue
+
+                # Match by taker_order_id (most reliable)
+                taker_oid = trade.get("taker_order_id", "")
+                is_our_order = (taker_oid == exchange_oid)
+
+                if not is_our_order:
+                    # Fallback: match by maker_orders list
+                    for mo in trade.get("maker_orders", []):
+                        if mo.get("order_id", "") == exchange_oid:
+                            is_our_order = True
+                            break
+
+                if not is_our_order:
                     continue
 
                 try:
@@ -513,8 +566,16 @@ class LiveExecutor(OrderExecutor):
 
             if total_size > 0:
                 vwap = total_value / total_size
+                logger.debug(
+                    f"Verified trades for {pending.order_id}: "
+                    f"size={total_size:.2f}, vwap={vwap:.4f}"
+                )
                 return total_size, vwap
 
+            logger.debug(
+                f"No matching trades found for {pending.order_id} "
+                f"(exchange_id={exchange_oid}) among {len(trades)} trades"
+            )
             return 0.0, 0.0
 
         except ImportError:
