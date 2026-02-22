@@ -10,11 +10,12 @@ Requires:
 - FillManager for fill tracking and reconciliation
 
 Fill verification:
-  When get_order() reports size_matched > 0, the executor attempts to
-  verify the fill via get_trades() for accurate VWAP pricing.
-  If trades cannot be verified within the timeout, the fill is ACCEPTED
-  at the limit price (not discarded), because get_order() is the source
-  of truth and USDC balance changes confirm real execution.
+  When get_order() reports size_matched > 0, it also returns
+  ``associate_trades`` — the definitive list of trade IDs for this order.
+  The executor uses these IDs to look up exact execution prices via
+  get_trades().  If verification fails (API delay), fills are accepted
+  at the limit price rather than discarded — get_order() is authoritative
+  and USDC balance changes confirm real execution.
 """
 
 import asyncio
@@ -55,6 +56,9 @@ class LivePendingOrder:
     created_at: float = 0.0
     last_checked: float = 0.0
     is_taker: bool = False
+    # Trade IDs from get_order().associate_trades — the definitive link
+    # between this order and its matched trades.
+    associate_trades: List[str] = field(default_factory=list)
     # Fill verification: tracks unverified fills detected by get_order()
     # but not yet confirmed by get_trades().
     unverified_fill_size: float = 0.0
@@ -311,6 +315,11 @@ class LiveExecutor(OrderExecutor):
                 status = order_status.get("status", "")
                 api_filled = float(order_status.get("size_matched", 0))
 
+                # Update associate_trades — the definitive link to matched trades
+                assoc = order_status.get("associate_trades")
+                if assoc and isinstance(assoc, list):
+                    pending.associate_trades = assoc
+
                 if status in ("CANCELLED", "EXPIRED"):
                     # Check if there were any partial fills before cancellation
                     if api_filled > pending.filled_size + 0.01:
@@ -441,11 +450,14 @@ class LiveExecutor(OrderExecutor):
         now: float,
         is_final: bool,
     ) -> FillEvent:
-        """Accept a fill that get_order() confirms but get_trades() cannot verify.
+        """Accept a fill that get_order() confirms but get_trades() cannot match.
 
-        get_order() is the source of truth for fill status.  When it reports
-        size_matched > 0, the fill is real (USDC balance changes prove it).
-        We accept at the limit price since we can't determine VWAP.
+        This should rarely happen — it means get_order() returned
+        associate_trades but none of them matched in get_trades(), or
+        associate_trades was empty.  get_order() is authoritative for
+        fill status (USDC balance confirms execution), so we accept
+        using the limit price.  The periodic reconciliation loop will
+        correct share counts if needed.
         """
         new_fill = max(0, api_filled - pending.filled_size)
         if new_fill < 0.01:
@@ -455,11 +467,13 @@ class LiveExecutor(OrderExecutor):
         pending.unverified_since = 0
         pending.unverified_fill_size = 0
 
-        logger.warning(
-            f"Fill ACCEPTED (unverified): {pending.order_id} "
-            f"{pending.side.upper()} {new_fill:.2f}@{pending.price:.4f} "
-            f"— get_trades() could not confirm after {_FILL_VERIFY_TIMEOUT:.0f}s, "
-            f"using limit price"
+        logger.error(
+            f"TRADE VERIFICATION FAILED — accepting at limit price: "
+            f"{pending.order_id} {pending.side.upper()} "
+            f"{new_fill:.2f}@{pending.price:.4f} | "
+            f"exchange_id={pending.exchange_order_id}, "
+            f"associate_trades={pending.associate_trades} | "
+            f"get_trades() returned no matches after {_FILL_VERIFY_TIMEOUT:.0f}s"
         )
 
         return FillEvent(
@@ -479,36 +493,23 @@ class LiveExecutor(OrderExecutor):
     ) -> Tuple[float, float]:
         """Fetch confirmed trades for a pending order from the Trades API.
 
-        The CLOB ``GET /data/trades`` endpoint with L2 auth returns all
-        trades for the authenticated user.  ``maker_address`` is required
-        but returns trades where we are **either maker or taker**.  Each
-        trade has a ``trader_side`` field ("MAKER" or "TAKER") and a
-        ``taker_order_id`` we can match against our ``exchange_order_id``.
+        Uses ``associate_trades`` from ``get_order()`` — the definitive
+        list of trade IDs linked to this order by the exchange itself.
+        This is deterministic: no fuzzy matching, no time windows.
 
-        Strategy:
-        1. Query by maker_address + asset_id (no ``after`` — avoids
-           clock-skew issues that caused all trades to be missed).
-        2. Match trades by ``taker_order_id`` (taker fills) or
-           ``maker_orders[].order_id`` (maker fills) == exchange_order_id.
-        3. Compute VWAP from matched trades.
+        Matching priority:
+        1. ``associate_trades`` from get_order() (definitive, primary)
+        2. ``taker_order_id`` == our exchange_order_id (secondary)
+        3. ``maker_orders[].order_id`` == our exchange_order_id (tertiary)
 
-        Returns (total_size, vwap) or (0.0, 0.0) if nothing found.
+        Returns (total_size, vwap) or (0.0, 0.0) if nothing found yet.
         """
         if not self._maker_address:
-            logger.debug(
-                f"No maker address for trade verification, "
-                f"using limit price for {pending.order_id}"
-            )
-            api_size = pending.unverified_fill_size or pending.filled_size
-            if api_size > 0:
-                return api_size, pending.price
             return 0.0, 0.0
 
         try:
             from py_clob_client.clob_types import TradeParams
 
-            # Query WITHOUT after filter to avoid clock-skew exclusion.
-            # The asset_id filter keeps the result set small.
             params = TradeParams(
                 maker_address=self._maker_address,
                 asset_id=pending.token_id,
@@ -522,11 +523,8 @@ class LiveExecutor(OrderExecutor):
                 )
                 return 0.0, 0.0
 
-            # Match trades to this specific order by order ID.
-            # taker_order_id matches when we crossed the spread (taker).
-            # maker_orders[].order_id matches when our order rested (maker).
-            total_size = 0.0
-            total_value = 0.0
+            # Build a set of known trade IDs from get_order().associate_trades
+            assoc_ids = set(pending.associate_trades) if pending.associate_trades else set()
             exchange_oid = pending.exchange_order_id
 
             _ACCEPTED_STATUSES = {
@@ -535,23 +533,34 @@ class LiveExecutor(OrderExecutor):
                 "TRADE_STATUS_MATCHED",
             }
 
+            total_size = 0.0
+            total_value = 0.0
+            matched_ids: List[str] = []
+
             for trade in trades:
                 trade_status = trade.get("status", "")
                 if trade_status not in _ACCEPTED_STATUSES:
                     continue
 
-                # Match by taker_order_id (most reliable)
-                taker_oid = trade.get("taker_order_id", "")
-                is_our_order = (taker_oid == exchange_oid)
+                trade_id = trade.get("id", "")
 
-                if not is_our_order:
-                    # Fallback: match by maker_orders list
+                # Primary: match by associate_trades (definitive)
+                is_our_trade = trade_id in assoc_ids if assoc_ids else False
+
+                # Secondary: match by taker_order_id (when we are taker)
+                if not is_our_trade:
+                    taker_oid = trade.get("taker_order_id", "")
+                    if taker_oid and taker_oid == exchange_oid:
+                        is_our_trade = True
+
+                # Tertiary: match by maker_orders (when we are maker)
+                if not is_our_trade:
                     for mo in trade.get("maker_orders", []):
                         if mo.get("order_id", "") == exchange_oid:
-                            is_our_order = True
+                            is_our_trade = True
                             break
 
-                if not is_our_order:
+                if not is_our_trade:
                     continue
 
                 try:
@@ -563,26 +572,27 @@ class LiveExecutor(OrderExecutor):
                 if size > 0 and price > 0:
                     total_size += size
                     total_value += size * price
+                    matched_ids.append(trade_id)
 
             if total_size > 0:
                 vwap = total_value / total_size
-                logger.debug(
+                logger.info(
                     f"Verified trades for {pending.order_id}: "
-                    f"size={total_size:.2f}, vwap={vwap:.4f}"
+                    f"size={total_size:.2f}, vwap={vwap:.4f}, "
+                    f"trades={matched_ids}"
                 )
                 return total_size, vwap
 
             logger.debug(
                 f"No matching trades found for {pending.order_id} "
-                f"(exchange_id={exchange_oid}) among {len(trades)} trades"
+                f"(exchange_id={exchange_oid}, "
+                f"associate_trades={pending.associate_trades}) "
+                f"among {len(trades)} trades"
             )
             return 0.0, 0.0
 
         except ImportError:
-            logger.debug("TradeParams not available, falling back to limit price")
-            api_size = pending.unverified_fill_size or pending.filled_size
-            if api_size > 0:
-                return api_size, pending.price
+            logger.error("py_clob_client.clob_types not available — cannot verify trades")
             return 0.0, 0.0
         except Exception as e:
             logger.warning(
