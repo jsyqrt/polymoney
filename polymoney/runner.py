@@ -1234,9 +1234,8 @@ class TradingRunner:
                         down_has_data = False
 
                         _VALID_STATUSES = {
-                            "TRADE_STATUS_CONFIRMED",
-                            "TRADE_STATUS_MINED",
-                            "TRADE_STATUS_MATCHED",
+                            "CONFIRMED", "MINED", "MATCHED",
+                            "TRADE_STATUS_CONFIRMED", "TRADE_STATUS_MINED", "TRADE_STATUS_MATCHED",
                         }
 
                         for side, token_id in [("up", up_token), ("down", down_token)]:

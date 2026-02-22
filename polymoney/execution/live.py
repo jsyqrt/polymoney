@@ -597,9 +597,8 @@ class LiveExecutor(OrderExecutor):
             exchange_oid = pending.exchange_order_id
 
             _ACCEPTED_STATUSES = {
-                "TRADE_STATUS_CONFIRMED",
-                "TRADE_STATUS_MINED",
-                "TRADE_STATUS_MATCHED",
+                "CONFIRMED", "MINED", "MATCHED",
+                "TRADE_STATUS_CONFIRMED", "TRADE_STATUS_MINED", "TRADE_STATUS_MATCHED",
             }
 
             def _match_trades(trades: list) -> Tuple[float, float, List[str]]:
