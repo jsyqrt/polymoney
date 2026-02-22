@@ -503,6 +503,9 @@ class MarketResult:
     orders_submitted: int = 0
     orders_filled: int = 0
 
+    # Sell tracking: cumulative cash received from selling positions
+    sell_proceeds: float = 0.0
+
     # Final metrics
     pnl: float = 0.0
     roi: float = 0.0
@@ -522,28 +525,35 @@ class MarketResult:
         return self.winner is not None
 
     def calculate_final_metrics(self) -> None:
-        """Calculate final PnL, ROI, ECR after settlement."""
+        """Calculate final PnL, ROI, ECR after settlement.
+
+        PnL = settlement_value + sell_proceeds - total_buy_cost
+        where total_buy_cost = remaining cost + cost-basis of shares sold.
+        Since apply_sell already reduced up_cost/down_cost proportionally,
+        total_cost here is the cost of *remaining* shares only.
+        sell_proceeds captures the cash already received from selling.
+        """
         if not self.winner:
             return
 
-        total_cost = self.total_cost
-        if total_cost == 0:
+        remaining_cost = self.total_cost
+        total_invested = remaining_cost + self.sell_proceeds
+        if total_invested <= 0 and remaining_cost <= 0:
             return
 
-        # Settlement value
         if self.winner == "up":
             settlement_value = self.up_shares
         else:
             settlement_value = self.down_shares
 
-        self.pnl = settlement_value - total_cost
-        self.roi = self.pnl / total_cost if total_cost > 0 else 0
+        self.pnl = settlement_value + self.sell_proceeds - remaining_cost
+        denominator = remaining_cost + self.sell_proceeds
+        self.roi = self.pnl / denominator if denominator > 0 else 0
 
-        # ECR and balance
         min_shares = min(self.up_shares, self.down_shares)
         max_shares = max(self.up_shares, self.down_shares)
 
-        self.ecr = total_cost / min_shares if min_shares > 0 else float('inf')
+        self.ecr = remaining_cost / min_shares if min_shares > 0 else float('inf')
         self.balance_ratio = min_shares / max_shares if max_shares > 0 else 0
 
 

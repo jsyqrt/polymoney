@@ -50,6 +50,7 @@ class PendingOrder:
     original_size: float
     is_taker: bool
     created_at: float   # time.time() when submitted
+    is_sell: bool = False
     
     @property
     def age(self) -> float:
@@ -115,6 +116,11 @@ class SimulatedExecutor(OrderExecutor):
         if not order.order_id:
             order.order_id = self._gen_order_id(order.market_id, order.side)
 
+        # --- SELL orders: fill at market bid with high probability ---
+        if getattr(order, 'trade_side', 'buy') == 'sell':
+            return self._simulate_sell_order(state, order)
+
+        # --- BUY orders: original fill model ---
         # Attempt immediate fill via depth/spread model
         fill_result = self._simulate_fill(
             state, order.side, order.size, order.price, order.price,
@@ -179,6 +185,71 @@ class SimulatedExecutor(OrderExecutor):
             order_id=order.order_id,
         )
 
+    def _simulate_sell_order(
+        self, state: MarketState, order: ExecutionOrder
+    ) -> OrderResult:
+        """Simulate a sell order.
+
+        Selling in Polymarket means placing a limit-sell on the CLOB.
+        The sell fills if there is a buyer at or above our sell price.
+        We model this as: the current market price (best bid) is the
+        price a seller can expect.  If our sell price <= market price,
+        we fill immediately; otherwise it goes pending.
+        """
+        market_price = (
+            state.up_price if order.side == "up" else state.down_price
+        )
+        if market_price <= 0:
+            return OrderResult(
+                status=OrderResultStatus.REJECTED,
+                order_id=order.order_id,
+                error="No market price for sell",
+            )
+
+        if order.price <= market_price:
+            # Sell fills at our limit price (or slightly better).
+            # Taker fee applies when selling aggressively.
+            fill_price = order.price
+            filled_size = order.size
+
+            # Taker fee on sell: Polymarket charges the seller the fee
+            # as a reduction in proceeds, not in shares.  For simulation
+            # we model it as a price haircut.
+            fee_rate = self._taker_fee_rate(fill_price)
+            effective_price = fill_price * (1 - fee_rate)
+
+            self._liquidity_tracker.record_fill(order.market_id)
+            return OrderResult(
+                status=OrderResultStatus.FILLED,
+                order_id=order.order_id,
+                fill_price=effective_price,
+                fill_size=filled_size,
+            )
+
+        # Sell price above market — goes pending (may fill later)
+        pending = PendingOrder(
+            order_id=order.order_id,
+            market_id=order.market_id,
+            side=order.side,
+            price=order.price,
+            size=order.size,
+            original_size=order.size,
+            is_taker=False,
+            created_at=time.time(),
+            is_sell=True,
+        )
+        state.pending_orders.append(pending)
+        return OrderResult(
+            status=OrderResultStatus.PENDING,
+            order_id=order.order_id,
+        )
+
+    def _taker_fee_rate(self, price: float) -> float:
+        """Polymarket taker fee rate based on trade price."""
+        if price <= 0 or price >= 1:
+            return 0.0
+        return min(price, 1 - price) * 0.0312
+
     async def cancel_order(self, order_id: str) -> bool:
         """Cancel a pending simulated order."""
         for state in self._markets.values():
@@ -218,6 +289,28 @@ class SimulatedExecutor(OrderExecutor):
 
         for order in state.pending_orders:
             market_price = up_price if order.side == "up" else down_price
+
+            # --- Pending SELL orders: fill when market >= sell price ---
+            if order.is_sell:
+                if market_price >= order.price and market_price > 0:
+                    fee_rate = self._taker_fee_rate(order.price)
+                    effective_price = order.price * (1 - fee_rate)
+                    events.append(FillEvent(
+                        order_id=order.order_id,
+                        market_id=market_id,
+                        side=order.side,
+                        fill_price=effective_price,
+                        fill_size=order.size,
+                        is_taker=True,
+                        is_sell=True,
+                        timestamp=now,
+                    ))
+                    self._liquidity_tracker.record_fill(market_id)
+                else:
+                    remaining.append(order)
+                continue
+
+            # --- Pending BUY orders: original fill model ---
             price_diff = (
                 (market_price - order.price) / market_price
                 if market_price > 0

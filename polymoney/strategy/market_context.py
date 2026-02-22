@@ -227,7 +227,6 @@ class MarketContext:
         if size <= 0:
             return
 
-        # Reduce cost proportionally
         avg = pos.avg_price
         pos.shares -= size
         pos.cost -= size * avg
@@ -239,9 +238,12 @@ class MarketContext:
             self.result.down_shares -= size
             self.result.down_cost -= size * avg
 
+        self.result.sell_proceeds += proceeds
+
         logger.info(
             f"Sell applied: {self.slug} {side.upper()} "
-            f"{size:.2f}@{sell_price:.4f} (proceeds=${proceeds:.2f})"
+            f"{size:.2f}@{sell_price:.4f} (proceeds=${proceeds:.2f}, "
+            f"total_sell_proceeds=${self.result.sell_proceeds:.2f})"
         )
 
     def record_order_submitted(self) -> None:

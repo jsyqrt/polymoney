@@ -331,6 +331,15 @@ class PositionArbitrageStrategy(BaseStrategy):
         self._last_sell_time: float = 0.0
         self._sell_cooldown: float = self.params.get("sell_cooldown", 10.0)
 
+        # Pre-settlement exit: sell ALL positions before market closes so we
+        # never need to redeem.  Starts `exit_lead_seconds` before settlement.
+        self.enable_exit_sell = self.params.get("enable_exit_sell", True)
+        self.exit_lead_seconds = self.params.get("exit_lead_seconds", 180.0)
+        self.exit_sell_interval = self.params.get("exit_sell_interval", 3.0)
+        self._exit_mode = False
+        self._exit_logged = False
+        self._last_exit_sell_time: float = 0.0
+
         # Sequential ordering: only place secondary (leading) side when the
         # primary (lagging) side has enough pending or filled shares.
         # This prevents one-sided position building from asymmetric fills.
@@ -729,6 +738,9 @@ class PositionArbitrageStrategy(BaseStrategy):
         self._rebalancing_events.clear()
         self._skew_rejection_logged = False
         self._trend_patience_logged = False
+        self._exit_mode = False
+        self._exit_logged = False
+        self._last_exit_sell_time = 0.0
         self._phase3_tilt_logged = False
         self._directional_recovery_side = None
         self._directional_recovery_logged = False
@@ -786,7 +798,11 @@ class PositionArbitrageStrategy(BaseStrategy):
         self.current_down_price = price_data.down_price
 
         signals = []
-        
+
+        # === Pre-settlement exit: sell everything before market closes ===
+        if self._is_exit_phase():
+            return self._on_exit_phase_tick(price_data)
+
         # Update trend detector with new prices (time-based)
         if self.enable_trend_detection:
             self._trend_detector.update(
@@ -1240,12 +1256,13 @@ class PositionArbitrageStrategy(BaseStrategy):
         """Generate sell signals to lock in profit before settlement.
 
         When a side's market price is high (>= sell_profit_threshold), selling
-        that side's shares returns cash immediately, avoiding redeem risk and
-        settlement delay.  The sell price is set at a small discount below
-        market so the order sits as a maker (0% fee).
+        a portion of that side's shares returns cash immediately, avoiding
+        redeem risk and settlement delay.
 
-        Only sells the hedged (profitable) portion — min(up, down) shares on
-        the high-price side.
+        CRITICAL safety rules:
+        - Never sell more than 50% of hedged shares in one batch
+        - Always retain enough winning shares so remaining position stays hedged
+        - Must leave at least min_order_shares on the side being sold
         """
         signals: List[OrderSignal] = []
 
@@ -1253,21 +1270,31 @@ class PositionArbitrageStrategy(BaseStrategy):
             ("up", self.up_position, price_data.up_price),
             ("down", self.down_position, price_data.down_price),
         ]:
-            if pos.shares < self.min_order_shares:
+            if pos.shares < self.min_order_shares * 2:
                 continue
             if market_price < self.sell_profit_threshold:
                 continue
 
-            # Only sell the hedged portion (guaranteed profit shares)
-            hedged = min(self.up_position.shares, self.down_position.shares)
-            sellable = min(pos.shares, hedged)
+            other_pos = (
+                self.down_position if side == "up" else self.up_position
+            )
+            hedged = min(pos.shares, other_pos.shares)
+            if hedged < self.min_order_shares:
+                continue
+
+            # Sell at most 50% of the hedged portion per cycle.
+            # After selling, the position remains partially hedged.
+            max_sell_ratio = self.params.get("sell_max_ratio", 0.50)
+            sellable = hedged * max_sell_ratio
+
+            # Ensure we retain enough shares to stay above min_order_shares
+            retain = max(self.min_order_shares, pos.shares * 0.20)
+            sellable = min(sellable, pos.shares - retain)
             if sellable < self.min_order_shares:
                 continue
 
             sell_price = max(market_price * (1 - self.sell_discount), 0.01)
 
-            # Verify selling is actually profitable:
-            # sell_price must exceed our average cost for this side
             if sell_price <= pos.avg_price:
                 continue
 
@@ -1281,8 +1308,142 @@ class PositionArbitrageStrategy(BaseStrategy):
             signals.append(signal)
             logger.info(
                 f"[{self.name}] SELL signal: {side.upper()} "
-                f"{sellable:.1f}sh @{sell_price:.3f} "
-                f"(market={market_price:.3f}, avg_cost={pos.avg_price:.3f})"
+                f"{sellable:.1f}/{pos.shares:.1f}sh @{sell_price:.3f} "
+                f"(market={market_price:.3f}, avg_cost={pos.avg_price:.3f}, "
+                f"retain={pos.shares - sellable:.1f})"
+            )
+
+        return signals
+
+    # ------------------------------------------------------------------
+    # Pre-settlement exit phase
+    # ------------------------------------------------------------------
+
+    def _is_exit_phase(self) -> bool:
+        """Check whether we should be in pre-settlement exit mode.
+
+        Returns True when the market is within `exit_lead_seconds` of its
+        settlement time.  Once activated, exit mode stays on for the rest
+        of the market.
+        """
+        if not self.enable_exit_sell:
+            return False
+        if self._exit_mode:
+            return True
+        if self.market_start_time is None:
+            return False
+
+        now_ts = datetime.now().timestamp()
+
+        if self.market_settlement_time is not None:
+            remaining = self.market_settlement_time - now_ts
+        else:
+            elapsed = (datetime.now() - self.market_start_time).total_seconds()
+            remaining = self.market_duration - elapsed
+
+        if remaining <= self.exit_lead_seconds:
+            self._exit_mode = True
+            return True
+        return False
+
+    def _on_exit_phase_tick(self, price_data: PriceData) -> List[OrderSignal]:
+        """Generate signals during the exit phase.
+
+        During exit we:
+        1. Cancel all pending BUY orders (via special CANCEL signals)
+        2. Sell remaining positions in batches, both sides
+        3. Prioritise the winning (high-price) side — it has more value
+        """
+        if not self._exit_logged:
+            remaining = "?"
+            if self.market_settlement_time is not None:
+                remaining = f"{self.market_settlement_time - datetime.now().timestamp():.0f}s"
+            elif self.market_start_time is not None:
+                elapsed = (datetime.now() - self.market_start_time).total_seconds()
+                remaining = f"{self.market_duration - elapsed:.0f}s"
+            up_sh = self.up_position.shares
+            down_sh = self.down_position.shares
+            logger.info(
+                f"[{self.name}] EXIT PHASE: {remaining} to settlement | "
+                f"UP={up_sh:.1f}sh DOWN={down_sh:.1f}sh | selling all"
+            )
+            self._exit_logged = True
+
+        now_ts = time.time()
+        if now_ts - self._last_exit_sell_time < self.exit_sell_interval:
+            return []
+
+        signals = self._generate_exit_signals(price_data)
+        if signals:
+            self._last_exit_sell_time = now_ts
+        return signals
+
+    def _generate_exit_signals(self, price_data: PriceData) -> List[OrderSignal]:
+        """Generate aggressive sell signals to liquidate all positions.
+
+        Strategy for maximising proceeds:
+        - Sell the winning side (high price) first — most value per share
+        - Also sell the losing side — any recovery > 0 is better than
+          risking a failed redeem
+        - Use a time-adaptive discount: tighter early in exit phase,
+          more aggressive as settlement approaches
+        - Sell up to 50% of remaining shares per tick to avoid single
+          large order that may not fill
+        """
+        signals: List[OrderSignal] = []
+
+        if self.market_settlement_time is not None:
+            remaining = max(1.0, self.market_settlement_time - datetime.now().timestamp())
+        elif self.market_start_time is not None:
+            elapsed = (datetime.now() - self.market_start_time).total_seconds()
+            remaining = max(1.0, self.market_duration - elapsed)
+        else:
+            remaining = self.exit_lead_seconds
+
+        # Adaptive discount: tight when plenty of time, aggressive near end
+        #   180s remaining → 0.5% discount (fills easily as maker)
+        #    60s remaining → 1.5% discount
+        #    15s remaining → 3% discount (emergency)
+        urgency = 1.0 - min(1.0, remaining / self.exit_lead_seconds)
+        discount = 0.005 + urgency * 0.025
+
+        # Sell up to this fraction of remaining shares per tick
+        sell_fraction = min(0.60, 0.30 + urgency * 0.30)
+
+        sides = [
+            ("up", self.up_position, price_data.up_price),
+            ("down", self.down_position, price_data.down_price),
+        ]
+        # Sell higher-value side first
+        sides.sort(key=lambda x: x[2], reverse=True)
+
+        for side, pos, market_price in sides:
+            if pos.shares < self.min_order_shares:
+                continue
+
+            sell_price = max(market_price * (1 - discount), 0.01)
+
+            # For the losing side (very low price), selling at any positive
+            # price is better than holding to zero.  Accept down to 2 cents.
+            if sell_price < 0.02:
+                continue
+
+            sell_size = max(self.min_order_shares, pos.shares * sell_fraction)
+            sell_size = min(sell_size, pos.shares)
+
+            token_type = TokenType.YES if side == "up" else TokenType.NO
+            signal = OrderSignal(
+                side=TradeSide.SELL,
+                token_type=token_type,
+                target_price=sell_price,
+                size=sell_size,
+            )
+            signals.append(signal)
+            logger.info(
+                f"[{self.name}] EXIT SELL: {side.upper()} "
+                f"{sell_size:.1f}/{pos.shares:.1f}sh @{sell_price:.3f} "
+                f"(market={market_price:.3f}, discount={discount:.1%}, "
+                f"remaining={remaining:.0f}s)"
             )
 
         return signals

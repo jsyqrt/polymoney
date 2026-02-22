@@ -229,8 +229,15 @@ class TradingRunner:
         tasks = [
             asyncio.create_task(self._metrics_output_loop()),
         ]
-        if self.mode == "live":
-            tasks.append(asyncio.create_task(self._position_reconciliation_loop()))
+        # DISABLED: The position reconciliation loop queries the Trades API
+        # and sums the `size` field, but that field contains the *counterparty's*
+        # full trade size, not our bot's portion.  This caused phantom positions
+        # (e.g. BTC DOWN=1196 instead of ~9), inflated ECR, wrong PnL, and
+        # blocked new market entry via a bogus exposure limit.
+        # Until we have a reliable on-chain balance query, rely solely on
+        # fill tracking from verified order fills.
+        # if self.mode == "live":
+        #     tasks.append(asyncio.create_task(self._position_reconciliation_loop()))
         if self.config.duration_seconds > 0:
             tasks.append(asyncio.create_task(self._duration_watchdog()))
 
@@ -664,6 +671,19 @@ class TradingRunner:
         # Generate order signals from strategy
         signals = ctx.process_price_update(price)
 
+        # When the strategy enters exit mode (pre-settlement sell-all),
+        # cancel all pending orders so buys don't consume capital or
+        # create new positions that we'd need to sell again.
+        if signals and hasattr(ctx.strategy, '_exit_mode') and ctx.strategy._exit_mode:
+            if ctx.strategy.pending_orders:
+                cancelled = await self.executor.cancel_all(slug)
+                if cancelled > 0:
+                    logger.info(
+                        f"EXIT MODE: cancelled {cancelled} pending orders "
+                        f"for {slug}"
+                    )
+                ctx.strategy.pending_orders.clear()
+
         # Submit each signal to executor
         for signal in signals:
             await self._submit_signal(ctx, signal)
@@ -716,14 +736,19 @@ class TradingRunner:
         """Submit an order signal to the executor."""
         if self.kill_switch.is_activated:
             return
-        if not self.risk_manager.can_trade(
-            market_id=ctx.slug, order_cost=signal.size * signal.target_price
-        ):
-            return
+
+        signal_side_raw = signal.side if isinstance(signal.side, str) else signal.side.value
+        is_sell_signal = signal_side_raw == "sell"
+
+        # Sell signals bypass risk checks — reducing exposure is always allowed
+        if not is_sell_signal:
+            if not self.risk_manager.can_trade(
+                market_id=ctx.slug, order_cost=signal.size * signal.target_price
+            ):
+                return
 
         # Balance gate: reject BUY orders we cannot afford (sell orders bring in cash)
-        signal_side_raw = signal.side if isinstance(signal.side, str) else signal.side.value
-        if signal_side_raw != "sell":
+        if not is_sell_signal:
             order_cost = signal.size * signal.target_price
             if self.mode == "live" and order_cost > self._available_cash:
                 logger.warning(
@@ -1174,7 +1199,8 @@ class TradingRunner:
 
                     hedged = min(ctx.result.up_shares, ctx.result.down_shares)
                     total_cost = ctx.result.total_cost
-                    market_pnl = hedged - total_cost if hedged > 0 else 0
+                    sell_cash = ctx.result.sell_proceeds
+                    market_pnl = hedged + sell_cash - total_cost if hedged > 0 else sell_cash - total_cost
                     expected_pnl += market_pnl
 
                     ecr = total_cost / hedged if hedged > 0 else 0
