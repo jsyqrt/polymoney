@@ -2,7 +2,7 @@
 # Core dependencies
 
 # Polymarket API client
-py-clob-client>=0.1.0
+py-clob-client>=0.34.0
 
 # Polymarket Web3 client (for gas-based position redemption)
 polymarket-apis>=0.1.0

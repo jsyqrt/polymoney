@@ -189,6 +189,12 @@ class TradingRunner:
         # Initialize ClobClient for live mode
         if self.mode == "live":
             await self._init_clob_client()
+            if not self._preflight_checks():
+                logger.error("Preflight checks FAILED — aborting to prevent losses")
+                self._running = False
+                raise RuntimeError(
+                    "Preflight checks failed. Fix the issues above before trading."
+                )
 
         logger.info(
             f"Starting TradingRunner: mode={self.mode}, coins={self.config.coins}, "
@@ -407,6 +413,130 @@ class TradingRunner:
         except Exception as e:
             logger.warning(f"Failed to fetch USDC balance: {e}")
             return None
+
+    # ------------------------------------------------------------------
+    # Preflight checks (live mode)
+    # ------------------------------------------------------------------
+
+    def _preflight_checks(self) -> bool:
+        """Verify all critical interfaces before trading starts.
+
+        Returns True if all checks pass, False if any fail.
+        A failure here means trading MUST NOT proceed — the system would
+        lose money due to inaccurate position tracking or broken APIs.
+        """
+        checks_passed = True
+        failures: list = []
+
+        def _check(name: str, ok: bool, detail: str = "") -> None:
+            nonlocal checks_passed
+            status = "OK" if ok else "FAIL"
+            msg = f"  [{status}] {name}"
+            if detail:
+                msg += f": {detail}"
+            if ok:
+                logger.info(msg)
+            else:
+                logger.error(msg)
+                failures.append(name)
+                checks_passed = False
+
+        logger.info("=" * 60)
+        logger.info("PREFLIGHT CHECKS — verifying all interfaces before trading")
+        logger.info("=" * 60)
+
+        # 1. CLOB client exists
+        _check(
+            "CLOB client initialized",
+            self._clob_client is not None,
+        )
+        if not self._clob_client:
+            logger.error("Cannot continue preflight without CLOB client")
+            return False
+
+        # 2. Maker address extracted (critical for trade verification)
+        maker_addr = None
+        if isinstance(self.executor, LiveExecutor):
+            maker_addr = self.executor._maker_address
+        _check(
+            "Maker address extracted",
+            maker_addr is not None,
+            maker_addr[:16] + "..." if maker_addr else "MISSING — fills will use limit price, not real VWAP",
+        )
+
+        # 3. L2 auth (required for get_trades, get_order, post_order)
+        l2_ok = False
+        try:
+            self._clob_client.assert_level_2_auth()
+            l2_ok = True
+        except Exception:
+            pass
+        _check(
+            "L2 authentication",
+            l2_ok,
+            "" if l2_ok else "get_trades/get_order will fail — cannot verify fills",
+        )
+
+        # 4. USDC balance API
+        balance = self._fetch_usdc_balance()
+        balance_ok = balance is not None and balance > 0
+        _check(
+            "USDC balance API",
+            balance_ok,
+            f"${balance:.2f}" if balance is not None else "API returned None",
+        )
+
+        # 5. get_trades API (actual round-trip test)
+        trades_ok = False
+        trades_detail = "skipped (requires L2 auth + maker address)"
+        if l2_ok and maker_addr:
+            try:
+                from py_clob_client.clob_types import TradeParams
+                result_trades = self._clob_client.get_trades(
+                    params=TradeParams(maker_address=maker_addr)
+                )
+                trades_ok = isinstance(result_trades, list)
+                trades_detail = f"returned {len(result_trades)} trades" if trades_ok else "unexpected response type"
+            except Exception as e:
+                trades_detail = str(e)
+        _check("Trades API (get_trades)", trades_ok, trades_detail)
+
+        # 6. get_order API (test with a dummy ID — expect graceful failure)
+        order_api_ok = False
+        if l2_ok:
+            try:
+                self._clob_client.get_order("0x" + "0" * 64)
+                order_api_ok = True  # even None/empty is fine, no exception
+            except Exception as e:
+                err_str = str(e).lower()
+                if "not found" in err_str or "404" in err_str:
+                    order_api_ok = True  # expected — API is reachable
+        _check(
+            "Order status API (get_order)",
+            order_api_ok,
+            "" if order_api_ok else "cannot poll order fill status",
+        )
+
+        # 7. Server connectivity
+        server_ok = False
+        try:
+            resp = self._clob_client.get_ok()
+            server_ok = resp == "OK" or bool(resp)
+        except Exception:
+            pass
+        _check("CLOB server connectivity", server_ok)
+
+        logger.info("=" * 60)
+        if checks_passed:
+            logger.info("ALL PREFLIGHT CHECKS PASSED — safe to trade")
+        else:
+            logger.error(
+                f"PREFLIGHT FAILED: {len(failures)} check(s) failed: "
+                + ", ".join(failures)
+            )
+        logger.info("=" * 60)
+
+        return checks_passed
 
     # ------------------------------------------------------------------
     # Data provider callbacks
@@ -1087,16 +1217,17 @@ class TradingRunner:
                                 maker_address=maker_address,
                                 asset_id=token_id,
                             )
-                            resp = self._clob_client.get_trades(params=params)
-                            if not resp or not isinstance(resp, dict):
+                            trades = self._clob_client.get_trades(params=params)
+                            if not trades or not isinstance(trades, list):
                                 continue
 
                             total = 0.0
-                            for trade in resp.get("data", []):
+                            for trade in trades:
                                 status = trade.get("status", "")
                                 if status in (
                                     "TRADE_STATUS_CONFIRMED",
                                     "TRADE_STATUS_MINED",
+                                    "TRADE_STATUS_MATCHED",
                                 ):
                                     try:
                                         total += float(trade.get("size", 0))

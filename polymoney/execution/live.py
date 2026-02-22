@@ -102,30 +102,42 @@ class LiveExecutor(OrderExecutor):
         """Set or update the CLOB client."""
         self._client = clob_client
         self._maker_address = self._extract_maker_address(clob_client)
-        logger.info(
-            f"CLOB client configured for live execution"
-            f" (maker={self._maker_address[:10]}...)" if self._maker_address else ""
-        )
+        if self._maker_address:
+            logger.info(
+                f"CLOB client configured for live execution "
+                f"(maker={self._maker_address[:10]}...)"
+            )
+        else:
+            logger.error(
+                "CLOB client configured but maker address could NOT be extracted. "
+                "Trade verification will be UNAVAILABLE — positions will be inaccurate!"
+            )
 
     @staticmethod
     def _extract_maker_address(client) -> Optional[str]:
-        """Extract the maker wallet address from the CLOB client."""
+        """Extract the maker wallet address from the CLOB client.
+
+        The address used for trade filtering is the *funder* address
+        (``client.builder.funder``), which equals the signer address for
+        EOA wallets and the proxy wallet address for Magic/browser wallets.
+        ``client.get_address()`` returns the signer address directly.
+        """
         if client is None:
             return None
         try:
-            # py-clob-client stores the funder address (proxy wallet)
-            # or derives it from the private key
-            if hasattr(client, "funder") and client.funder:
-                return client.funder
-            if hasattr(client, "creds") and client.creds:
-                # L2 header-based auth stores the address
-                if hasattr(client.creds, "api_key"):
-                    pass  # api_key is not the address
-            # Derive from private key as fallback
-            if hasattr(client, "key") and client.key:
-                from eth_account import Account
-                acct = Account.from_key(client.key)
-                return acct.address
+            # Best: builder.funder — the actual on-chain address that holds funds.
+            # For EOA wallets this equals the signer address; for proxy wallets
+            # it is the separate funder address passed at ClobClient init.
+            if hasattr(client, "builder") and client.builder:
+                funder = getattr(client.builder, "funder", None)
+                if funder:
+                    return funder
+
+            # Fallback: get_address() returns signer address (works for EOA).
+            if hasattr(client, "get_address"):
+                addr = client.get_address()
+                if addr:
+                    return addr
         except Exception as e:
             logger.warning(f"Could not extract maker address: {e}")
         return None
@@ -445,14 +457,16 @@ class LiveExecutor(OrderExecutor):
     ) -> Tuple[float, float]:
         """
         Fetch confirmed trades for a pending order from the Trades API.
-        
+
+        ``get_trades()`` returns a **flat list** of trade dicts (it handles
+        pagination internally).  Each trade dict has keys like ``size``,
+        ``price``, ``status``, ``asset_id``, etc.
+
         Returns:
             (total_verified_size, volume_weighted_avg_price)
             Returns (0.0, 0.0) if no confirmed trades found.
         """
         if not self._maker_address:
-            # Fallback: can't verify without maker address.
-            # Use the limit price (old behavior) — better than blocking.
             logger.debug(
                 f"No maker address for trade verification, "
                 f"using limit price for {pending.order_id}"
@@ -468,15 +482,11 @@ class LiveExecutor(OrderExecutor):
             params = TradeParams(
                 maker_address=self._maker_address,
                 asset_id=pending.token_id,
-                after=str(int(pending.created_at)),
+                after=int(pending.created_at),
             )
-            response = self._client.get_trades(params=params)
+            trades = self._client.get_trades(params=params)
 
-            if not response or not isinstance(response, dict):
-                return 0.0, 0.0
-
-            trades = response.get("data", [])
-            if not trades:
+            if not trades or not isinstance(trades, list):
                 return 0.0, 0.0
 
             total_size = 0.0
