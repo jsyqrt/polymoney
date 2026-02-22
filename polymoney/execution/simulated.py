@@ -197,7 +197,7 @@ class SimulatedExecutor(OrderExecutor):
         we fill immediately; otherwise it goes pending.
         """
         market_price = (
-            state.up_price if order.side == "up" else state.down_price
+            state.prev_up_price if order.side == "up" else state.prev_down_price
         )
         if market_price <= 0:
             return OrderResult(
