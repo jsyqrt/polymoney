@@ -336,6 +336,7 @@ class PositionArbitrageStrategy(BaseStrategy):
         self.enable_exit_sell = self.params.get("enable_exit_sell", True)
         self.exit_lead_seconds = self.params.get("exit_lead_seconds", 180.0)
         self.exit_sell_interval = self.params.get("exit_sell_interval", 3.0)
+        self.exit_hold_winner_seconds = self.params.get("exit_hold_winner_seconds", 60.0)
         self._exit_mode = False
         self._exit_logged = False
         self._last_exit_sell_time: float = 0.0
@@ -1418,6 +1419,8 @@ class PositionArbitrageStrategy(BaseStrategy):
         # Sell cheaper (riskier) side first — it has more downside toward 0
         sides.sort(key=lambda x: x[2])
 
+        late_phase = remaining <= self.exit_hold_winner_seconds
+
         for side, pos, market_price in sides:
             if pos.shares < self.min_order_shares:
                 continue
@@ -1427,15 +1430,28 @@ class PositionArbitrageStrategy(BaseStrategy):
             if sell_price < 0.02:
                 continue
 
-            # Never sell below cost — let the hedge pay off at settlement
-            # instead of locking in a loss by selling cheap.
-            if sell_price <= pos.avg_price:
-                logger.debug(
-                    f"[{self.name}] EXIT SKIP: {side.upper()} "
-                    f"sell_price={sell_price:.3f} <= avg_cost={pos.avg_price:.3f}, "
-                    f"holding for settlement"
-                )
-                continue
+            if late_phase:
+                # Last minute: outcome nearly certain.
+                # Winning side → hold for $1 settlement.
+                # Losing side → sell to recover any value before $0.
+                if market_price > 0.50:
+                    logger.debug(
+                        f"[{self.name}] EXIT HOLD: {side.upper()} "
+                        f"price={market_price:.3f} > 0.50, "
+                        f"holding for $1 settlement ({remaining:.0f}s left)"
+                    )
+                    continue
+            else:
+                # Early exit: market can still reverse.
+                # Only sell if profitable — don't lock in a loss that
+                # could be recovered by a reversal.
+                if sell_price <= pos.avg_price:
+                    logger.debug(
+                        f"[{self.name}] EXIT SKIP: {side.upper()} "
+                        f"sell={sell_price:.3f} <= cost={pos.avg_price:.3f}, "
+                        f"waiting ({remaining:.0f}s left)"
+                    )
+                    continue
 
             sell_size = max(self.min_order_shares, pos.shares * sell_fraction)
             sell_size = min(sell_size, pos.shares)
