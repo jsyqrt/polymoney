@@ -1519,9 +1519,13 @@ class PositionArbitrageStrategy(BaseStrategy):
     def _is_exit_phase(self) -> bool:
         """Check whether we should be in pre-settlement exit mode.
 
-        Returns True when the market is within `exit_lead_seconds` of its
-        settlement time.  Once activated, exit mode stays on for the rest
-        of the market.
+        Returns True when:
+        1. The market is within ``exit_lead_seconds`` of settlement (normal), OR
+        2. The hedged position is clearly profitable (ECR < target_cost) with
+           good balance (> 70%) and meaningful size — trigger early to lock in
+           profit before a market reversal can destroy the hedge.
+
+        Once activated, exit mode stays on for the rest of the market.
         """
         if not self.enable_exit_sell:
             return False
@@ -1541,6 +1545,28 @@ class PositionArbitrageStrategy(BaseStrategy):
         if remaining <= self.exit_lead_seconds:
             self._exit_mode = True
             return True
+
+        # Early take-profit trigger: when the hedged position is clearly
+        # profitable, sell both sides now instead of risking market reversal.
+        # Only trigger after Phase 1 (need enough fills to be meaningful).
+        # Threshold is ECR < 1.0 (any profitable hedge), not target_cost,
+        # because even ECR=0.97 (2.73% profit) is worth locking in vs the
+        # risk of a market reversal wiping out the entire position.
+        ecr = self.effective_cost_rate
+        hedged = self.hedged_position
+        take_profit_ecr = self.params.get("take_profit_ecr", 0.995)
+        if (ecr != float("inf")
+                and ecr < take_profit_ecr
+                and self.balance_ratio >= 0.70
+                and hedged >= self.position_size * 0.20):
+            self._exit_mode = True
+            logger.info(
+                f"[{self.name}] EARLY TAKE-PROFIT EXIT: "
+                f"ECR={ecr:.4f} < target={self.target_cost:.4f}, "
+                f"balance={self.balance_ratio:.0%}, hedged={hedged:.1f}sh"
+            )
+            return True
+
         return False
 
     def _on_exit_phase_tick(self, price_data: PriceData) -> List[OrderSignal]:
@@ -1576,17 +1602,16 @@ class PositionArbitrageStrategy(BaseStrategy):
         return signals
 
     def _generate_exit_signals(self, price_data: PriceData) -> List[OrderSignal]:
-        """Generate aggressive sell signals to liquidate all positions.
+        """Generate sell signals to liquidate all positions.
 
-        Sell order priority — cheap side first:
-        - The low-price (losing) side has the most downside risk: its
-          price can keep falling toward 0, so exit it ASAP to limit loss.
-        - The high-price (winning) side may still appreciate toward 1.00,
-          so selling it last gives a chance at a better exit price.
-        - Use a time-adaptive discount: tighter early in exit phase,
-          more aggressive as settlement approaches
-        - Sell up to 60% of remaining shares per tick to avoid single
-          large order that may not fill
+        Key principle: when the hedged position is profitable (ECR < 1.0),
+        sell BOTH sides proportionally to preserve the hedge and lock in
+        profit.  The old approach of checking per-side profitability would
+        only sell the winning side, destroying the hedge and leaving the
+        losing side to become worthless at settlement.
+
+        When ECR >= 1.0 (unprofitable), fall back to per-side profitability
+        checks — only sell what doesn't lock in a loss.
         """
         signals: List[OrderSignal] = []
 
@@ -1598,24 +1623,57 @@ class PositionArbitrageStrategy(BaseStrategy):
         else:
             remaining = self.exit_lead_seconds
 
-        # Adaptive discount: tight when plenty of time, aggressive near end
-        #   180s remaining → 0.5% discount (fills easily as maker)
-        #    60s remaining → 1.5% discount
-        #    15s remaining → 3% discount (emergency)
         urgency = 1.0 - min(1.0, remaining / self.exit_lead_seconds)
         discount = 0.005 + urgency * 0.025
 
-        # Sell up to this fraction of remaining shares per tick
         sell_fraction = min(0.60, 0.30 + urgency * 0.30)
 
+        ecr = self.effective_cost_rate
+        hedge_profitable = ecr != float("inf") and ecr < 1.0
+        combined_price = price_data.up_price + price_data.down_price
+        pair_profitable = combined_price > ecr if ecr != float("inf") else False
+
+        late_phase = remaining <= self.exit_hold_winner_seconds
+
+        # When the hedge is profitable, sell both sides proportionally.
+        # This preserves the hedge instead of only selling the winning side.
+        if hedge_profitable and pair_profitable and not late_phase:
+            hedged = min(self.up_position.shares, self.down_position.shares)
+            if hedged >= self.min_order_shares:
+                sell_shares = max(self.min_order_shares, hedged * sell_fraction)
+                sell_shares = min(sell_shares, hedged)
+
+                for side, pos, market_price in [
+                    ("up", self.up_position, price_data.up_price),
+                    ("down", self.down_position, price_data.down_price),
+                ]:
+                    if pos.shares < self.min_order_shares:
+                        continue
+                    sell_price = max(market_price * (1 - discount), 0.01)
+                    if sell_price < 0.02:
+                        continue
+                    size = min(sell_shares, pos.shares)
+                    token_type = TokenType.YES if side == "up" else TokenType.NO
+                    signals.append(OrderSignal(
+                        side=TradeSide.SELL,
+                        token_type=token_type,
+                        target_price=sell_price,
+                        size=size,
+                    ))
+                    logger.info(
+                        f"[{self.name}] EXIT PAIR-SELL: {side.upper()} "
+                        f"{size:.1f}/{pos.shares:.1f}sh @{sell_price:.3f} "
+                        f"(market={market_price:.3f}, ECR={ecr:.4f}, "
+                        f"combined={combined_price:.3f}, remaining={remaining:.0f}s)"
+                    )
+                return signals
+
+        # Fallback: per-side exit for unhedged or unprofitable positions
         sides = [
             ("up", self.up_position, price_data.up_price),
             ("down", self.down_position, price_data.down_price),
         ]
-        # Sell cheaper (riskier) side first — it has more downside toward 0
         sides.sort(key=lambda x: x[2])
-
-        late_phase = remaining <= self.exit_hold_winner_seconds
 
         for side, pos, market_price in sides:
             if pos.shares < self.min_order_shares:
@@ -1627,9 +1685,6 @@ class PositionArbitrageStrategy(BaseStrategy):
                 continue
 
             if late_phase:
-                # Last minute: outcome nearly certain.
-                # Winning side → hold for $1 settlement.
-                # Losing side → sell to recover any value before $0.
                 if market_price > 0.50:
                     logger.debug(
                         f"[{self.name}] EXIT HOLD: {side.upper()} "
@@ -1638,9 +1693,6 @@ class PositionArbitrageStrategy(BaseStrategy):
                     )
                     continue
             else:
-                # Early exit: market can still reverse.
-                # Only sell if profitable — don't lock in a loss that
-                # could be recovered by a reversal.
                 if sell_price <= pos.avg_price:
                     logger.debug(
                         f"[{self.name}] EXIT SKIP: {side.upper()} "
@@ -1653,13 +1705,12 @@ class PositionArbitrageStrategy(BaseStrategy):
             sell_size = min(sell_size, pos.shares)
 
             token_type = TokenType.YES if side == "up" else TokenType.NO
-            signal = OrderSignal(
+            signals.append(OrderSignal(
                 side=TradeSide.SELL,
                 token_type=token_type,
                 target_price=sell_price,
                 size=sell_size,
-            )
-            signals.append(signal)
+            ))
             logger.info(
                 f"[{self.name}] EXIT SELL: {side.upper()} "
                 f"{sell_size:.1f}/{pos.shares:.1f}sh @{sell_price:.3f} "
