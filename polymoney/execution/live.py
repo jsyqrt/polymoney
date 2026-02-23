@@ -159,6 +159,52 @@ class LiveExecutor(OrderExecutor):
         """Check if executor has a configured client."""
         return self._client is not None
 
+    def _get_conditional_balance(self, token_id: str) -> Optional[Tuple[float, float]]:
+        """Query on-chain conditional token balance and allowance.
+
+        Returns (balance, allowance) in token units, or None on failure.
+        Conditional tokens on Polymarket are ERC-1155 with 6 decimals.
+        """
+        if not self._client:
+            return None
+        try:
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+
+            resp = self._client.get_balance_allowance(
+                params=BalanceAllowanceParams(
+                    asset_type=AssetType.CONDITIONAL,
+                    token_id=token_id,
+                )
+            )
+            if resp and isinstance(resp, dict):
+                raw_bal = resp.get("balance", "0")
+                raw_allow = resp.get("allowance", "0")
+                balance = float(raw_bal) / 1e6
+                allowance = float(raw_allow) / 1e6
+                return balance, allowance
+        except Exception as e:
+            logger.warning(f"Failed to query conditional token balance: {e}")
+        return None
+
+    def _update_conditional_allowance(self, token_id: str) -> bool:
+        """Refresh token approval so the CLOB can spend conditional tokens."""
+        if not self._client:
+            return False
+        try:
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+
+            self._client.update_balance_allowance(
+                params=BalanceAllowanceParams(
+                    asset_type=AssetType.CONDITIONAL,
+                    token_id=token_id,
+                )
+            )
+            logger.info(f"Updated conditional token allowance for {token_id[:16]}...")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to update conditional token allowance: {e}")
+            return False
+
     # ------------------------------------------------------------------
     # OrderExecutor interface
     # ------------------------------------------------------------------
@@ -191,15 +237,45 @@ class LiveExecutor(OrderExecutor):
 
         order_id = order.order_id or f"live_{uuid.uuid4().hex[:8]}"
 
+        # Pre-sell check: verify we actually hold the conditional tokens
+        is_sell = order.trade_side == "sell"
+        actual_size = order.size
+        if is_sell:
+            bal_result = self._get_conditional_balance(token_id)
+            if bal_result is not None:
+                balance, allowance = bal_result
+                if balance < 0.01:
+                    logger.warning(
+                        f"SELL rejected: no on-chain balance for token "
+                        f"{token_id[:16]}... (balance={balance:.4f})"
+                    )
+                    return OrderResult(
+                        status=OrderResultStatus.REJECTED,
+                        order_id=order_id,
+                        error="No on-chain conditional token balance",
+                    )
+                if actual_size > balance:
+                    logger.warning(
+                        f"SELL size capped: {actual_size:.2f} → {balance:.2f} "
+                        f"(on-chain balance) for token {token_id[:16]}..."
+                    )
+                    actual_size = balance
+                if allowance < actual_size:
+                    logger.info(
+                        f"Refreshing allowance for token {token_id[:16]}... "
+                        f"(allowance={allowance:.2f}, need={actual_size:.2f})"
+                    )
+                    self._update_conditional_allowance(token_id)
+
         for attempt in range(self._max_retries):
             try:
                 from py_clob_client.clob_types import OrderArgs
                 from py_clob_client.order_builder.constants import BUY, SELL
 
-                clob_side = SELL if order.trade_side == "sell" else BUY
+                clob_side = SELL if is_sell else BUY
                 order_args = OrderArgs(
                     price=order.price,
-                    size=order.size,
+                    size=actual_size,
                     side=clob_side,
                     token_id=token_id,
                 )
@@ -225,7 +301,6 @@ class LiveExecutor(OrderExecutor):
                         f"post_order returned no orderID: {response}"
                     )
 
-                is_sell = order.trade_side == "sell"
                 pending = LivePendingOrder(
                     order_id=order_id,
                     exchange_order_id=exchange_order_id,
@@ -233,7 +308,7 @@ class LiveExecutor(OrderExecutor):
                     side=order.side,
                     token_id=token_id,
                     price=order.price,
-                    size=order.size,
+                    size=actual_size,
                     created_at=time.time(),
                     last_checked=time.time(),
                     is_taker=order.is_taker,
@@ -244,7 +319,7 @@ class LiveExecutor(OrderExecutor):
                 trade_label = "SELL" if is_sell else "BUY"
                 logger.info(
                     f"Live order placed: {order_id} {trade_label} "
-                    f"{order.side.upper()} {order.size}@{order.price} "
+                    f"{order.side.upper()} {actual_size}@{order.price} "
                     f"token={token_id[:16]}... exchange_id={exchange_order_id}"
                 )
 
@@ -255,6 +330,17 @@ class LiveExecutor(OrderExecutor):
                 )
 
             except Exception as e:
+                err_str = str(e)
+                # Don't retry balance/allowance failures — they won't self-resolve
+                if "not enough balance" in err_str or "allowance" in err_str:
+                    logger.error(
+                        f"Order rejected (balance/allowance): {err_str}"
+                    )
+                    return OrderResult(
+                        status=OrderResultStatus.REJECTED,
+                        order_id=order_id,
+                        error=err_str,
+                    )
                 delay = self._retry_delay * (2 ** attempt)
                 logger.warning(
                     f"Order submission failed (attempt {attempt+1}/{self._max_retries}): {e}"
@@ -266,7 +352,7 @@ class LiveExecutor(OrderExecutor):
                     return OrderResult(
                         status=OrderResultStatus.REJECTED,
                         order_id=order_id,
-                        error=str(e),
+                        error=err_str,
                     )
 
         # Should not reach here

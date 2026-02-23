@@ -1381,13 +1381,14 @@ class PositionArbitrageStrategy(BaseStrategy):
     def _generate_exit_signals(self, price_data: PriceData) -> List[OrderSignal]:
         """Generate aggressive sell signals to liquidate all positions.
 
-        Strategy for maximising proceeds:
-        - Sell the winning side (high price) first — most value per share
-        - Also sell the losing side — any recovery > 0 is better than
-          risking a failed redeem
+        Sell order priority — cheap side first:
+        - The low-price (losing) side has the most downside risk: its
+          price can keep falling toward 0, so exit it ASAP to limit loss.
+        - The high-price (winning) side may still appreciate toward 1.00,
+          so selling it last gives a chance at a better exit price.
         - Use a time-adaptive discount: tighter early in exit phase,
           more aggressive as settlement approaches
-        - Sell up to 50% of remaining shares per tick to avoid single
+        - Sell up to 60% of remaining shares per tick to avoid single
           large order that may not fill
         """
         signals: List[OrderSignal] = []
@@ -1414,8 +1415,8 @@ class PositionArbitrageStrategy(BaseStrategy):
             ("up", self.up_position, price_data.up_price),
             ("down", self.down_position, price_data.down_price),
         ]
-        # Sell higher-value side first
-        sides.sort(key=lambda x: x[2], reverse=True)
+        # Sell cheaper (riskier) side first — it has more downside toward 0
+        sides.sort(key=lambda x: x[2])
 
         for side, pos, market_price in sides:
             if pos.shares < self.min_order_shares:
@@ -1423,9 +1424,17 @@ class PositionArbitrageStrategy(BaseStrategy):
 
             sell_price = max(market_price * (1 - discount), 0.01)
 
-            # For the losing side (very low price), selling at any positive
-            # price is better than holding to zero.  Accept down to 2 cents.
             if sell_price < 0.02:
+                continue
+
+            # Never sell below cost — let the hedge pay off at settlement
+            # instead of locking in a loss by selling cheap.
+            if sell_price <= pos.avg_price:
+                logger.debug(
+                    f"[{self.name}] EXIT SKIP: {side.upper()} "
+                    f"sell_price={sell_price:.3f} <= avg_cost={pos.avg_price:.3f}, "
+                    f"holding for settlement"
+                )
                 continue
 
             sell_size = max(self.min_order_shares, pos.shares * sell_fraction)
@@ -1442,8 +1451,8 @@ class PositionArbitrageStrategy(BaseStrategy):
             logger.info(
                 f"[{self.name}] EXIT SELL: {side.upper()} "
                 f"{sell_size:.1f}/{pos.shares:.1f}sh @{sell_price:.3f} "
-                f"(market={market_price:.3f}, discount={discount:.1%}, "
-                f"remaining={remaining:.0f}s)"
+                f"(market={market_price:.3f}, cost={pos.avg_price:.3f}, "
+                f"discount={discount:.1%}, remaining={remaining:.0f}s)"
             )
 
         return signals
