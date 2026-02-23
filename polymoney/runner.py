@@ -682,55 +682,13 @@ class TradingRunner:
             logger.warning(f"Failed to load market costs from status file: {e}")
             return None
 
-    def _query_trade_costs_for_market(
-        self, ctx: MarketContext,
-    ) -> Optional[Tuple[float, float, float, float]]:
-        """Query Polymarket Trades API for accurate position costs.
-
-        Returns ``(up_cost, down_cost, total_buy_cost, sell_proceeds)``
-        or ``None`` if the executor doesn't support trade queries.
-        """
-        if not hasattr(self.executor, "query_trade_costs"):
-            return None
-
-        # Use 0.5 as reference price when live prices are not yet available.
-        up_ref = ctx.last_up_price or 0.5
-        down_ref = ctx.last_down_price or 0.5
-
-        up_result = self.executor.query_trade_costs(ctx.slug, "up", up_ref)
-        down_result = self.executor.query_trade_costs(ctx.slug, "down", down_ref)
-
-        # Both sides must succeed; partial data is worse than estimation.
-        if up_result is None or down_result is None:
-            return None
-
-        up_buy_sh, up_buy_cost, up_sell_sh, up_sell_proceeds = up_result
-        dn_buy_sh, dn_buy_cost, dn_sell_sh, dn_sell_proceeds = down_result
-
-        # Remaining cost = buy cost - cost-basis of shares sold.
-        # avg_buy_price * sold_shares is the cost-basis we released.
-        def _remaining(buy_sh: float, buy_cost: float, sell_sh: float) -> float:
-            if buy_sh <= 0:
-                return 0.0
-            avg = buy_cost / buy_sh
-            return max(0.0, buy_cost - sell_sh * avg)
-
-        up_cost = _remaining(up_buy_sh, up_buy_cost, up_sell_sh)
-        down_cost = _remaining(dn_buy_sh, dn_buy_cost, dn_sell_sh)
-        total_buy_cost = up_buy_cost + dn_buy_cost
-        sell_proceeds = up_sell_proceeds + dn_sell_proceeds
-
-        return up_cost, down_cost, total_buy_cost, sell_proceeds
-
     def _sync_initial_positions(self, ctx: MarketContext) -> None:
         """Query on-chain token balances and restore tracked costs.
 
-        Cost recovery priority:
-        1. Saved status file — exact per-market data persisted every few
-           seconds during the previous session.
-        2. Polymarket Trades API — reconstructs cost from actual fills.
-        3. (None) — if no cost source is available the shares are still
-           synced but cost stays zero; a loud warning is emitted.
+        Restores exact per-market cost data from the saved status file
+        (persisted every few seconds).  If the status file has no data for
+        this market, shares are synced but costs stay zero with a warning;
+        the next reconciliation cycle will fill in incremental costs.
         """
         slug = ctx.slug
         balances = self.executor.get_market_balances(slug)
@@ -742,7 +700,7 @@ class TradingRunner:
         if up_shares < 0.01 and down_shares < 0.01:
             return
 
-        # --- Recover accurate costs ---
+        # --- Recover accurate costs from status file ---
         up_cost = 0.0
         down_cost = 0.0
         total_buy_cost = 0.0
@@ -757,15 +715,9 @@ class TradingRunner:
             sell_proceeds = saved["sell_proceeds"]
             source = "status-file"
         else:
-            api_costs = self._query_trade_costs_for_market(ctx)
-            if api_costs is not None:
-                up_cost, down_cost, total_buy_cost, sell_proceeds = api_costs
-                source = "trades-api"
-
-        if source == "none":
             logger.warning(
                 f"[{slug}] Positions found on-chain (UP={up_shares:.2f}, "
-                f"DOWN={down_shares:.2f}) but NO cost data available — "
+                f"DOWN={down_shares:.2f}) but no saved cost data — "
                 f"PnL will be inaccurate until reconciliation fills in costs"
             )
 
@@ -935,39 +887,32 @@ class TradingRunner:
         up_price = ctx.last_up_price or 0.5
         down_price = ctx.last_down_price or 0.5
 
-        # --- Strategy 1: Query the Trades API for accurate costs ---
-        # This gives us the actual fill prices instead of estimates.
-        api_costs = self._query_trade_costs_for_market(ctx)
-        if api_costs is not None:
-            new_up_cost, new_down_cost, new_total_buy, new_sell_proceeds = api_costs
-            ctx.result.total_buy_cost = new_total_buy
-            ctx.result.sell_proceeds = new_sell_proceeds
-            cost_source = "trades-api"
-        else:
-            # --- Strategy 2: Estimate from market price (fallback) ---
-            def _adjust_cost(
-                local_shares: float, chain_shares: float,
-                local_cost: float, market_price: float,
-            ) -> float:
-                diff = chain_shares - local_shares
-                if abs(diff) <= threshold:
-                    return local_cost
-                if diff > 0:
-                    return local_cost + diff * market_price
-                else:
-                    if local_shares > 0.01:
-                        return local_cost * (chain_shares / local_shares)
-                    return 0.0
+        # Adjust per-side costs incrementally.  For increases (missed fills)
+        # estimate at current market price; for decreases (missed sells)
+        # reduce proportionally.
+        def _adjust_cost(
+            local_shares: float, chain_shares: float,
+            local_cost: float, market_price: float,
+        ) -> float:
+            diff = chain_shares - local_shares
+            if abs(diff) <= threshold:
+                return local_cost
+            if diff > 0:
+                return local_cost + diff * market_price
+            else:
+                if local_shares > 0.01:
+                    return local_cost * (chain_shares / local_shares)
+                return 0.0
 
-            new_up_cost = _adjust_cost(local_up, chain_up, ctx.result.up_cost, up_price)
-            new_down_cost = _adjust_cost(local_down, chain_down, ctx.result.down_cost, down_price)
+        new_up_cost = _adjust_cost(local_up, chain_up, ctx.result.up_cost, up_price)
+        new_down_cost = _adjust_cost(local_down, chain_down, ctx.result.down_cost, down_price)
 
-            for side_diff, price in [(up_diff, up_price), (down_diff, down_price)]:
-                if side_diff > threshold:
-                    ctx.result.total_buy_cost += side_diff * price
-                elif side_diff < -threshold:
-                    ctx.result.sell_proceeds += abs(side_diff) * price
-            cost_source = "market-price-estimate"
+        # Keep total_buy_cost and sell_proceeds in sync so PnL stays accurate.
+        for side_diff, price in [(up_diff, up_price), (down_diff, down_price)]:
+            if side_diff > threshold:
+                ctx.result.total_buy_cost += side_diff * price
+            elif side_diff < -threshold:
+                ctx.result.sell_proceeds += abs(side_diff) * price
 
         # Apply to all tracking layers
         ctx.result.up_shares = chain_up
@@ -988,7 +933,7 @@ class TradingRunner:
             pos.down_cost = new_down_cost
 
         logger.info(
-            f"[{slug}] Positions corrected to chain values ({cost_source}): "
+            f"[{slug}] Positions corrected to chain values: "
             f"UP={chain_up:.2f} (cost=${new_up_cost:.2f}), "
             f"DOWN={chain_down:.2f} (cost=${new_down_cost:.2f}), "
             f"total_buy=${ctx.result.total_buy_cost:.2f}, "
