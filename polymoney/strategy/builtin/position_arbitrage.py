@@ -324,7 +324,11 @@ class PositionArbitrageStrategy(BaseStrategy):
         self.directional_recovery_max_ratio = self.params.get("directional_recovery_max_ratio", 1.5)
 
         # Profit-taking sell parameters.
-        self.enable_profit_sell = self.params.get("enable_profit_sell", True)
+        # DISABLED by default: in hedged binary markets, the winning side
+        # settles at $1. Selling it at any price < $1 destroys value vs
+        # simply holding to settlement. Only enable if you explicitly want
+        # early cash-out and accept the settlement loss.
+        self.enable_profit_sell = self.params.get("enable_profit_sell", False)
         self.sell_profit_threshold = self.params.get("sell_profit_threshold", 0.85)
         self.sell_min_phase = self.params.get("sell_min_phase", 2)
         self.sell_discount = self.params.get("sell_discount", 0.005)
@@ -347,7 +351,9 @@ class PositionArbitrageStrategy(BaseStrategy):
         self.enable_sequential_ordering = self.params.get("enable_sequential_ordering", True)
         # Maximum allowed imbalance ratio for secondary-side orders.
         # If (leading_shares - lagging_shares) / leading_shares > this, block secondary.
-        self.sequential_max_gap_ratio = self.params.get("sequential_max_gap_ratio", 0.30)
+        # Tightened from 0.30 → 0.20: in live trading, asymmetric fills are the
+        # primary cause of ECR > 1.0.  A 20% gap limit catches the problem earlier.
+        self.sequential_max_gap_ratio = self.params.get("sequential_max_gap_ratio", 0.20)
 
         # Minimum maker discount: ensure limit prices are at least this %
         # below market to avoid crossing the spread and filling as taker.
@@ -358,6 +364,19 @@ class PositionArbitrageStrategy(BaseStrategy):
         self.max_single_side_exposure = self.params.get(
             "max_single_side_exposure", 0.0
         )  # 0 = disabled; set to e.g. 50 to cap at 50 shares
+
+        # Fill-rate adaptive pricing: track rolling fill counts per side and
+        # skew limit prices so the hard-to-fill side gets tighter limits.
+        # This is the core mechanism against asymmetric fills.
+        self.enable_fill_rate_skew = self.params.get("enable_fill_rate_skew", True)
+        # EMA decay for fill rate tracking (lower = more memory)
+        self._fill_rate_ema_alpha: float = self.params.get("fill_rate_ema_alpha", 0.15)
+        # Maximum limit price adjustment from fill-rate skew (fraction of offset)
+        self.fill_rate_skew_max: float = self.params.get("fill_rate_skew_max", 0.40)
+        self._up_fill_ema: float = 0.5   # starts balanced
+        self._down_fill_ema: float = 0.5
+        self._up_cancel_ema: float = 0.5
+        self._down_cancel_ema: float = 0.5
 
         # Internal position tracking
         self.up_position = InternalPosition()
@@ -390,6 +409,51 @@ class PositionArbitrageStrategy(BaseStrategy):
             max_momentum_threshold=self.max_momentum_threshold,
             trend_stop_threshold=self.trend_stop_threshold,
         )
+
+    def record_fill_event(self, side: str, is_cancelled: bool) -> None:
+        """Update fill-rate EMA based on an order outcome.
+
+        Called by the runner whenever an order fills or gets cancelled.
+        Maintains a per-side exponential moving average that tracks how
+        easily each side is filling, used to skew limit prices.
+        """
+        if not self.enable_fill_rate_skew:
+            return
+        alpha = self._fill_rate_ema_alpha
+        if side == "up":
+            if is_cancelled:
+                self._up_cancel_ema = alpha * 1.0 + (1 - alpha) * self._up_cancel_ema
+                self._up_fill_ema = alpha * 0.0 + (1 - alpha) * self._up_fill_ema
+            else:
+                self._up_fill_ema = alpha * 1.0 + (1 - alpha) * self._up_fill_ema
+                self._up_cancel_ema = alpha * 0.0 + (1 - alpha) * self._up_cancel_ema
+        else:
+            if is_cancelled:
+                self._down_cancel_ema = alpha * 1.0 + (1 - alpha) * self._down_cancel_ema
+                self._down_fill_ema = alpha * 0.0 + (1 - alpha) * self._down_fill_ema
+            else:
+                self._down_fill_ema = alpha * 1.0 + (1 - alpha) * self._down_fill_ema
+                self._down_cancel_ema = alpha * 0.0 + (1 - alpha) * self._down_cancel_ema
+
+    def _get_fill_rate_skew(self) -> float:
+        """Return a skew factor in [-1, +1] based on per-side fill rates.
+
+        Positive = UP is filling more easily than DOWN → push DOWN tighter.
+        Negative = DOWN is filling more easily than UP → push UP tighter.
+        Zero     = balanced fill rates or feature disabled.
+
+        The magnitude is capped at ``fill_rate_skew_max``.
+        """
+        if not self.enable_fill_rate_skew:
+            return 0.0
+        up_rate = self._up_fill_ema
+        down_rate = self._down_fill_ema
+        total = up_rate + down_rate
+        if total < 0.01:
+            return 0.0
+        # Normalised difference: +1 when only UP fills, -1 when only DOWN fills
+        raw_skew = (up_rate - down_rate) / total
+        return max(-self.fill_rate_skew_max, min(self.fill_rate_skew_max, raw_skew))
 
     @property
     def strategy_type(self) -> str:
@@ -884,36 +948,64 @@ class PositionArbitrageStrategy(BaseStrategy):
         
         if has_both_sides and severe_imbalance and self.can_rebalance():
             rebalance_signal = self._generate_rebalancing_order(price_data)
+
+            # Fallback: if buying underweight side was rejected (too expensive),
+            # try selling excess of the overweight side instead.
+            if rebalance_signal is None:
+                rebalance_signal = self._generate_sell_to_rebalance(price_data)
+
             if rebalance_signal:
                 signals.append(rebalance_signal)
                 self._last_rebalancing_time = datetime.now()
                 
-                # Track the rebalancing order in strategy's pending list so that
-                # budget and ECR prediction account for it.  Previously omitted
-                # because market orders always filled immediately; now that we use
-                # aggressive limit orders, the fill may be delayed.
-                rebal_side = "up" if rebalance_signal.token_type == TokenType.YES else "down"
-                rebal_cost = rebalance_signal.size * rebalance_signal.target_price
-                self._order_counter += 1
-                self.pending_orders.append(LimitOrder(
-                    order_id=f"rebal_{rebal_side}_{self._order_counter}",
-                    side=rebal_side,
-                    price=rebalance_signal.target_price,
-                    shares=rebalance_signal.size,
-                    cost=rebal_cost,
-                    created_market_price=(price_data.up_price if rebal_side == "up"
-                                         else price_data.down_price),
-                ))
+                is_sell_rebal = rebalance_signal.side == TradeSide.SELL
+                if is_sell_rebal:
+                    rebal_side = "up" if rebalance_signal.token_type == TokenType.YES else "down"
+                else:
+                    rebal_side = "up" if rebalance_signal.token_type == TokenType.YES else "down"
+                    rebal_cost = rebalance_signal.size * rebalance_signal.target_price
+                    self._order_counter += 1
+                    self.pending_orders.append(LimitOrder(
+                        order_id=f"rebal_{rebal_side}_{self._order_counter}",
+                        side=rebal_side,
+                        price=rebalance_signal.target_price,
+                        shares=rebalance_signal.size,
+                        cost=rebal_cost,
+                        created_market_price=(price_data.up_price if rebal_side == "up"
+                                             else price_data.down_price),
+                    ))
                 
                 # Record rebalancing event
                 self._rebalancing_events.append({
                     "timestamp": datetime.now().isoformat(),
                     "side": rebal_side,
+                    "type": "sell_excess" if is_sell_rebal else "buy_underweight",
                     "size": rebalance_signal.size,
                     "price": rebalance_signal.target_price,
                     "balance_before": self.balance_ratio,
                 })
                 return signals  # Return just the rebalancing order
+
+        # ECR > 1 with any imbalance: sell excess to reduce cost even if
+        # balance_ratio isn't below severe_imbalance_threshold.
+        ecr = self.effective_cost_rate
+        if (has_both_sides and ecr != float("inf") and ecr > 1.0
+                and not severe_imbalance and self.can_rebalance()):
+            sell_rebal = self._generate_sell_to_rebalance(price_data)
+            if sell_rebal:
+                signals.append(sell_rebal)
+                self._last_rebalancing_time = datetime.now()
+                rebal_side = "up" if sell_rebal.token_type == TokenType.YES else "down"
+                self._rebalancing_events.append({
+                    "timestamp": datetime.now().isoformat(),
+                    "side": rebal_side,
+                    "type": "sell_excess_ecr",
+                    "size": sell_rebal.size,
+                    "price": sell_rebal.target_price,
+                    "balance_before": self.balance_ratio,
+                    "ecr": ecr,
+                })
+                return signals
 
         # === Market skew guard ===
         # Prevent new limit orders in extremely skewed markets where one side dominates.
@@ -1113,10 +1205,18 @@ class PositionArbitrageStrategy(BaseStrategy):
             # Sequential ordering gate: block secondary (leading) side when
             # the primary (lagging) side is too far behind.  This prevents
             # one-sided position building from asymmetric fills.
+            #
+            # The gap ratio is tightened dynamically when fill-rate asymmetry
+            # is detected: if one side consistently fails to fill, the gate
+            # closes earlier to prevent further imbalance accumulation.
             if self.enable_sequential_ordering and not secondary_blocked:
+                effective_gap_ratio = self.sequential_max_gap_ratio
+                fill_skew = abs(self._get_fill_rate_skew())
+                if fill_skew > 0.10:
+                    effective_gap_ratio *= max(0.25, 1.0 - fill_skew)
                 leading = max(up_shares_total, down_shares_total)
                 lagging = min(up_shares_total, down_shares_total)
-                if leading > 0 and lagging < leading * (1 - self.sequential_max_gap_ratio):
+                if leading > 0 and lagging < leading * (1 - effective_gap_ratio):
                     secondary_blocked = True
 
             # Per-side exposure cap
@@ -1220,10 +1320,20 @@ class PositionArbitrageStrategy(BaseStrategy):
         total_cost = self.up_position.cost + self.down_position.cost
         max_order_cost = total_cost * self.market_order_size_cap
         
+        # Skip rebalancing when the underweight side is very expensive.
+        # Buying at 0.90+ means max $0.10 profit at settlement — the capital
+        # is better left as cash or used in the next market cycle.
+        rebal_max_price = self.params.get("rebal_max_price", 0.85)
+        if market_price > rebal_max_price:
+            logger.debug(
+                f"[{self.name}] Rebal skip: {underweight_side.upper()} "
+                f"price={market_price:.3f} > max {rebal_max_price} (poor value)"
+            )
+            return None
+
         # Aggressive limit price: 0.2% below market.
         # This keeps us as MAKER (0% fee + 20% daily rebate) while still being
         # close enough to market that the order fills on micro-dips.
-        # Previous approach: market_price * 1.01 (taker, 1.56% fee at 50¢).
         order_price = max(market_price * 0.998, 0.01)
         
         # Calculate order cost and cap if necessary
@@ -1252,6 +1362,92 @@ class PositionArbitrageStrategy(BaseStrategy):
         )
         
         return self._create_signal(underweight_side, order_price, order_cost)
+
+    def _generate_sell_to_rebalance(self, price_data: PriceData) -> Optional[OrderSignal]:
+        """Sell excess shares of the overweight side to restore balance.
+
+        Complements _generate_rebalancing_order (which buys the underweight
+        side).  Selling the overweight side is preferable when:
+        - The underweight side is too expensive to buy (price > rebal_max_price)
+        - ECR > 1 and we need to reduce total cost to improve profitability
+        - The overweight side's unhedged excess is a directional gamble
+
+        Favorable-condition rules:
+        - Losing overweight (price <= 0.50): sell at any positive price —
+          these shares trend toward $0 at settlement.
+        - Winning overweight (price > 0.50): only sell if price > avg_cost,
+          locking in profit on the excess shares.
+        """
+        if not self.enable_rebalancing:
+            return None
+
+        up = self.up_position.shares
+        down = self.down_position.shares
+        if up == 0 and down == 0:
+            return None
+
+        if up > down:
+            overweight_side = "up"
+            overweight_pos = self.up_position
+            market_price = price_data.up_price
+            excess = up - down
+        else:
+            overweight_side = "down"
+            overweight_pos = self.down_position
+            market_price = price_data.down_price
+            excess = down - up
+
+        if excess < self.min_order_shares:
+            return None
+
+        sell_discount = 0.002  # 0.2% below market → maker order
+        sell_price = max(market_price * (1 - sell_discount), 0.01)
+
+        if sell_price < 0.02:
+            return None
+
+        # Favorable-condition gate
+        if market_price > 0.50:
+            # Winning overweight: only sell excess if profitable
+            if sell_price <= overweight_pos.avg_price:
+                logger.debug(
+                    f"[{self.name}] Sell-rebal skip: {overweight_side.upper()} "
+                    f"sell={sell_price:.3f} <= cost={overweight_pos.avg_price:.3f}"
+                )
+                return None
+        # Losing overweight (price <= 0.50): always willing to sell — better than $0
+
+        # Sell at most 50% of excess per cycle to avoid over-correction
+        sell_shares = min(excess * 0.50, excess)
+        sell_shares = max(sell_shares, float(self.min_order_shares))
+        sell_shares = min(sell_shares, excess)
+
+        # Keep at least min_order_shares on the overweight side after selling
+        if overweight_pos.shares - sell_shares < self.min_order_shares:
+            sell_shares = overweight_pos.shares - self.min_order_shares
+            if sell_shares < self.min_order_shares:
+                return None
+
+        token_type = TokenType.YES if overweight_side == "up" else TokenType.NO
+        signal = OrderSignal(
+            side=TradeSide.SELL,
+            token_type=token_type,
+            target_price=sell_price,
+            size=sell_shares,
+        )
+
+        hedged = min(up, down)
+        new_excess = excess - sell_shares
+        new_balance = hedged / (hedged + new_excess) if (hedged + new_excess) > 0 else 1.0
+
+        logger.info(
+            f"[{self.name}] SELL-REBAL: {overweight_side.upper()} "
+            f"{sell_shares:.1f}/{excess:.1f}excess @{sell_price:.3f} "
+            f"(market={market_price:.3f}, cost={overweight_pos.avg_price:.3f}) "
+            f"bal={self.balance_ratio:.0%}→~{new_balance:.0%} "
+            f"ECR={self.effective_cost_rate:.2%}"
+        )
+        return signal
 
     def _generate_sell_signals(self, price_data: PriceData) -> List[OrderSignal]:
         """Generate sell signals to lock in profit before settlement.
@@ -1622,6 +1818,23 @@ class PositionArbitrageStrategy(BaseStrategy):
                     else:
                         down_limit = min(down_price * 0.99, down_limit + (down_price - down_limit) * 0.3)
         
+        # === Fill-rate adaptive skew ===
+        # Redistribute discount between sides based on observed fill rates.
+        # If UP fills easily but DOWN keeps timing out, move DOWN's limit
+        # closer to market (tighter) and UP's limit further (wider).
+        # This keeps the pair sum unchanged while making the hard-to-fill
+        # side more likely to execute.
+        fill_skew = self._get_fill_rate_skew()
+        if abs(fill_skew) > 0.05:
+            up_offset = up_price - up_limit
+            down_offset = down_price - down_limit
+            total_offset = up_offset + down_offset
+            if total_offset > 0.001:
+                # fill_skew > 0 means UP fills more → tighten DOWN
+                shift = total_offset * fill_skew * 0.5
+                up_limit -= shift      # wider (more discount) for easy side
+                down_limit += shift    # tighter (less discount) for hard side
+
         # Safety floor: never go below low_prob_threshold (e.g. 0.05).
         # Orders below this price are not worth placing — tokens at <5% are
         # nearly worthless and carry extreme settlement risk.

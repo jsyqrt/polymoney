@@ -852,6 +852,12 @@ class TradingRunner:
     ) -> None:
         """Process fill events from check_fills."""
         for event in events:
+            # Notify strategy of fill/cancel for fill-rate tracking
+            if hasattr(ctx.strategy, "record_fill_event"):
+                ctx.strategy.record_fill_event(
+                    event.side, event.is_cancelled
+                )
+
             if event.is_cancelled:
                 ctx.remove_pending_order(event.order_id)
                 continue

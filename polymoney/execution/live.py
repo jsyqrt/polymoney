@@ -86,6 +86,12 @@ class LiveExecutor(OrderExecutor):
     - Recently submitted orders polled more frequently (500ms for 5s)
     - Verifies fills via get_trades() for actual execution prices
     - Accepts unverified fills at limit price if trades can't be verified
+    
+    Order lifecycle management:
+    - Timeout: cancels orders after order_timeout seconds (default 30s)
+    - Stale detection: cancels when market moves > stale_order_threshold
+      away from order price (default 20%)
+    - Matches SimulatedExecutor behavior for consistency
     """
 
     def __init__(self, clob_client=None):
@@ -267,6 +273,14 @@ class LiveExecutor(OrderExecutor):
                     )
                     self._update_conditional_allowance(token_id)
 
+        # Polymarket price range: [0.01, 0.99]
+        clamped_price = max(0.01, min(0.99, round(order.price, 2)))
+        if clamped_price != round(order.price, 2):
+            logger.warning(
+                f"Price clamped: {order.price:.6f} → {clamped_price} "
+                f"(Polymarket range [0.01, 0.99])"
+            )
+
         for attempt in range(self._max_retries):
             try:
                 from py_clob_client.clob_types import OrderArgs
@@ -274,7 +288,7 @@ class LiveExecutor(OrderExecutor):
 
                 clob_side = SELL if is_sell else BUY
                 order_args = OrderArgs(
-                    price=order.price,
+                    price=clamped_price,
                     size=actual_size,
                     side=clob_side,
                     token_id=token_id,
@@ -307,7 +321,7 @@ class LiveExecutor(OrderExecutor):
                     market_id=order.market_id,
                     side=order.side,
                     token_id=token_id,
-                    price=order.price,
+                    price=clamped_price,
                     size=actual_size,
                     created_at=time.time(),
                     last_checked=time.time(),
@@ -319,7 +333,7 @@ class LiveExecutor(OrderExecutor):
                 trade_label = "SELL" if is_sell else "BUY"
                 logger.info(
                     f"Live order placed: {order_id} {trade_label} "
-                    f"{order.side.upper()} {actual_size}@{order.price} "
+                    f"{order.side.upper()} {actual_size}@{clamped_price} "
                     f"token={token_id[:16]}... exchange_id={exchange_order_id}"
                 )
 
@@ -417,7 +431,12 @@ class LiveExecutor(OrderExecutor):
         """
         Poll exchange for fill updates on pending orders.
         
-        Two-phase fill detection:
+        Order lifecycle management (matching SimulatedExecutor):
+        1. Timeout: cancel orders older than order_timeout (default 30s)
+        2. Stale detection: cancel when market moves > stale_order_threshold
+        3. Fill detection via get_order() + get_trades() verification
+        
+        Fill detection two-phase:
         1. get_order() detects that size_matched increased (fast, but
            returns the limit price, not the actual fill price).
         2. get_trades() verifies the fill on-chain and returns the real
@@ -443,12 +462,83 @@ class LiveExecutor(OrderExecutor):
             ]
             events.extend(deferred)
 
+        # Get market config for timeout/stale thresholds
+        market_config = self._markets.get(market_id)
+        order_timeout = market_config.order_timeout if market_config else 30.0
+        stale_threshold = (
+            market_config.stale_order_threshold if market_config else 0.20
+        )
+
         for order_id, pending in self._pending.items():
             if pending.market_id != market_id:
                 continue
 
-            # Adaptive polling interval
             age = now - pending.created_at
+            market_price = up_price if pending.side == "up" else down_price
+
+            # --- Timeout check: cancel orders that have been pending too long ---
+            if age > order_timeout and pending.filled_size < 0.01:
+                logger.info(
+                    f"Live order timeout: {order_id} {pending.side.upper()} "
+                    f"@{pending.price:.4f} age={age:.0f}s > {order_timeout:.0f}s "
+                    f"(market={market_price:.4f})"
+                )
+                try:
+                    self._client.cancel(pending.exchange_order_id)
+                except Exception as e:
+                    logger.warning(f"Cancel on timeout failed for {order_id}: {e}")
+                events.append(FillEvent(
+                    order_id=order_id,
+                    market_id=market_id,
+                    side=pending.side,
+                    fill_price=0.0,
+                    fill_size=0.0,
+                    is_cancelled=True,
+                    cancel_reason=f"timeout: {age:.0f}s > {order_timeout:.0f}s",
+                    timestamp=now,
+                ))
+                to_remove.append(order_id)
+                continue
+
+            # --- Stale order check: cancel when market moved too far ---
+            if market_price > 0 and pending.filled_size < 0.01:
+                if pending.is_sell:
+                    price_diff = (
+                        (pending.price - market_price) / market_price
+                    )
+                else:
+                    price_diff = (
+                        (market_price - pending.price) / market_price
+                    )
+                if price_diff > stale_threshold:
+                    logger.info(
+                        f"Live order stale: {order_id} {pending.side.upper()} "
+                        f"@{pending.price:.4f} market={market_price:.4f} "
+                        f"diff={price_diff:.1%} > {stale_threshold:.0%}"
+                    )
+                    try:
+                        self._client.cancel(pending.exchange_order_id)
+                    except Exception as e:
+                        logger.warning(
+                            f"Cancel on stale failed for {order_id}: {e}"
+                        )
+                    events.append(FillEvent(
+                        order_id=order_id,
+                        market_id=market_id,
+                        side=pending.side,
+                        fill_price=0.0,
+                        fill_size=0.0,
+                        is_cancelled=True,
+                        cancel_reason=(
+                            f"stale: market={market_price:.4f}, "
+                            f"diff={price_diff:.1%}"
+                        ),
+                        timestamp=now,
+                    ))
+                    to_remove.append(order_id)
+                    continue
+
+            # Adaptive polling interval
             interval = 0.5 if age < 5.0 else 2.0 if age < 60.0 else 10.0
             if now - pending.last_checked < interval:
                 continue
@@ -519,10 +609,6 @@ class LiveExecutor(OrderExecutor):
                                 f"awaiting trade confirmation"
                             )
                         elif now - pending.unverified_since > _FILL_VERIFY_TIMEOUT:
-                            # get_order() confirms the fill but get_trades()
-                            # cannot verify it.  ACCEPT at limit price —
-                            # get_order() is the source of truth and USDC
-                            # balance changes prove the execution is real.
                             fill_event = self._accept_unverified_fill(
                                 pending, api_filled, now, is_final=True,
                             )
@@ -530,7 +616,6 @@ class LiveExecutor(OrderExecutor):
                             to_remove.append(order_id)
 
                 # Accept fills stuck in unverified state after timeout
-                # Use current api_filled (not stale unverified_fill_size)
                 elif (pending.unverified_since > 0
                       and now - pending.unverified_since > _FILL_VERIFY_TIMEOUT):
                     latest_fill = max(api_filled, pending.unverified_fill_size)
@@ -589,11 +674,15 @@ class LiveExecutor(OrderExecutor):
         pending.filled_size = verified_size
         self._verified_trades[pending.order_id] = verified_size
 
+        if pending.is_sell:
+            improvement = (vwap - pending.price) / pending.price if pending.price > 0 else 0
+        else:
+            improvement = (pending.price - vwap) / pending.price if pending.price > 0 else 0
         logger.info(
             f"Live fill (verified): {pending.order_id} "
+            f"{'SELL' if pending.is_sell else 'BUY'} "
             f"{pending.side.upper()} {new_fill:.2f}@{vwap:.4f} "
-            f"(limit={pending.price:.4f}, improvement="
-            f"{(pending.price - vwap) / pending.price:.1%})"
+            f"(limit={pending.price:.4f}, improvement={improvement:.1%})"
         )
 
         return FillEvent(
@@ -707,6 +796,42 @@ class LiveExecutor(OrderExecutor):
                 "TRADE_STATUS_CONFIRMED", "TRADE_STATUS_MINED", "TRADE_STATUS_MATCHED",
             }
 
+            def _correct_trade_price(
+                api_price: float, limit_price: float, is_sell: bool,
+            ) -> float:
+                """Correct for Polymarket neg_risk complement pricing.
+
+                In neg_risk binary markets, complementary order matching can
+                cause the trade API's ``price`` field to return the complement
+                (1 - actual_cost) instead of the true fill price.
+
+                Detection: for BUY orders the fill price must be <= limit;
+                for SELL orders >= limit.  When the raw API price violates
+                this constraint but ``1 - api_price`` satisfies it, the trade
+                was complement-matched and we use the corrected price.
+
+                If both interpretations satisfy the constraint, we pick the
+                one closest to the limit (most likely correct).
+                """
+                complement = 1.0 - api_price
+                tolerance = 0.02  # 2 cents tolerance for rounding
+
+                if is_sell:
+                    api_ok = api_price >= limit_price - tolerance
+                    comp_ok = complement >= limit_price - tolerance
+                else:
+                    api_ok = api_price <= limit_price + tolerance
+                    comp_ok = complement <= limit_price + tolerance
+
+                if api_ok and not comp_ok:
+                    return api_price
+                if comp_ok and not api_ok:
+                    return complement
+                # Both satisfy or neither — pick closer to limit
+                if abs(api_price - limit_price) <= abs(complement - limit_price):
+                    return api_price
+                return complement
+
             def _match_trades(trades: list) -> Tuple[float, float, List[str]]:
                 """Match our trades, skipping already-claimed ones and capping at order size."""
                 total_size = 0.0
@@ -740,11 +865,22 @@ class LiveExecutor(OrderExecutor):
 
                     try:
                         size = float(trade.get("size", 0))
-                        price = float(trade.get("price", 0))
+                        raw_price = float(trade.get("price", 0))
                     except (ValueError, TypeError):
                         continue
-                    if size <= 0 or price <= 0:
+                    if size <= 0 or raw_price <= 0:
                         continue
+
+                    price = _correct_trade_price(
+                        raw_price, pending.price, pending.is_sell,
+                    )
+                    if abs(price - raw_price) > 0.005:
+                        logger.debug(
+                            f"Complement price correction for {order_id}: "
+                            f"API={raw_price:.4f} → {price:.4f} "
+                            f"(limit={pending.price:.4f}, "
+                            f"sell={pending.is_sell})"
+                        )
 
                     # Cap contribution so total never exceeds ordered amount
                     remaining = max_size - total_size

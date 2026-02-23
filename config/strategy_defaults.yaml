@@ -133,7 +133,10 @@ urgency_pricing:
   urgency_weight: 1.5
 
   # Maximum offset reduction factor from urgency adjustments.
-  urgency_price_factor: 0.5
+  # Reduced from 0.50 → 0.25: at 0.50, limits were pushed so close to market
+  # that even minor fill asymmetry caused ECR > 1.0.  At 0.25, limits stay
+  # further from market, preserving the discount margin needed for profitability.
+  urgency_price_factor: 0.25
 
   # Default market duration in seconds (fallback if settlement time unknown).
   market_duration: 900

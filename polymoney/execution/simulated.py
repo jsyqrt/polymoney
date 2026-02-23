@@ -73,6 +73,15 @@ class MarketState:
     prev_down_price: float = 0.0
     up_price_delta: float = 0.0   # positive = price rising
     down_price_delta: float = 0.0
+    # Trend momentum: exponential moving average of price changes.
+    # Persistent across ticks — captures the structural trend direction
+    # rather than just instantaneous noise.  Used to penalise fills on the
+    # "against trend" side, modeling the real-market observation that limit
+    # orders on the rising side almost never fill while the declining side
+    # fills easily.
+    up_trend_ema: float = 0.0     # positive = UP price trending higher
+    down_trend_ema: float = 0.0   # positive = DOWN price trending higher
+    _ema_alpha: float = 0.15      # smoothing factor (lower = more persistent)
 
 
 class SimulatedExecutor(OrderExecutor):
@@ -277,8 +286,16 @@ class SimulatedExecutor(OrderExecutor):
         # Track price direction for asymmetric fill modeling
         if state.prev_up_price > 0:
             state.up_price_delta = up_price - state.prev_up_price
+            state.up_trend_ema = (
+                state._ema_alpha * state.up_price_delta
+                + (1 - state._ema_alpha) * state.up_trend_ema
+            )
         if state.prev_down_price > 0:
             state.down_price_delta = down_price - state.prev_down_price
+            state.down_trend_ema = (
+                state._ema_alpha * state.down_price_delta
+                + (1 - state._ema_alpha) * state.down_trend_ema
+            )
         state.prev_up_price = up_price
         state.prev_down_price = down_price
 
@@ -724,18 +741,42 @@ class SimulatedExecutor(OrderExecutor):
             )
             fill_probability = min(0.70, base_probability * size_penalty)
 
-            # Directional asymmetry: when the token price is rising, our
-            # buy limit is moving further from market → harder to fill.
-            # When falling, the market is coming toward our limit → easier.
+            # Directional asymmetry — two-layer model:
+            #
+            # Layer 1 (instantaneous): single-tick delta captures sudden moves.
+            # Layer 2 (trend momentum): EMA of deltas captures persistent
+            # directional bias.  In a sustained trend, the trending side's
+            # buy orders almost never fill (market keeps moving away) while
+            # the declining side fills easily (market comes toward limit).
+            #
+            # For BUY orders, positive delta/trend = price rising = hard to
+            # fill.  Negative = price falling toward our limit = easier.
             price_delta = (
                 state.up_price_delta if side == "up" else state.down_price_delta
             )
+            trend_ema = (
+                state.up_trend_ema if side == "up" else state.down_trend_ema
+            )
+
+            # Layer 1: instantaneous tick penalty/bonus (original logic)
             if price_delta > 0.005:
-                # Price rising → penalty (market moving away from our buy)
                 fill_probability *= max(0.15, 1.0 - price_delta * 8.0)
             elif price_delta < -0.005:
-                # Price falling → bonus (market coming toward our buy)
-                fill_probability = min(0.80, fill_probability * (1.0 + abs(price_delta) * 3.0))
+                fill_probability = min(
+                    0.80, fill_probability * (1.0 + abs(price_delta) * 3.0)
+                )
+
+            # Layer 2: persistent trend penalty/bonus
+            # A trend_ema of +0.01 means the price has been rising ~1¢/tick
+            # on average — substantial headwind for a buy limit order.
+            if trend_ema > 0.003:
+                trend_penalty = max(0.10, 1.0 - trend_ema * 15.0)
+                fill_probability *= trend_penalty
+            elif trend_ema < -0.003:
+                trend_bonus = min(
+                    0.85, fill_probability * (1.0 + abs(trend_ema) * 6.0)
+                )
+                fill_probability = trend_bonus
 
             # Liquidity competition penalty
             competition_factor = self._liquidity_tracker.get_competition_factor(
