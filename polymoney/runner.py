@@ -649,10 +649,52 @@ class TradingRunner:
         # Register with fill manager
         self.fill_manager.register_market(slug)
 
+        # Sync initial positions from on-chain balances (live mode only)
+        if self.mode == "live" and hasattr(self.executor, "get_market_balances"):
+            self._sync_initial_positions(ctx)
+
         # Subscribe to WS and fetch initial orderbooks
         await self.data_provider.subscribe_market(slug, market)
 
         logger.info(f"Started market context for {slug} ({event.coin})")
+
+    def _sync_initial_positions(self, ctx: MarketContext) -> None:
+        """Query on-chain token balances and initialize positions.
+
+        Called once when a market context is created in live mode so the
+        strategy starts with accurate share counts instead of zero.
+        """
+        slug = ctx.slug
+        balances = self.executor.get_market_balances(slug)
+        if balances is None:
+            logger.warning(f"Could not query on-chain balances for {slug}")
+            return
+
+        up_shares, down_shares = balances
+        if up_shares < 0.01 and down_shares < 0.01:
+            return
+
+        # Set positions on MarketResult, strategy, and fill manager.
+        # We don't know the original buy price so we use 0 cost — PnL
+        # for inherited positions will be inaccurate, but share counts
+        # (and therefore ECR, balance ratio, order sizing) will be correct.
+        if up_shares >= 0.01:
+            ctx.result.up_shares = up_shares
+            ctx.strategy.up_position.shares = up_shares
+        if down_shares >= 0.01:
+            ctx.result.down_shares = down_shares
+            ctx.strategy.down_position.shares = down_shares
+
+        # Sync fill manager too
+        pos = self.fill_manager.get_position(slug)
+        if pos:
+            pos.up_shares = up_shares
+            pos.down_shares = down_shares
+
+        logger.info(
+            f"[{slug}] Initial position sync from chain: "
+            f"UP={up_shares:.2f}, DOWN={down_shares:.2f}"
+        )
 
     async def _on_price_update(self, slug: str, price: PriceUpdate) -> None:
         """Handle price update — generate signals and submit orders."""
@@ -711,6 +753,53 @@ class TradingRunner:
                 )
                 ctx.remove_pending_order(orphan.order_id)
         ctx.sync_pending_orders()
+
+        # Periodic position reconciliation (every 30s per market)
+        if (
+            self.mode == "live"
+            and hasattr(self.executor, "get_market_balances")
+        ):
+            now = time.time()
+            last_recon = getattr(ctx, "_last_reconcile", 0.0)
+            if now - last_recon > 30.0:
+                ctx._last_reconcile = now
+                self._reconcile_positions(ctx)
+
+    def _reconcile_positions(self, ctx: MarketContext) -> None:
+        """Compare internal positions against on-chain balances and fix drift."""
+        slug = ctx.slug
+        balances = self.executor.get_market_balances(slug)
+        if balances is None:
+            return
+
+        chain_up, chain_down = balances
+        local_up = ctx.result.up_shares
+        local_down = ctx.result.down_shares
+
+        up_diff = chain_up - local_up
+        down_diff = chain_down - local_down
+
+        # Only correct significant drift (> 0.5 shares)
+        threshold = 0.5
+        if abs(up_diff) > threshold or abs(down_diff) > threshold:
+            logger.warning(
+                f"[{slug}] Position drift detected! "
+                f"UP: local={local_up:.2f} chain={chain_up:.2f} diff={up_diff:+.2f} | "
+                f"DOWN: local={local_down:.2f} chain={chain_down:.2f} diff={down_diff:+.2f}"
+            )
+            # Correct positions to match on-chain reality
+            ctx.result.up_shares = chain_up
+            ctx.result.down_shares = chain_down
+            ctx.strategy.up_position.shares = chain_up
+            ctx.strategy.down_position.shares = chain_down
+            pos = self.fill_manager.get_position(slug)
+            if pos:
+                pos.up_shares = chain_up
+                pos.down_shares = chain_down
+            logger.info(
+                f"[{slug}] Positions corrected to chain values: "
+                f"UP={chain_up:.2f}, DOWN={chain_down:.2f}"
+            )
 
     async def _on_orderbook_update(
         self, slug: str, side: str, snapshot: OrderbookSnapshot

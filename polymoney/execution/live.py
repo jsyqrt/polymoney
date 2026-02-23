@@ -1017,6 +1017,26 @@ class LiveExecutor(OrderExecutor):
             f"(up={config.up_token_id[:16]}..., down={config.down_token_id[:16]}...)"
         )
 
+    def get_market_balances(
+        self, market_id: str
+    ) -> Optional[Tuple[float, float]]:
+        """Query actual on-chain token balances for a market.
+
+        Returns (up_shares, down_shares) or None on failure.
+        """
+        config = self._markets.get(market_id)
+        if not config or not self._client:
+            return None
+        try:
+            up_bal = self._get_conditional_balance(config.up_token_id)
+            down_bal = self._get_conditional_balance(config.down_token_id)
+            up_shares = up_bal[0] if up_bal else 0.0
+            down_shares = down_bal[0] if down_bal else 0.0
+            return up_shares, down_shares
+        except Exception as e:
+            logger.warning(f"Failed to query market balances for {market_id}: {e}")
+            return None
+
     def unregister_market(self, market_id: str) -> None:
         """Unregister a market and cancel its orders.
 
