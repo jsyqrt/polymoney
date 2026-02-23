@@ -754,14 +754,14 @@ class TradingRunner:
                 ctx.remove_pending_order(orphan.order_id)
         ctx.sync_pending_orders()
 
-        # Periodic position reconciliation (every 30s per market)
+        # Periodic position reconciliation (every 10s per market)
         if (
             self.mode == "live"
             and hasattr(self.executor, "get_market_balances")
         ):
             now = time.time()
             last_recon = getattr(ctx, "_last_reconcile", 0.0)
-            if now - last_recon > 30.0:
+            if now - last_recon > 10.0:
                 ctx._last_reconcile = now
                 self._reconcile_positions(ctx)
 
