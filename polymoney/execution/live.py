@@ -475,18 +475,26 @@ class LiveExecutor(OrderExecutor):
 
             age = now - pending.created_at
             market_price = up_price if pending.side == "up" else down_price
+            has_partial_fill = pending.filled_size >= 0.01
 
             # --- Timeout check: cancel orders that have been pending too long ---
-            if age > order_timeout and pending.filled_size < 0.01:
+            # Unfilled orders: cancel after order_timeout.
+            # Partially-filled orders: cancel after 2x order_timeout to give
+            # the verification loop time to reconcile, but don't let them
+            # linger forever.
+            effective_timeout = order_timeout if not has_partial_fill else order_timeout * 2
+            if age > effective_timeout:
+                tag = "partial-timeout" if has_partial_fill else "timeout"
                 logger.info(
-                    f"Live order timeout: {order_id} {pending.side.upper()} "
-                    f"@{pending.price:.4f} age={age:.0f}s > {order_timeout:.0f}s "
+                    f"Live order {tag}: {order_id} {pending.side.upper()} "
+                    f"@{pending.price:.4f} age={age:.0f}s > {effective_timeout:.0f}s "
+                    f"filled={pending.filled_size:.2f}/{pending.size:.2f} "
                     f"(market={market_price:.4f})"
                 )
                 try:
                     self._client.cancel(pending.exchange_order_id)
                 except Exception as e:
-                    logger.warning(f"Cancel on timeout failed for {order_id}: {e}")
+                    logger.warning(f"Cancel on {tag} failed for {order_id}: {e}")
                 events.append(FillEvent(
                     order_id=order_id,
                     market_id=market_id,
@@ -494,14 +502,20 @@ class LiveExecutor(OrderExecutor):
                     fill_price=0.0,
                     fill_size=0.0,
                     is_cancelled=True,
-                    cancel_reason=f"timeout: {age:.0f}s > {order_timeout:.0f}s",
+                    cancel_reason=f"{tag}: {age:.0f}s > {effective_timeout:.0f}s",
                     timestamp=now,
                 ))
                 to_remove.append(order_id)
                 continue
 
             # --- Stale order check: cancel when market moved too far ---
-            if market_price > 0 and pending.filled_size < 0.01:
+            # Applies to unfilled orders immediately, and to partially-filled
+            # orders after a grace period (order_timeout) so the fill
+            # verification loop has time to finish.
+            stale_eligible = (
+                not has_partial_fill or age > order_timeout
+            )
+            if market_price > 0 and stale_eligible:
                 if pending.is_sell:
                     price_diff = (
                         (pending.price - market_price) / market_price
@@ -511,16 +525,18 @@ class LiveExecutor(OrderExecutor):
                         (market_price - pending.price) / market_price
                     )
                 if price_diff > stale_threshold:
+                    tag = "partial-stale" if has_partial_fill else "stale"
                     logger.info(
-                        f"Live order stale: {order_id} {pending.side.upper()} "
+                        f"Live order {tag}: {order_id} {pending.side.upper()} "
                         f"@{pending.price:.4f} market={market_price:.4f} "
-                        f"diff={price_diff:.1%} > {stale_threshold:.0%}"
+                        f"diff={price_diff:.1%} > {stale_threshold:.0%} "
+                        f"filled={pending.filled_size:.2f}/{pending.size:.2f}"
                     )
                     try:
                         self._client.cancel(pending.exchange_order_id)
                     except Exception as e:
                         logger.warning(
-                            f"Cancel on stale failed for {order_id}: {e}"
+                            f"Cancel on {tag} failed for {order_id}: {e}"
                         )
                     events.append(FillEvent(
                         order_id=order_id,
@@ -530,7 +546,7 @@ class LiveExecutor(OrderExecutor):
                         fill_size=0.0,
                         is_cancelled=True,
                         cancel_reason=(
-                            f"stale: market={market_price:.4f}, "
+                            f"{tag}: market={market_price:.4f}, "
                             f"diff={price_diff:.1%}"
                         ),
                         timestamp=now,
@@ -1053,6 +1069,15 @@ class LiveExecutor(OrderExecutor):
                 1 for p in self._pending.values() if p.market_id == market_id
             )
         return len(self._pending)
+
+    def get_pending_order_ids(self, market_id: Optional[str] = None) -> set:
+        """Return the set of order IDs currently tracked as pending."""
+        if market_id:
+            return {
+                oid for oid, p in self._pending.items()
+                if p.market_id == market_id
+            }
+        return set(self._pending.keys())
 
     # ------------------------------------------------------------------
     # Private helpers

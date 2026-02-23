@@ -696,7 +696,20 @@ class TradingRunner:
             if fill_events:
                 self._process_fill_events(ctx, fill_events)
 
-        # Clean up strategy pending orders
+        # Clean up strategy pending orders and detect orphans
+        if self.mode == "live" and hasattr(self.executor, "get_pending_order_ids"):
+            live_ids = self.executor.get_pending_order_ids(slug)
+            orphans = [
+                o for o in ctx.strategy.pending_orders
+                if o.order_id not in live_ids
+            ]
+            for orphan in orphans:
+                logger.warning(
+                    f"Removing orphaned pending order: {orphan.order_id} "
+                    f"{orphan.side.upper()} {orphan.shares:.2f}@{orphan.price:.4f} "
+                    f"(no matching executor order)"
+                )
+                ctx.remove_pending_order(orphan.order_id)
         ctx.sync_pending_orders()
 
     async def _on_orderbook_update(
@@ -782,6 +795,25 @@ class TradingRunner:
             signal.side if isinstance(signal.side, str) else signal.side.value
         )
         is_sell = signal_side_str == "sell"
+
+        # Stale pre-check: skip orders that would be immediately stale
+        # to avoid wasteful API round-trips (place → cancel within 1s).
+        if self.mode == "live" and market_price and market_price > 0:
+            stale_threshold = self.config.stale_order_threshold
+            if is_sell:
+                price_diff = (signal.target_price - market_price) / market_price
+            else:
+                price_diff = (market_price - signal.target_price) / market_price
+            if price_diff > stale_threshold:
+                for p in ctx.strategy.pending_orders:
+                    if (
+                        p.side == side
+                        and abs(p.price - signal.target_price) < 0.001
+                        and p.shares > 0
+                    ):
+                        ctx.remove_pending_order(p.order_id)
+                        break
+                return
 
         order = ExecutionOrder(
             market_id=ctx.slug,

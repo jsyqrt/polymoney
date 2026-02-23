@@ -278,8 +278,8 @@ class MarketContext:
                 pending.side == side_str
                 and abs(pending.price - signal.target_price) < 0.001
             ):
-                if self.slug in pending.order_id:
-                    continue  # Already linked
+                if pending.order_id.startswith("live_"):
+                    continue  # Already linked to a live executor order
                 pending.order_id = order_id
                 pending.timestamp = time.time()
                 pending.is_taker = is_taker
