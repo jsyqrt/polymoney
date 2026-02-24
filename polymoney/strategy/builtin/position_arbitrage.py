@@ -2068,23 +2068,24 @@ class PositionArbitrageStrategy(BaseStrategy):
             down_limit *= scale
         
         # === ECR-aware counterpart cap ===
-        # When one side already has fills, cap the OTHER side's limit so that
-        # avg_filled_price + new_limit <= effective_target.  This prevents
-        # the scenario: UP fills at 0.62, then DOWN limit set to 0.40,
-        # giving pair cost = 1.02 (loss).
+        # When EITHER side already has fills, cap the OTHER side's limit so
+        # that avg_filled_price + new_limit <= effective_target.  This prevents
+        # cross-temporal accumulation: UP fills at 0.52 when market is 50/50,
+        # then market trends to 35/65 and DOWN fills at 0.60 → pair cost 1.12.
+        # By capping DOWN at effective_target - 0.52 = 0.44, we ensure ECR
+        # stays below 1.0 regardless of market movement between fills.
         # Exception: directional recovery side is exempt (uses EV-based pricing).
         dr_side = self._directional_recovery_side
-        if self.up_position.shares > 0 and self.down_position.shares > 0:
+        if self.up_position.shares > 0 and dr_side != "down":
             up_avg = self.up_position.avg_price
+            max_down = effective_target - up_avg
+            if max_down > 0.01 and down_limit > max_down:
+                down_limit = max_down
+        if self.down_position.shares > 0 and dr_side != "up":
             down_avg = self.down_position.avg_price
-            if dr_side != "down":
-                max_down = effective_target - up_avg
-                if max_down > 0.01 and down_limit > max_down:
-                    down_limit = max_down
-            if dr_side != "up":
-                max_up = effective_target - down_avg
-                if max_up > 0.01 and up_limit > max_up:
-                    up_limit = max_up
+            max_up = effective_target - down_avg
+            if max_up > 0.01 and up_limit > max_up:
+                up_limit = max_up
         
         # === Directional recovery: aggressive pricing ===
         # When betting on the probable winner, the hedging-based limit price
