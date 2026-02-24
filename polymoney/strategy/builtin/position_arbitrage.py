@@ -1701,7 +1701,7 @@ class PositionArbitrageStrategy(BaseStrategy):
                     )
                     continue
             else:
-                if sell_price <= pos.avg_price:
+                if not hedge_profitable and sell_price <= pos.avg_price:
                     logger.debug(
                         f"[{self.name}] EXIT SKIP: {side.upper()} "
                         f"sell={sell_price:.3f} <= cost={pos.avg_price:.3f}, "
@@ -1719,11 +1719,12 @@ class PositionArbitrageStrategy(BaseStrategy):
                 target_price=sell_price,
                 size=sell_size,
             ))
+            force_tag = " [HEDGE-FORCE]" if hedge_profitable and sell_price <= pos.avg_price else ""
             logger.info(
-                f"[{self.name}] EXIT SELL: {side.upper()} "
+                f"[{self.name}] EXIT SELL{force_tag}: {side.upper()} "
                 f"{sell_size:.1f}/{pos.shares:.1f}sh @{sell_price:.3f} "
                 f"(market={market_price:.3f}, cost={pos.avg_price:.3f}, "
-                f"discount={discount:.1%}, remaining={remaining:.0f}s)"
+                f"ECR={ecr:.4f}, discount={discount:.1%}, remaining={remaining:.0f}s)"
             )
 
         return signals

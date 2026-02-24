@@ -302,6 +302,35 @@ class LiveExecutor(OrderExecutor):
 
                 if not response.get("success", True):
                     error_msg = response.get("errorMsg", "Unknown error")
+
+                    if is_sell and "cross" in error_msg.lower():
+                        logger.warning(
+                            f"SELL order crosses the book — retrying as FOK "
+                            f"(price={clamped_price}, size={actual_size})"
+                        )
+                        signed_order_fok = self._client.create_order(order_args)
+                        response = self._client.post_order(signed_order_fok, "FOK")
+                        if response and isinstance(response, dict) and response.get("success", True):
+                            exchange_order_id = response.get("orderID", "")
+                            if exchange_order_id:
+                                logger.info(
+                                    f"FOK SELL filled: {order_id} "
+                                    f"{order.side.upper()} {actual_size}@{clamped_price} "
+                                    f"exchange_id={exchange_order_id}"
+                                )
+                                return OrderResult(
+                                    status=OrderResultStatus.FILLED,
+                                    order_id=order_id,
+                                    exchange_order_id=exchange_order_id,
+                                    fill_price=clamped_price,
+                                    fill_size=actual_size,
+                                )
+                        fok_err = (
+                            response.get("errorMsg", "Unknown")
+                            if response and isinstance(response, dict) else str(response)
+                        )
+                        logger.warning(f"FOK retry also failed: {fok_err}")
+
                     logger.error(f"Order rejected by exchange: {error_msg}")
                     return OrderResult(
                         status=OrderResultStatus.REJECTED,

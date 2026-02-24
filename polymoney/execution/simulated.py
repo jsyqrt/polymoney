@@ -112,7 +112,17 @@ class SimulatedExecutor(OrderExecutor):
     # ------------------------------------------------------------------
 
     async def submit_order(self, order: ExecutionOrder) -> OrderResult:
-        """Submit a simulated order, attempting immediate fill."""
+        """Submit a simulated order.
+
+        Models real Polymarket GTC behavior:
+        - SELL orders: fill immediately if sell_price <= market (taker)
+        - BUY orders: always go to pending (resting bid on the book)
+
+        In real Polymarket, GTC buy orders sit on the book as maker
+        orders.  They NEVER fill immediately — if the limit price would
+        cross the best ask, the exchange rejects the order.  So the
+        simulation must NOT immediately fill buys either.
+        """
         state = self._markets.get(order.market_id)
         if not state:
             return OrderResult(
@@ -121,7 +131,6 @@ class SimulatedExecutor(OrderExecutor):
                 error=f"Market {order.market_id} not registered",
             )
 
-        # Generate order ID if not provided
         if not order.order_id:
             order.order_id = self._gen_order_id(order.market_id, order.side)
 
@@ -129,54 +138,7 @@ class SimulatedExecutor(OrderExecutor):
         if getattr(order, 'trade_side', 'buy') == 'sell':
             return self._simulate_sell_order(state, order)
 
-        # --- BUY orders: original fill model ---
-        # Attempt immediate fill via depth/spread model
-        fill_result = self._simulate_fill(
-            state, order.side, order.size, order.price, order.price,
-            order.market_id, is_taker=order.is_taker,
-        )
-
-        if fill_result:
-            fill_price, filled_size, _stale = fill_result
-
-            # Fee model: any fill at or above market is effectively taker.
-            is_taker_fill = order.is_taker or order.price >= fill_price
-            if is_taker_fill:
-                filled_size = apply_taker_fee_to_shares(filled_size, fill_price)
-
-            if filled_size >= order.size - 0.01:
-                # Full fill — track for liquidity competition
-                self._liquidity_tracker.record_fill(order.market_id)
-                return OrderResult(
-                    status=OrderResultStatus.FILLED,
-                    order_id=order.order_id,
-                    fill_price=fill_price,
-                    fill_size=filled_size,
-                )
-            else:
-                # Partial fill — add remainder as pending
-                remaining = order.size - filled_size
-                pending = PendingOrder(
-                    order_id=order.order_id,
-                    market_id=order.market_id,
-                    side=order.side,
-                    price=order.price,
-                    size=remaining,
-                    original_size=order.size,
-                    is_taker=order.is_taker,
-                    created_at=time.time(),
-                )
-                state.pending_orders.append(pending)
-
-                return OrderResult(
-                    status=OrderResultStatus.PARTIALLY_FILLED,
-                    order_id=order.order_id,
-                    fill_price=fill_price,
-                    fill_size=filled_size,
-                    pending_size=remaining,
-                )
-
-        # No immediate fill — add to pending
+        # --- BUY orders: GTC maker — always goes on the book ---
         pending = PendingOrder(
             order_id=order.order_id,
             market_id=order.market_id,
@@ -184,7 +146,7 @@ class SimulatedExecutor(OrderExecutor):
             price=order.price,
             size=order.size,
             original_size=order.size,
-            is_taker=order.is_taker,
+            is_taker=False,
             created_at=time.time(),
         )
         state.pending_orders.append(pending)
@@ -302,7 +264,6 @@ class SimulatedExecutor(OrderExecutor):
         events: List[FillEvent] = []
         remaining: List[PendingOrder] = []
         now = time.time()
-        stale_fills_this_tick: Dict[str, int] = {"up": 0, "down": 0}
 
         for order in state.pending_orders:
             market_price = up_price if order.side == "up" else down_price
@@ -327,68 +288,89 @@ class SimulatedExecutor(OrderExecutor):
                     remaining.append(order)
                 continue
 
-            # --- Pending BUY orders: original fill model ---
+            # --- Pending BUY orders: maker fill model ---
+            # GTC buy orders sit on the book as resting bids.  They fill
+            # when the market drops to our level (a taker seller crosses
+            # to hit our bid), NOT by us walking the asks.  This matches
+            # real Polymarket GTC behaviour.
             price_diff = (
                 (market_price - order.price) / market_price
                 if market_price > 0
                 else 0
             )
 
-            # Fill delay — orders need time to attract counterparties
             min_delay = self._get_fill_delay(order.price, market_price)
             if order.age < min_delay:
                 remaining.append(order)
                 continue
 
-            max_stale = 1
-            fill_result = self._simulate_fill(
-                state, order.side, order.size, order.price, market_price,
-                market_id, is_taker=order.is_taker,
-                stale_fills_used=stale_fills_this_tick.get(order.side, 0),
-                max_stale_fills=max_stale,
-            )
+            filled = False
+            fill_price = order.price  # Maker always fills at limit
 
-            if fill_result:
-                fill_price, filled_size, used_stale_model = fill_result
+            if market_price <= order.price:
+                # Market dropped to/below our bid — guaranteed fill.
+                filled = True
+            else:
+                # Market is above our bid — probabilistic fill models
+                # the chance a taker sell sweeps down to our level.
+                spread_tolerance = self._get_effective_spread(state, order.side)
+                if price_diff <= spread_tolerance and spread_tolerance > 0:
+                    proximity = 1.0 - (price_diff / spread_tolerance)
 
-                # Fee model: any fill at or above market price is effectively
-                # a taker fill — apply taker fee regardless of the order flag.
-                is_taker_fill = order.is_taker or order.price >= market_price
-                if is_taker_fill:
-                    filled_size = apply_taker_fee_to_shares(filled_size, fill_price)
+                    # Conservative probability: 5% at spread edge → 35%
+                    # near market.  Much lower than the old 20%-75% range
+                    # to match observed live fill rates.
+                    base_prob = 0.05 + 0.30 * proximity
 
-                if used_stale_model:
-                    stale_fills_this_tick[order.side] = stale_fills_this_tick.get(order.side, 0) + 1
+                    size_penalty = (
+                        1.0
+                        if order.size <= 50
+                        else max(0.5, 1.0 - (order.size - 50) * 0.002)
+                    )
 
-                if filled_size < order.size - 0.01:
-                    events.append(FillEvent(
-                        order_id=order.order_id,
-                        market_id=market_id,
+                    # Directional adjustment: harder to fill when price
+                    # is moving away from our bid.
+                    price_delta = (
+                        state.up_price_delta if order.side == "up"
+                        else state.down_price_delta
+                    )
+                    if price_delta > 0.005:
+                        base_prob *= 0.6   # price rising → harder to buy
+                    elif price_delta < -0.005:
+                        base_prob *= 1.3   # price falling → easier to buy
+
+                    competition = self._liquidity_tracker.get_competition_factor(
+                        market_id
+                    )
+                    fill_prob = min(0.40, base_prob * size_penalty * competition)
+                    filled = random.random() < fill_prob
+
+                    state.fill_tracker.record(
                         side=order.side,
-                        fill_price=fill_price,
-                        fill_size=filled_size,
-                        is_taker=is_taker_fill,
-                        is_partial=True,
-                        remaining_size=order.size - filled_size,
-                        timestamp=now,
-                    ))
-                    order.size -= filled_size
-                    remaining.append(order)
-                else:
-                    events.append(FillEvent(
-                        order_id=order.order_id,
-                        market_id=market_id,
-                        side=order.side,
-                        fill_price=fill_price,
-                        fill_size=filled_size,
-                        is_taker=is_taker_fill,
-                        timestamp=now,
-                    ))
-                    # Track for liquidity competition
-                    self._liquidity_tracker.record_fill(market_id)
+                        limit_price=order.price,
+                        market_price=market_price,
+                        size=order.size,
+                        spread_tolerance=spread_tolerance,
+                        fill_probability=fill_prob,
+                        filled=filled,
+                        fill_source="spread",
+                        slug=market_id,
+                    )
+
+            if filled:
+                # Maker fill: no taker fee (Polymarket maker fee = 0%)
+                events.append(FillEvent(
+                    order_id=order.order_id,
+                    market_id=market_id,
+                    side=order.side,
+                    fill_price=fill_price,
+                    fill_size=order.size,
+                    is_taker=False,
+                    timestamp=now,
+                ))
+                self._liquidity_tracker.record_fill(market_id)
 
             elif price_diff > state.config.stale_order_threshold:
-                # Stale order — market moved too far
                 events.append(FillEvent(
                     order_id=order.order_id,
                     market_id=market_id,
@@ -401,7 +383,6 @@ class SimulatedExecutor(OrderExecutor):
                 ))
 
             elif order.age > state.config.order_timeout:
-                # Timeout
                 events.append(FillEvent(
                     order_id=order.order_id,
                     market_id=market_id,
