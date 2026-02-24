@@ -358,6 +358,14 @@ class PositionArbitrageStrategy(BaseStrategy):
         # Minimum maker discount: ensure limit prices are at least this %
         # below market to avoid crossing the spread and filling as taker.
         self.min_maker_discount = self.params.get("min_maker_discount", 0.015)
+        
+        # Fill urgency mode: use aggressive limit pricing to improve fill rate.
+        # When enabled, limits are set closer to market price (smaller discount),
+        # sacrificing profit margin for faster fills. Important for live trading
+        # where maker orders may not fill if market moves away.
+        self.fill_urgency_mode = self.params.get("fill_urgency_mode", False)
+        # Urgency discount multiplier: 1.0 = normal, 0.5 = half the discount (more aggressive)
+        self.urgency_discount_factor = self.params.get("urgency_discount_factor", 0.5)
 
         # Per-side exposure cap: maximum shares on any single side before
         # the other side must catch up. Expressed as ratio of position_size.
@@ -1945,6 +1953,27 @@ class PositionArbitrageStrategy(BaseStrategy):
                 maker_ceiling_down = down_price * (1 - self.min_maker_discount)
                 if down_limit > maker_ceiling_down:
                     down_limit = maker_ceiling_down
+        
+        # === Fill urgency mode: aggressive pricing for faster fills ===
+        # When enabled, move limit prices closer to market to improve fill rate.
+        # This is important for live trading where maker orders may not fill
+        # if the market moves away from the limit price.
+        # 
+        # Strategy: reduce the discount (distance from market) by the urgency factor.
+        # Example: if limit is 5% below market and urgency_factor=0.5,
+        # new limit is only 2.5% below market.
+        if self.fill_urgency_mode:
+            up_discount = up_price - up_limit
+            down_discount = down_price - down_limit
+            
+            # Reduce discount by urgency factor (0.5 = half the distance to market)
+            up_limit = up_price - up_discount * self.urgency_discount_factor
+            down_limit = down_price - down_discount * self.urgency_discount_factor
+            
+            # Ensure we still have some discount (don't cross to taker)
+            min_discount = 0.005  # 0.5% minimum discount
+            up_limit = min(up_limit, up_price * (1 - min_discount))
+            down_limit = min(down_limit, down_price * (1 - min_discount))
 
         return up_limit, down_limit
 

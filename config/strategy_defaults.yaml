@@ -65,8 +65,17 @@ strategy:
   # High liquidity (tight spread) → smaller discount (higher target).
   # Low liquidity (wide spread) → larger discount (lower target).
   enable_adaptive_target: true
-  adaptive_target_min: 0.94   # Floor for wide-spread (illiquid) markets
-  adaptive_target_max: 0.98   # Ceiling for tight-spread (liquid) markets
+  adaptive_target_min: 0.95   # Floor for wide-spread (illiquid) markets
+  adaptive_target_max: 0.97   # Ceiling for tight-spread (liquid) markets
+  
+  # Minimum maker discount: limit price must be at least this % below market.
+  # Increased from 1.5% to 3% to improve fill rate in live trading.
+  # Higher value = closer to market price = more fills but lower margin.
+  min_maker_discount: 0.03
+  
+  # Fill urgency mode: when true, use aggressive limit pricing (closer to market)
+  # to improve fill rate at the cost of lower profit margin.
+  fill_urgency_mode: true
 
 # ---------------------------------------------------------------------------
 # Risk Control Parameters

@@ -98,6 +98,8 @@ class OrderSignal(BaseModel):
     token_type: TokenType = Field(default=TokenType.YES, description="Token type")
     target_price: float = Field(ge=0, le=1, description="Target limit price")
     size: float = Field(gt=0, description="Order size in shares")
+    order_type: OrderType = Field(default=OrderType.GTC, description="Order type (GTC/FOK/FAK)")
+    is_taker: bool = Field(default=False, description="Whether this is a taker order")
 
     model_config = ConfigDict(use_enum_values=True)
 
