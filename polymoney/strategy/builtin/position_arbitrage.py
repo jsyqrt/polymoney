@@ -357,10 +357,10 @@ class PositionArbitrageStrategy(BaseStrategy):
         # Early abandon for extreme one-sided positions: when ECR is extremely
         # high (>3) with near-zero balance (<0.1), the position is essentially
         # a directional bet. Continuing to place orders wastes capital.
-        # Triggers earlier (30% of market time) than normal abandon (50%).
+        # Triggers earlier (20% of market time) than normal abandon (50%).
         self.early_abandon_ecr_threshold = self.params.get("early_abandon_ecr_threshold", 3.0)
         self.early_abandon_balance_threshold = self.params.get("early_abandon_balance_threshold", 0.10)
-        self.early_abandon_time_threshold = self.params.get("early_abandon_time_threshold", 0.30)
+        self.early_abandon_time_threshold = self.params.get("early_abandon_time_threshold", 0.20)
 
         # Late-game directional signal from Binance price delta.
         # When enabled and Binance delta exceeds threshold in the final
@@ -631,20 +631,38 @@ class PositionArbitrageStrategy(BaseStrategy):
         """
         Hard stop-loss: detect irrecoverable positions early.
         
-        Two tiers:
-        1. Normal abandon: ECR > 1.02, balance < 0.30, past 50% of duration
-        2. Early abandon: ECR > 3.0, balance < 0.10, past 30% of duration
+        Three tiers:
+        1. Pure one-sided: only one side has fills, balance=0.
+           Abandon after 15% of duration — no point waiting, the counterpart
+           cap (1.25) will allow fills up to that ECR, so if it hasn't filled
+           by now the market has moved too far.
+        2. Early abandon: ECR > 3.0, balance < 0.10, past 20% of duration
            (extreme one-sided positions that are essentially directional bets)
+        3. Normal abandon: ECR > 1.02, balance < 0.30, past 50% of duration
         """
         if self._abandon_mode:
+            return True
+
+        up_sh = self.up_position.shares
+        down_sh = self.down_position.shares
+        has_position = up_sh > 0 or down_sh > 0
+
+        if not has_position:
+            return False
+
+        time_urgency = self._calculate_time_urgency()
+        bal = self.balance_ratio
+
+        # Pure one-sided: one side filled, the other is zero.
+        # The relaxed counterpart cap (1.25) gives the other side a chance to
+        # fill, but if it still hasn't after 15% of duration, the market has
+        # moved too far and continuing is a losing bet.
+        if has_position and (up_sh == 0 or down_sh == 0) and time_urgency >= 0.15:
             return True
 
         ecr = self.realized_ecr
         if ecr == float("inf"):
             return False
-
-        time_urgency = self._calculate_time_urgency()
-        bal = self.balance_ratio
 
         # Early abandon: extreme one-sided position, stop wasting capital
         if (ecr > self.early_abandon_ecr_threshold
@@ -659,6 +677,51 @@ class PositionArbitrageStrategy(BaseStrategy):
             return True
 
         return False
+
+    def _generate_abandon_sell_signals(self, price_data: PriceData) -> List[OrderSignal]:
+        """Sell positions when abandon mode triggers.
+
+        For one-sided positions, selling at market immediately is better than
+        holding to settlement (coin flip).  For example, DOWN-only at $0.30
+        market: selling recovers $3.06 guaranteed vs 50% × $5.10 = $2.55 EV
+        from holding.  The earlier we sell, the higher the recovery since the
+        losing side's price decays toward 0 as settlement approaches.
+        """
+        now_ts = time.time()
+        if now_ts - self._last_sell_time < self._sell_cooldown:
+            return []
+
+        signals: List[OrderSignal] = []
+        discount = 0.005
+
+        for side, pos, market_price in [
+            ("up", self.up_position, price_data.up_price),
+            ("down", self.down_position, price_data.down_price),
+        ]:
+            if pos.shares < self.min_order_shares:
+                continue
+            sell_price = max(market_price * (1 - discount), 0.01)
+            if sell_price < 0.02:
+                continue
+            sell_shares = min(pos.shares, pos.shares * 0.5)
+            sell_shares = max(sell_shares, self.min_order_shares)
+            sell_shares = min(sell_shares, pos.shares)
+            token_type = TokenType.YES if side == "up" else TokenType.NO
+            signals.append(OrderSignal(
+                side=TradeSide.SELL,
+                token_type=token_type,
+                target_price=sell_price,
+                size=sell_shares,
+            ))
+            logger.info(
+                f"[{self.name}] ABANDON-SELL: {side.upper()} "
+                f"{sell_shares:.1f}/{pos.shares:.1f}sh @{sell_price:.3f} "
+                f"(market={market_price:.3f})"
+            )
+
+        if signals:
+            self._last_sell_time = now_ts
+        return signals
 
     def _get_directional_signal(self) -> Optional[Tuple[str, float]]:
         """Compute a directional signal from Binance price delta.
@@ -1001,7 +1064,12 @@ class PositionArbitrageStrategy(BaseStrategy):
                     f"up={self.up_position.shares:.1f}@${self.up_position.avg_price:.3f}, "
                     f"down={self.down_position.shares:.1f}@${self.down_position.avg_price:.3f}"
                 )
-            return []
+            # Sell one-sided positions immediately to recover capital.
+            # Holding a one-sided position to settlement is a coin flip:
+            # 50% chance worthless ($0), 50% chance full value ($1).
+            # Selling at current market (e.g. $0.30) recovers a guaranteed
+            # ~60% of cost vs the 50% expected value of holding.
+            return self._generate_abandon_sell_signals(price_data)
 
         # Update trend detector with new prices (time-based)
         if self.enable_trend_detection:
@@ -2068,22 +2136,32 @@ class PositionArbitrageStrategy(BaseStrategy):
             down_limit *= scale
         
         # === ECR-aware counterpart cap ===
-        # When EITHER side already has fills, cap the OTHER side's limit so
-        # that avg_filled_price + new_limit <= effective_target.  This prevents
-        # cross-temporal accumulation: UP fills at 0.52 when market is 50/50,
-        # then market trends to 35/65 and DOWN fills at 0.60 → pair cost 1.12.
-        # By capping DOWN at effective_target - 0.52 = 0.44, we ensure ECR
-        # stays below 1.0 regardless of market movement between fills.
+        # Two tiers based on position state:
+        #
+        # (A) Both sides have fills: strict cap at effective_target.
+        #     Prevents incremental ECR inflation from subsequent fill cycles.
+        #
+        # (B) Only one side has fills: relaxed cap at max_one_side_ecr (1.25).
+        #     A balanced position at ECR 1.25 loses ~$1.28 deterministically.
+        #     A one-sided position loses ~$2.50-4.00 in expectation (50/50 odds)
+        #     or far worse in trending markets (20/80 odds → ~$4.00).
+        #     So allowing a fill at ECR up to 1.25 is strictly better than
+        #     blocking it and ending up one-sided.
+        #
         # Exception: directional recovery side is exempt (uses EV-based pricing).
+        max_one_side_ecr = 1.25
         dr_side = self._directional_recovery_side
-        if self.up_position.shares > 0 and dr_side != "down":
+        has_up = self.up_position.shares > 0
+        has_down = self.down_position.shares > 0
+        cap = effective_target if (has_up and has_down) else max_one_side_ecr
+        if has_up and dr_side != "down":
             up_avg = self.up_position.avg_price
-            max_down = effective_target - up_avg
+            max_down = cap - up_avg
             if max_down > 0.01 and down_limit > max_down:
                 down_limit = max_down
-        if self.down_position.shares > 0 and dr_side != "up":
+        if has_down and dr_side != "up":
             down_avg = self.down_position.avg_price
-            max_up = effective_target - down_avg
+            max_up = cap - down_avg
             if max_up > 0.01 and up_limit > max_up:
                 up_limit = max_up
         
