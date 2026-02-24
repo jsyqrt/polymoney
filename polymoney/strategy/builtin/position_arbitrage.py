@@ -2132,6 +2132,15 @@ class PositionArbitrageStrategy(BaseStrategy):
             up_limit = min(up_limit, up_price * (1 - min_discount))
             down_limit = min(down_limit, down_price * (1 - min_discount))
 
+        # FINAL hard ceiling: post-urgency adjustments (fill_urgency_mode,
+        # directional recovery) can push pair cost above effective_target.
+        # Re-enforce so ECR stays below 1.0 even after sell-to-rebalance.
+        final_pair = up_limit + down_limit
+        if final_pair > effective_target:
+            final_scale = effective_target / final_pair
+            up_limit *= final_scale
+            down_limit *= final_scale
+
         return up_limit, down_limit
 
     # ------------------------------------------------------------------
