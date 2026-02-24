@@ -311,7 +311,7 @@ class PositionArbitrageStrategy(BaseStrategy):
         # are skipped entirely — we accumulate the cheap token and wait for a pullback to
         # buy the expensive side at a better price. This replaces the old approach of
         # refusing to trade in skewed markets entirely.
-        self.trend_patience_threshold = self.params.get("trend_patience_threshold", 0.65)
+        self.trend_patience_threshold = self.params.get("trend_patience_threshold", 0.60)
         self._trend_patience_logged = False  # avoid log spam
         
         # Directional recovery: when ECR > 1.0 and shares are balanced (normal
@@ -353,6 +353,14 @@ class PositionArbitrageStrategy(BaseStrategy):
         self.abandon_time_threshold = self.params.get("abandon_time_threshold", 0.50)
         self._abandon_mode = False
         self._abandon_logged = False
+
+        # Early abandon for extreme one-sided positions: when ECR is extremely
+        # high (>3) with near-zero balance (<0.1), the position is essentially
+        # a directional bet. Continuing to place orders wastes capital.
+        # Triggers earlier (30% of market time) than normal abandon (50%).
+        self.early_abandon_ecr_threshold = self.params.get("early_abandon_ecr_threshold", 3.0)
+        self.early_abandon_balance_threshold = self.params.get("early_abandon_balance_threshold", 0.10)
+        self.early_abandon_time_threshold = self.params.get("early_abandon_time_threshold", 0.30)
 
         # Late-game directional signal from Binance price delta.
         # When enabled and Binance delta exceeds threshold in the final
@@ -623,13 +631,10 @@ class PositionArbitrageStrategy(BaseStrategy):
         """
         Hard stop-loss: detect irrecoverable positions early.
         
-        Returns True when ALL conditions are met:
-        - Realized ECR exceeds abandon threshold (default 1.02)
-        - Position is severely imbalanced (balance_ratio < 0.30)
-        - More than half the market duration has elapsed
-        
-        This prevents the strategy from continuing to chase a losing
-        position where one-sided fills have already locked in losses.
+        Two tiers:
+        1. Normal abandon: ECR > 1.02, balance < 0.30, past 50% of duration
+        2. Early abandon: ECR > 3.0, balance < 0.10, past 30% of duration
+           (extreme one-sided positions that are essentially directional bets)
         """
         if self._abandon_mode:
             return True
@@ -638,17 +643,22 @@ class PositionArbitrageStrategy(BaseStrategy):
         if ecr == float("inf"):
             return False
 
-        if ecr <= self.abandon_ecr_threshold:
-            return False
-
-        if self.balance_ratio >= self.abandon_balance_threshold:
-            return False
-
         time_urgency = self._calculate_time_urgency()
-        if time_urgency < self.abandon_time_threshold:
-            return False
+        bal = self.balance_ratio
 
-        return True
+        # Early abandon: extreme one-sided position, stop wasting capital
+        if (ecr > self.early_abandon_ecr_threshold
+                and bal < self.early_abandon_balance_threshold
+                and time_urgency >= self.early_abandon_time_threshold):
+            return True
+
+        # Normal abandon
+        if (ecr > self.abandon_ecr_threshold
+                and bal < self.abandon_balance_threshold
+                and time_urgency >= self.abandon_time_threshold):
+            return True
+
+        return False
 
     def _get_directional_signal(self) -> Optional[Tuple[str, float]]:
         """Compute a directional signal from Binance price delta.
@@ -981,9 +991,13 @@ class PositionArbitrageStrategy(BaseStrategy):
                 self._abandon_mode = True
                 ecr = self.realized_ecr
                 ecr_str = f"{ecr:.2%}" if ecr != float("inf") else "inf"
+                bal = self.balance_ratio
+                is_early = (ecr > self.early_abandon_ecr_threshold
+                           and bal < self.early_abandon_balance_threshold)
+                tier = "EARLY" if is_early else "NORMAL"
                 logger.warning(
-                    f"[{self.name}] ABANDON: realized ECR={ecr_str}, "
-                    f"balance={self.balance_ratio:.2f}, "
+                    f"[{self.name}] ABANDON({tier}): realized ECR={ecr_str}, "
+                    f"balance={bal:.2f}, "
                     f"up={self.up_position.shares:.1f}@${self.up_position.avg_price:.3f}, "
                     f"down={self.down_position.shares:.1f}@${self.down_position.avg_price:.3f}"
                 )
@@ -1215,14 +1229,14 @@ class PositionArbitrageStrategy(BaseStrategy):
         
         # Limits
         # max_pending_per_side controls how many unfilled orders can exist per side.
-        # Reduced from 3→2 to limit maximum fill asymmetry: with 2 per side,
-        # at most 2 extra fills can accumulate on one side before the other
-        # catches up, keeping ECR drift within ~2%.
-        # Keep low to prevent "initial burst" problem: when REST orderbook data
-        # doesn't match real WS prices, a burst of orders fills one-sided.
-        # With 2, at most 4 orders pending initially — if some fill one-sided,
-        # the damage is limited and recovery is fast.
-        max_pending_per_side = 2
+        # Phase-aware: Phase 1 uses 1 per side to minimize initial burst asymmetry.
+        # In 15-min markets with only 3-4 fills total, an initial burst of 2+2=4
+        # orders where one side fills and the other doesn't creates immediate
+        # one-sided exposure (ECR > 20). With 1 per side in Phase 1, at most
+        # 1 extra fill can accumulate before the other side catches up.
+        # Phase 2+ allows 2 per side for faster position building once initial
+        # balance is established.
+        max_pending_per_side = 1 if phase == 1 else 2
         max_orders_per_tick = self.max_orders_per_tick
         orders_created = 0
         
@@ -1278,8 +1292,26 @@ class PositionArbitrageStrategy(BaseStrategy):
                 if primary_limit < self.low_prob_threshold:
                     break  # Stop if primary side is low probability
             
+            # === Skew-aware cheap-side blocking ===
+            # In a skewed market (max_price > 0.70), the cheap side's limit orders
+            # fill easily while the expensive side never fills, creating one-sided
+            # positions. Block the cheap side unless we already have an imbalance
+            # on the expensive side that needs catching up.
+            cheap_side_blocked = False
+            if max_price > 0.70 and phase <= 2:
+                cheap_side = "down" if price_data.up_price > price_data.down_price else "up"
+                expensive_side = "up" if cheap_side == "down" else "down"
+                cheap_shares = up_shares_total if cheap_side == "up" else down_shares_total
+                expensive_shares = up_shares_total if expensive_side == "up" else down_shares_total
+                # Only block if cheap side is not already lagging
+                if cheap_shares >= expensive_shares:
+                    cheap_side_blocked = True
+
             # Primary side order (lagging side - always try)
             primary_blocked = ecr_recovery_side is not None and primary_side != ecr_recovery_side
+            if cheap_side_blocked and not primary_blocked:
+                if primary_side == cheap_side:
+                    primary_blocked = True
             primary_cost_ratio = up_cost_ratio if primary_side == "up" else down_cost_ratio
             primary_min_cost = min_order_cost_up if primary_side == "up" else min_order_cost_down
             primary_order_budget = max(pair_budget * primary_cost_ratio, primary_min_cost)
@@ -1319,6 +1351,9 @@ class PositionArbitrageStrategy(BaseStrategy):
             
             # Secondary side order (leading side)
             secondary_blocked = ecr_recovery_side is not None and secondary_side != ecr_recovery_side
+            if cheap_side_blocked and not secondary_blocked:
+                if secondary_side == cheap_side:
+                    secondary_blocked = True
             secondary_cost_ratio = up_cost_ratio if secondary_side == "up" else down_cost_ratio
             secondary_min_cost = min_order_cost_up if secondary_side == "up" else min_order_cost_down
             secondary_order_budget = max(pair_budget * secondary_cost_ratio, secondary_min_cost)

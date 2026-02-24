@@ -110,9 +110,10 @@ risk:
   max_skew_threshold: 0.85
 
   # Trend patience threshold: when max(up, down) exceeds this but is below
-  # max_skew_threshold, enter "trend patience" mode — only buy the cheap side
-  # and wait for the expensive side to pull back. This replaces outright rejection.
-  trend_patience_threshold: 0.65
+  # max_skew_threshold, enter "trend patience" mode — asymmetric pricing and
+  # cheap-side blocking to prevent one-sided fill accumulation.
+  # Lowered from 0.65 → 0.60 to activate protection earlier.
+  trend_patience_threshold: 0.60
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +128,12 @@ stop_loss:
 
   # Market must be past this fraction of duration before abandon activates.
   abandon_time_threshold: 0.50
+
+  # Early abandon for extreme one-sided positions.
+  # When ECR is very high with near-zero balance, stop wasting capital earlier.
+  early_abandon_ecr_threshold: 3.0
+  early_abandon_balance_threshold: 0.10
+  early_abandon_time_threshold: 0.30
 
 # ---------------------------------------------------------------------------
 # Trend Detection Parameters
