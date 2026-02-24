@@ -1229,14 +1229,9 @@ class PositionArbitrageStrategy(BaseStrategy):
         
         # Limits
         # max_pending_per_side controls how many unfilled orders can exist per side.
-        # Phase-aware: Phase 1 uses 1 per side to minimize initial burst asymmetry.
-        # In 15-min markets with only 3-4 fills total, an initial burst of 2+2=4
-        # orders where one side fills and the other doesn't creates immediate
-        # one-sided exposure (ECR > 20). With 1 per side in Phase 1, at most
-        # 1 extra fill can accumulate before the other side catches up.
-        # Phase 2+ allows 2 per side for faster position building once initial
-        # balance is established.
-        max_pending_per_side = 1 if phase == 1 else 2
+        # Using 2 per side at all times to maximise fill opportunities — with
+        # only 2 fills per market the ECR never averages below 1.0.
+        max_pending_per_side = 2
         max_orders_per_tick = self.max_orders_per_tick
         orders_created = 0
         
@@ -1292,26 +1287,8 @@ class PositionArbitrageStrategy(BaseStrategy):
                 if primary_limit < self.low_prob_threshold:
                     break  # Stop if primary side is low probability
             
-            # === Skew-aware cheap-side blocking ===
-            # In a skewed market (max_price > 0.70), the cheap side's limit orders
-            # fill easily while the expensive side never fills, creating one-sided
-            # positions. Block the cheap side unless we already have an imbalance
-            # on the expensive side that needs catching up.
-            cheap_side_blocked = False
-            if max_price > 0.70 and phase <= 2:
-                cheap_side = "down" if price_data.up_price > price_data.down_price else "up"
-                expensive_side = "up" if cheap_side == "down" else "down"
-                cheap_shares = up_shares_total if cheap_side == "up" else down_shares_total
-                expensive_shares = up_shares_total if expensive_side == "up" else down_shares_total
-                # Only block if cheap side is not already lagging
-                if cheap_shares >= expensive_shares:
-                    cheap_side_blocked = True
-
             # Primary side order (lagging side - always try)
             primary_blocked = ecr_recovery_side is not None and primary_side != ecr_recovery_side
-            if cheap_side_blocked and not primary_blocked:
-                if primary_side == cheap_side:
-                    primary_blocked = True
             primary_cost_ratio = up_cost_ratio if primary_side == "up" else down_cost_ratio
             primary_min_cost = min_order_cost_up if primary_side == "up" else min_order_cost_down
             primary_order_budget = max(pair_budget * primary_cost_ratio, primary_min_cost)
@@ -1351,9 +1328,6 @@ class PositionArbitrageStrategy(BaseStrategy):
             
             # Secondary side order (leading side)
             secondary_blocked = ecr_recovery_side is not None and secondary_side != ecr_recovery_side
-            if cheap_side_blocked and not secondary_blocked:
-                if secondary_side == cheap_side:
-                    secondary_blocked = True
             secondary_cost_ratio = up_cost_ratio if secondary_side == "up" else down_cost_ratio
             secondary_min_cost = min_order_cost_up if secondary_side == "up" else min_order_cost_down
             secondary_order_budget = max(pair_budget * secondary_cost_ratio, secondary_min_cost)
@@ -1790,6 +1764,14 @@ class PositionArbitrageStrategy(BaseStrategy):
         pair_profitable = combined_price > ecr if ecr != float("inf") else False
 
         late_phase = remaining <= self.exit_hold_winner_seconds
+
+        # For balanced positions, holding to settlement gives a deterministic
+        # outcome: PnL = min(up, down) × $1 - total_cost.  Exit selling the
+        # winning side at market × (1-discount) < $1.00 always produces a
+        # worse result.  Skip exit sell and let redemption handle it.
+        balance = self.balance_ratio
+        if balance > 0.5 and ecr != float("inf") and ecr < 1.15:
+            return signals
 
         # When the hedge is profitable, sell both sides proportionally.
         # This preserves the hedge instead of only selling the winning side.
