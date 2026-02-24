@@ -428,6 +428,13 @@ class SimulationConfig:
     enable_trend_detection: bool = True
     enable_urgency_pricing: bool = True
 
+    # Multi-timeframe: which market durations to scan/trade.
+    # Default ["15m"] for backward compatibility.
+    timeframes: List[str] = field(default_factory=lambda: ["15m"])
+
+    # Binance real-time price feed for directional signal.
+    enable_binance_feed: bool = False
+
     # Simulation parameters
     market_scan_interval: float = 60.0   # 1 minute - HTTP scan for new markets
     metrics_output_interval: float = 1.0  # 1 second

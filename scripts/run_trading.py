@@ -504,6 +504,25 @@ async def cmd_claim(args):
 
 
 # =============================================================================
+# validate-signal (Binance signal validation)
+# =============================================================================
+
+async def cmd_validate_signal(args):
+    """Run Binance signal validation — no trading, only measurement."""
+    from scripts.validate_binance_signal import BinanceSignalValidator, parse_duration as sig_parse_duration
+
+    coins = [c.strip().lower() for c in args.markets.split(",")]
+    duration = sig_parse_duration(args.duration)
+
+    validator = BinanceSignalValidator(
+        coins=coins,
+        timeframe=args.timeframe,
+        output_dir=args.output_dir,
+    )
+    await validator.run(duration)
+
+
+# =============================================================================
 # run (paper / live trading)
 # =============================================================================
 
@@ -512,6 +531,9 @@ async def cmd_run(args, yaml_config):
     mode = "live" if args.live else "paper"
     coins = [c.strip().lower() for c in args.markets.split(",")]
     duration = parse_duration(args.duration)
+
+    timeframes = [t.strip() for t in args.timeframes.split(",")]
+    enable_binance = getattr(args, "enable_binance_feed", False)
 
     if yaml_config:
         config = yaml_config.to_simulation_config(
@@ -528,6 +550,8 @@ async def cmd_run(args, yaml_config):
             market_scan_interval=args.scan_interval,
             min_trading_time=args.min_trading_time,
         )
+        config.timeframes = timeframes
+        config.enable_binance_feed = enable_binance
     else:
         config = SimulationConfig(
             coins=coins,
@@ -544,6 +568,8 @@ async def cmd_run(args, yaml_config):
             market_scan_interval=args.scan_interval,
             metrics_output_interval=1.0,
             min_trading_time=args.min_trading_time,
+            timeframes=timeframes,
+            enable_binance_feed=enable_binance,
         )
 
     label = "LIVE TRADING" if mode == "live" else "PAPER TRADING"
@@ -553,6 +579,7 @@ async def cmd_run(args, yaml_config):
     print(f"  POLYMONEY {label}")
     print("=" * 60)
     print(f"  Coins     : {', '.join(c.upper() for c in coins)}")
+    print(f"  Timeframes: {', '.join(timeframes)}")
     if duration > 0:
         print(f"  Duration  : {duration / 3600:.1f}h")
     else:
@@ -562,6 +589,8 @@ async def cmd_run(args, yaml_config):
     print(f"  Batch     : ${batch_size:.2f} per order")
     print(f"  ECR limit : {args.ecr_threshold}")
     print(f"  Target    : {args.target_cost}")
+    if enable_binance:
+        print(f"  Binance   : ENABLED (directional signal)")
     if mode == "live":
         print()
         print("  *** LIVE — REAL ORDERS ON POLYMARKET CLOB ***")
@@ -627,6 +656,13 @@ def add_run_args(p):
     g.add_argument("--disable-ecr-stoploss", action="store_true")
     g.add_argument("--disable-rebalancing", action="store_true")
     g.add_argument("--disable-trend-detection", action="store_true")
+    g.add_argument("--timeframes", type=str, default="15m",
+                    help="Comma-separated timeframes to trade (default: 15m). "
+                         "Options: 5m,15m,1h,4h")
+    g.add_argument("--enable-binance-feed", action="store_true",
+                    help="Enable Binance real-time price feed for directional signal")
+    g.add_argument("--disable-directional-signal", action="store_true",
+                    help="Disable late-game directional signal even when Binance feed is on")
 
 
 def main():
@@ -639,8 +675,10 @@ Examples:
   python scripts/run_trading.py                            # paper trading
   python scripts/run_trading.py --live                     # live trading
   python scripts/run_trading.py -m btc,eth -d 10h         # custom
+  python scripts/run_trading.py --timeframes 1h,4h         # multi-timeframe
   python scripts/run_trading.py list                       # show markets
   python scripts/run_trading.py backtest --count 5         # backtest
+  python scripts/run_trading.py validate-signal -d 1h      # test Binance signal
   python scripts/run_trading.py claim                      # redeem tokens
   python scripts/run_trading.py claim --dry-run            # check only
 """,
@@ -666,6 +704,21 @@ Examples:
     p_run = sub.add_parser("run", help="Paper or live trading")
     add_run_args(p_run)
 
+    # --- validate-signal ---
+    p_sig = sub.add_parser(
+        "validate-signal",
+        help="Test Binance price signal lead and accuracy (no trading)",
+    )
+    p_sig.add_argument("-m", "--markets", type=str, default="btc,eth,sol",
+                       help="Coins to monitor")
+    p_sig.add_argument("-d", "--duration", type=str, default="30m",
+                       help="Test duration (30m, 2h, 1d)")
+    p_sig.add_argument("--timeframe", type=str, default="15m",
+                       help="Market timeframe (15m, 1h, 4h)")
+    p_sig.add_argument("-o", "--output-dir", type=Path,
+                       default=Path("signal_validation"),
+                       help="Output directory")
+
     # --- claim ---
     p_claim = sub.add_parser("claim", help="Check and redeem unredeemed tokens")
     p_claim.add_argument(
@@ -679,6 +732,7 @@ Examples:
     add_common_args(p_list)
     add_common_args(p_bt)
     add_common_args(p_run)
+    add_common_args(p_sig)
     add_common_args(p_claim)
 
     args = parser.parse_args()
@@ -702,6 +756,8 @@ Examples:
         asyncio.run(cmd_list(args))
     elif args.command == "backtest":
         asyncio.run(cmd_backtest(args, yaml_config))
+    elif args.command == "validate-signal":
+        asyncio.run(cmd_validate_signal(args))
     elif args.command == "claim":
         asyncio.run(cmd_claim(args))
     elif args.command == "run":

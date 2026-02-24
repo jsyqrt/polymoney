@@ -345,6 +345,27 @@ class PositionArbitrageStrategy(BaseStrategy):
         self._exit_logged = False
         self._last_exit_sell_time: float = 0.0
 
+        # Hard stop-loss: abandon market when realized ECR is irrecoverable.
+        # When realized ECR > threshold with severe imbalance past the midpoint
+        # of market duration, stop all activity to limit losses.
+        self.abandon_ecr_threshold = self.params.get("abandon_ecr_threshold", 1.02)
+        self.abandon_balance_threshold = self.params.get("abandon_balance_threshold", 0.30)
+        self.abandon_time_threshold = self.params.get("abandon_time_threshold", 0.50)
+        self._abandon_mode = False
+        self._abandon_logged = False
+
+        # Late-game directional signal from Binance price delta.
+        # When enabled and Binance delta exceeds threshold in the final
+        # portion of market duration, bias limit prices toward predicted
+        # winning side for better fill odds.
+        self.enable_directional_signal = self.params.get("enable_directional_signal", True)
+        self.directional_min_delta = self.params.get("directional_min_delta", 0.003)
+        self.directional_late_game_ratio = self.params.get("directional_late_game_ratio", 0.30)
+        # Injected by runner from BinancePriceFeed
+        self.binance_delta: Optional[float] = None
+        self.binance_price: Optional[float] = None
+        self._directional_signal_logged = False
+
         # Sequential ordering: only place secondary (leading) side when the
         # primary (lagging) side has enough pending or filled shares.
         # This prevents one-sided position building from asymmetric fills.
@@ -546,11 +567,21 @@ class PositionArbitrageStrategy(BaseStrategy):
         
         return total_cost / min_shares
 
+    @property
+    def realized_ecr(self) -> float:
+        """ECR based solely on filled positions — no pending order assumptions."""
+        total_cost = self.up_position.cost + self.down_position.cost
+        min_shares = min(self.up_position.shares, self.down_position.shares)
+        return total_cost / min_shares if min_shares > 0 else float("inf")
+
     def _predict_effective_cost_rate(self, side: str, price: float, order_cost: Optional[float] = None) -> float:
         """
-        Predict effective cost rate after placing an order.
+        Predict effective cost rate after a hypothetical order fills.
         
-        Includes pending orders in calculation for accurate ECR prediction.
+        Uses only realized (filled) positions for share counts. Pending orders
+        contribute to cost exposure but NOT to hedged share count, because
+        live fill rates are much lower than 100% — counting pending shares
+        as filled makes ECR appear artificially healthy.
         
         Args:
             side: Order direction ('up' or 'down')
@@ -564,14 +595,13 @@ class PositionArbitrageStrategy(BaseStrategy):
         if order_cost is None:
             order_cost = self.batch_size
 
-        # Include both filled positions AND pending orders
-        pending_up_shares = sum(o.shares for o in self.pending_orders if o.side == "up")
-        pending_down_shares = sum(o.shares for o in self.pending_orders if o.side == "down")
+        # Only count realized fills — pending orders have uncertain fill rates
+        up = self.up_position.shares
+        down = self.down_position.shares
+        cost = self.up_position.cost + self.down_position.cost
+        # Pending orders are committed capital exposure
         pending_cost = sum(o.cost for o in self.pending_orders)
-        
-        up = self.up_position.shares + pending_up_shares
-        down = self.down_position.shares + pending_down_shares
-        cost = self.up_position.cost + self.down_position.cost + pending_cost
+        cost += pending_cost
 
         # Predict state after this order
         new_shares = order_cost / price
@@ -588,6 +618,70 @@ class PositionArbitrageStrategy(BaseStrategy):
         if new_min <= 0:
             return float("inf")
         return new_cost / new_min
+
+    def _should_abandon_market(self) -> bool:
+        """
+        Hard stop-loss: detect irrecoverable positions early.
+        
+        Returns True when ALL conditions are met:
+        - Realized ECR exceeds abandon threshold (default 1.02)
+        - Position is severely imbalanced (balance_ratio < 0.30)
+        - More than half the market duration has elapsed
+        
+        This prevents the strategy from continuing to chase a losing
+        position where one-sided fills have already locked in losses.
+        """
+        if self._abandon_mode:
+            return True
+
+        ecr = self.realized_ecr
+        if ecr == float("inf"):
+            return False
+
+        if ecr <= self.abandon_ecr_threshold:
+            return False
+
+        if self.balance_ratio >= self.abandon_balance_threshold:
+            return False
+
+        time_urgency = self._calculate_time_urgency()
+        if time_urgency < self.abandon_time_threshold:
+            return False
+
+        return True
+
+    def _get_directional_signal(self) -> Optional[Tuple[str, float]]:
+        """Compute a directional signal from Binance price delta.
+
+        Returns ``("up", confidence)`` or ``("down", confidence)`` when
+        a strong enough signal exists in the late-game portion of the
+        market. Returns ``None`` otherwise.
+
+        Conditions:
+        - Binance delta is available (feed running + epoch recorded)
+        - Market is in late-game (time_remaining < directional_late_game_ratio)
+        - |delta| exceeds ``directional_min_delta``
+
+        Confidence scales from 0 to 1 based on delta magnitude.
+        """
+        if not self.enable_directional_signal:
+            return None
+        if self.binance_delta is None:
+            return None
+
+        time_urgency = self._calculate_time_urgency()
+        # time_urgency is fraction of market elapsed; late-game = high urgency
+        if time_urgency < (1.0 - self.directional_late_game_ratio):
+            return None
+
+        delta = self.binance_delta
+        if abs(delta) < self.directional_min_delta:
+            return None
+
+        # Confidence ramps from 0 at min_delta to 1 at 1% delta
+        confidence = min(1.0, abs(delta) / 0.01)
+        direction = "up" if delta > 0 else "down"
+        return (direction, confidence)
 
     def is_position_imbalanced(self) -> bool:
         """Check if position is severely imbalanced."""
@@ -813,6 +907,11 @@ class PositionArbitrageStrategy(BaseStrategy):
         self._trend_patience_logged = False
         self._exit_mode = False
         self._exit_logged = False
+        self._abandon_mode = False
+        self._abandon_logged = False
+        self.binance_delta = None
+        self.binance_price = None
+        self._directional_signal_logged = False
         self._last_exit_sell_time = 0.0
         self._phase3_tilt_logged = False
         self._directional_recovery_side = None
@@ -875,6 +974,20 @@ class PositionArbitrageStrategy(BaseStrategy):
         # === Pre-settlement exit: sell everything before market closes ===
         if self._is_exit_phase():
             return self._on_exit_phase_tick(price_data)
+
+        # === Hard stop-loss: abandon market if position is irrecoverable ===
+        if self._should_abandon_market():
+            if not self._abandon_mode:
+                self._abandon_mode = True
+                ecr = self.realized_ecr
+                ecr_str = f"{ecr:.2%}" if ecr != float("inf") else "inf"
+                logger.warning(
+                    f"[{self.name}] ABANDON: realized ECR={ecr_str}, "
+                    f"balance={self.balance_ratio:.2f}, "
+                    f"up={self.up_position.shares:.1f}@${self.up_position.avg_price:.3f}, "
+                    f"down={self.down_position.shares:.1f}@${self.down_position.avg_price:.3f}"
+                )
+            return []
 
         # Update trend detector with new prices (time-based)
         if self.enable_trend_detection:
@@ -1895,6 +2008,32 @@ class PositionArbitrageStrategy(BaseStrategy):
                 up_limit -= shift      # wider (more discount) for easy side
                 down_limit += shift    # tighter (less discount) for hard side
 
+        # === Late-game Binance directional bias ===
+        # When Binance price shows a strong directional move in the final
+        # portion of the market, shift the predicted winning side closer
+        # to market (higher fill probability) at the expense of the losing
+        # side.  Pair sum remains <= effective_target (enforced by ceiling).
+        dir_signal = self._get_directional_signal()
+        if dir_signal is not None:
+            signal_dir, signal_conf = dir_signal
+            up_offset = up_price - up_limit
+            down_offset = down_price - down_limit
+            total_off = up_offset + down_offset
+            if total_off > 0.001:
+                shift = total_off * signal_conf * 0.30
+                if signal_dir == "up":
+                    up_limit += shift
+                    down_limit -= shift
+                else:
+                    down_limit += shift
+                    up_limit -= shift
+                if not self._directional_signal_logged:
+                    self._directional_signal_logged = True
+                    logger.info(
+                        f"[{self.name}] Directional signal: {signal_dir} "
+                        f"conf={signal_conf:.2f} delta={self.binance_delta:.4f}"
+                    )
+
         # Safety floor: never go below low_prob_threshold (e.g. 0.05).
         # Orders below this price are not worth placing — tokens at <5% are
         # nearly worthless and carry extreme settlement risk.
@@ -1991,6 +2130,18 @@ class PositionArbitrageStrategy(BaseStrategy):
         """
         if order_cost is None:
             order_cost = self.batch_size
+
+        # --- 0. Abandon mode: no orders at all -----------------------------------
+        if self._abandon_mode:
+            return False
+
+        # --- 0b. Realized ECR hard gate: if filled position is already losing,
+        #     only allow orders on the lagging side (recovery) ----------------
+        recr = self.realized_ecr
+        if recr != float("inf") and recr > self.ecr_threshold:
+            lagging = self.get_lagging_side()
+            if side != lagging and lagging != "balanced":
+                return False
 
         # --- 1. Basic validation ------------------------------------------------
         ok, market_price = self._check_order_basics(side, limit_price, order_cost)

@@ -79,6 +79,7 @@ class MarketEventData:
     settlement_time: Optional[float] = None
     winner: Optional[str] = None  # For MARKET_SETTLED
     min_order_size: Optional[float] = None  # Market-specific minimum order (shares)
+    timeframe: str = "15m"  # Market timeframe: "15m", "1h", "4h"
 
 
 # Type alias for event callbacks
@@ -210,6 +211,16 @@ class RealDataFetcher:
         "eth": "eth-updown-15m",
         "sol": "sol-updown-15m",
     }
+
+    # Timeframe definitions: slug_infix → (interval_seconds, slug_suffix)
+    TIMEFRAMES = {
+        "15m": {"interval": 900,   "slug_infix": "updown-15m"},
+        "1h":  {"interval": 3600,  "slug_infix": "updown-1h"},
+        "4h":  {"interval": 14400, "slug_infix": "updown-4h"},
+    }
+
+    # Coin symbols for all timeframes
+    SUPPORTED_COIN_SYMBOLS = ["btc", "eth", "sol"]
     
     def __init__(
         self,
@@ -522,6 +533,113 @@ class RealDataFetcher:
                 "coin": coin,  # Tag with coin type
             })
         
+        return markets
+
+    async def find_markets_by_timeframe(
+        self,
+        coin: str = "btc",
+        timeframe: str = "1h",
+        count: int = 10,
+        include_active: bool = True,
+        include_closed: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """
+        Find Up/Down markets for a specific coin and timeframe.
+
+        Args:
+            coin: Coin type ("btc", "eth", "sol")
+            timeframe: Market timeframe ("15m", "1h", "4h")
+            count: Number of markets to find
+            include_active: Include active/open markets
+            include_closed: Include closed/settled markets
+
+        Returns:
+            List of market info dicts (same format as find_15min_markets).
+        """
+        coin = coin.lower()
+        if coin not in self.SUPPORTED_COIN_SYMBOLS:
+            raise ValueError(
+                f"Unsupported coin: {coin}. Supported: {self.SUPPORTED_COIN_SYMBOLS}"
+            )
+        if timeframe not in self.TIMEFRAMES:
+            raise ValueError(
+                f"Unsupported timeframe: {timeframe}. Supported: {list(self.TIMEFRAMES.keys())}"
+            )
+
+        tf = self.TIMEFRAMES[timeframe]
+        interval = tf["interval"]
+        slug_prefix = f"{coin}-{tf['slug_infix']}"
+
+        markets: List[Dict[str, Any]] = []
+        now = int(time.time())
+
+        max_lookback = max(100, 25 * 3600 // interval)
+        for i in range(max_lookback):
+            if len(markets) >= count:
+                break
+
+            ts = now - (i * interval)
+            ts = (ts // interval) * interval
+
+            slug = f"{slug_prefix}-{ts}"
+            event = await self.get_event_by_slug(slug)
+
+            if not event:
+                continue
+
+            is_closed = event.get("closed", False)
+            if is_closed and not include_closed:
+                continue
+            if not is_closed and not include_active:
+                continue
+
+            event_markets = event.get("markets", [])
+            if not event_markets:
+                continue
+
+            market = event_markets[0]
+
+            token_ids = market.get("clobTokenIds", [])
+            if isinstance(token_ids, str):
+                token_ids = json.loads(token_ids)
+            outcomes = market.get("outcomes", [])
+            if isinstance(outcomes, str):
+                outcomes = json.loads(outcomes)
+            outcome_prices = market.get("outcomePrices", [])
+            if isinstance(outcome_prices, str):
+                outcome_prices = json.loads(outcome_prices)
+
+            up_token_id = None
+            down_token_id = None
+            winner = None
+
+            for idx, outcome in enumerate(outcomes):
+                if outcome.lower() == "up":
+                    up_token_id = token_ids[idx] if idx < len(token_ids) else None
+                    if outcome_prices and idx < len(outcome_prices):
+                        if outcome_prices[idx] == "1":
+                            winner = "up"
+                elif outcome.lower() == "down":
+                    down_token_id = token_ids[idx] if idx < len(token_ids) else None
+                    if outcome_prices and idx < len(outcome_prices):
+                        if outcome_prices[idx] == "1":
+                            winner = "down"
+
+            markets.append({
+                "slug": slug,
+                "title": event.get("title"),
+                "closed": is_closed,
+                "end_date": event.get("endDate"),
+                "start_time": event.get("startTime"),
+                "condition_id": market.get("conditionId"),
+                "up_token_id": up_token_id,
+                "down_token_id": down_token_id,
+                "winner": winner,
+                "volume": market.get("volume"),
+                "coin": coin,
+                "timeframe": timeframe,
+            })
+
         return markets
 
     async def find_btc_15min_markets(

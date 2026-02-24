@@ -134,6 +134,19 @@ class SimulatedExecutor(OrderExecutor):
         if not order.order_id:
             order.order_id = self._gen_order_id(order.market_id, order.side)
 
+        # Enforce minimum order size (matching Polymarket CLOB constraint)
+        min_shares = getattr(state.config, "min_order_shares", 5.0)
+        if order.size < min_shares:
+            return OrderResult(
+                status=OrderResultStatus.REJECTED,
+                order_id=order.order_id,
+                error=f"Size ({order.size:.1f}) below minimum: {min_shares}",
+            )
+
+        # Apply Polymarket price clamping (matching live executor)
+        clamped_price = max(0.01, min(0.99, round(order.price, 2)))
+        order.price = clamped_price
+
         # --- SELL orders: fill at market bid with high probability ---
         if getattr(order, 'trade_side', 'buy') == 'sell':
             return self._simulate_sell_order(state, order)
@@ -143,7 +156,7 @@ class SimulatedExecutor(OrderExecutor):
             order_id=order.order_id,
             market_id=order.market_id,
             side=order.side,
-            price=order.price,
+            price=clamped_price,
             size=order.size,
             original_size=order.size,
             is_taker=False,
@@ -216,10 +229,16 @@ class SimulatedExecutor(OrderExecutor):
         )
 
     def _taker_fee_rate(self, price: float) -> float:
-        """Polymarket taker fee rate based on trade price."""
+        """Polymarket taker fee rate for 5/15-minute crypto markets.
+
+        Official formula: fee = C * feeRate * (p * (1-p))^exponent
+        For crypto: feeRate=0.25, exponent=2
+        Effective rate per share = 0.25 * (p*(1-p))^2
+        Peaks at 1.5625% at p=0.50.
+        """
         if price <= 0 or price >= 1:
             return 0.0
-        return min(price, 1 - price) * 0.0312
+        return 0.25 * (price * (1 - price)) ** 2
 
     async def cancel_order(self, order_id: str) -> bool:
         """Cancel a pending simulated order."""
@@ -308,8 +327,20 @@ class SimulatedExecutor(OrderExecutor):
             fill_price = order.price  # Maker always fills at limit
 
             if market_price <= order.price:
-                # Market dropped to/below our bid — guaranteed fill.
-                filled = True
+                # Market dropped to/below our bid.  In live markets this
+                # does NOT guarantee a fill — queue position, flash prices,
+                # and latency all reduce actual fill probability.  Use a
+                # high but imperfect probability calibrated from live data.
+                trend_ema = (
+                    state.up_trend_ema if order.side == "up"
+                    else state.down_trend_ema
+                )
+                # If price is trending down through our level (favorable),
+                # higher fill chance. If it merely touched and bounced, lower.
+                if trend_ema < -0.002:
+                    filled = random.random() < 0.85  # strong move through
+                else:
+                    filled = random.random() < 0.60  # touch-and-bounce
             else:
                 # Market is above our bid — probabilistic fill models
                 # the chance a taker sell sweeps down to our level.
@@ -317,32 +348,36 @@ class SimulatedExecutor(OrderExecutor):
                 if price_diff <= spread_tolerance and spread_tolerance > 0:
                     proximity = 1.0 - (price_diff / spread_tolerance)
 
-                    # Conservative probability: 5% at spread edge → 35%
-                    # near market.  Much lower than the old 20%-75% range
-                    # to match observed live fill rates.
-                    base_prob = 0.05 + 0.30 * proximity
+                    # Calibrated from live data: live fill rates are 7-43%
+                    # vs previous simulated 45-72%.  Use much lower base
+                    # probabilities: 2% at spread edge → 15% near market.
+                    base_prob = 0.02 + 0.13 * proximity
 
                     size_penalty = (
                         1.0
-                        if order.size <= 50
-                        else max(0.5, 1.0 - (order.size - 50) * 0.002)
+                        if order.size <= 20
+                        else max(0.3, 1.0 - (order.size - 20) * 0.005)
                     )
 
-                    # Directional adjustment: harder to fill when price
-                    # is moving away from our bid.
-                    price_delta = (
-                        state.up_price_delta if order.side == "up"
-                        else state.down_price_delta
+                    # Directional adjustment using EMA trend (more robust
+                    # than instantaneous delta which is noisy).
+                    trend_ema = (
+                        state.up_trend_ema if order.side == "up"
+                        else state.down_trend_ema
                     )
-                    if price_delta > 0.005:
-                        base_prob *= 0.6   # price rising → harder to buy
-                    elif price_delta < -0.005:
-                        base_prob *= 1.3   # price falling → easier to buy
+                    if trend_ema > 0.003:
+                        base_prob *= 0.4   # sustained rise → very hard to buy
+                    elif trend_ema > 0.001:
+                        base_prob *= 0.7   # mild rise → harder
+                    elif trend_ema < -0.003:
+                        base_prob *= 1.4   # sustained drop → easier to buy
+                    elif trend_ema < -0.001:
+                        base_prob *= 1.2   # mild drop → slightly easier
 
                     competition = self._liquidity_tracker.get_competition_factor(
                         market_id
                     )
-                    fill_prob = min(0.40, base_prob * size_penalty * competition)
+                    fill_prob = min(0.20, base_prob * size_penalty * competition)
                     filled = random.random() < fill_prob
 
                     state.fill_tracker.record(

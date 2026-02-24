@@ -114,6 +114,46 @@ python scripts/run_trading.py -m btc,eth
 python scripts/run_trading.py -m btc,eth,sol
 ```
 
+### 多时间框架（NEW）
+
+```bash
+# 仅交易 15 分钟市场（默认，向后兼容）
+python scripts/run_trading.py
+
+# 交易 1 小时市场（零 taker 手续费）
+python scripts/run_trading.py --timeframes 1h
+
+# 同时交易 15 分钟和 1 小时市场
+python scripts/run_trading.py --timeframes 15m,1h
+
+# 交易所有支持的时间框架
+python scripts/run_trading.py --timeframes 15m,1h,4h
+```
+
+| 时间框架 | 市场时长 | Taker 手续费 | 套利优势 |
+|---------|---------|-------------|---------|
+| `15m` | 15 分钟 | 最高 1.56% | 高频，流动性好 |
+| `1h` | 1 小时 | 0%（零手续费）| 更多时间平衡仓位 |
+| `4h` | 4 小时 | 0%（零手续费）| 最多时间，低频 |
+
+策略参数会根据时间框架自动调整（phase 时长、订单超时等）。
+
+### Binance 价格信号（NEW）
+
+```bash
+# 启用 Binance 实时价格信号
+python scripts/run_trading.py --enable-binance-feed
+
+# 启用 Binance 但禁用方向性信号
+python scripts/run_trading.py --enable-binance-feed --disable-directional-signal
+```
+
+Binance 价格信号在市场后 30% 时间段内激活：
+- 比较 Binance 实时价格与市场开始时的价格
+- 当差值 > 0.3% 时生成方向性信号
+- 将预测赢方的限价调近市价（提高成交率）
+- 仍使用 maker 限价单（0% 手续费）
+
 ### 策略参数
 
 ```bash
@@ -133,6 +173,9 @@ python scripts/run_trading.py \
 | `--disable-ecr-stoploss` | - | 禁用 ECR 止损 |
 | `--disable-rebalancing` | - | 禁用市价单再平衡 |
 | `--disable-trend-detection` | - | 禁用趋势检测 |
+| `--timeframes` | 15m | 交易的时间框架（逗号分隔：15m,1h,4h） |
+| `--enable-binance-feed` | - | 启用 Binance 实时价格信号 |
+| `--disable-directional-signal` | - | 禁用方向性信号 |
 
 ### 其他选项
 
@@ -475,12 +518,16 @@ print(f"Mode: {status['mode']}, PnL: ${status['pnl']:.2f}, Sharpe: {status['shar
 
 | 特性 | 纸上交易 | 实盘交易 |
 |------|---------|---------|
-| 成交模型 | 概率模型（8-55%基础概率）+ 订单簿深度 | 真实 CLOB 挂单撮合 |
-| 订单超时 | 30 秒自动取消 | 30 秒自动取消（已修复） |
-| 陈旧检测 | 市场偏移 >20% 取消 | 市场偏移 >20% 取消（已修复） |
-| 成交对称性 | 双方概率近似均等 | 受市场方向影响，一侧倾向成交 |
-| 手续费 | 模拟 taker 费（最高 1.56%） | 真实 maker 0% / taker 最高 1.56% |
+| 成交模型 | 校准概率（2-15%基础，触价60-85%）+ EMA趋势惩罚 | 真实 CLOB 挂单撮合 |
+| 最小订单 | 强制 min_order_shares=5（匹配 Polymarket） | Polymarket API 强制 |
+| 价格精度 | 自动 clamping 0.01~0.99 + round(2) | Polymarket API 强制 |
+| 订单超时 | 30 秒自动取消 | 30 秒自动取消 |
+| 陈旧检测 | 市场偏移 >20% 取消 | 市场偏移 >20% 取消 |
+| 成交对称性 | EMA 趋势惩罚模拟不对称成交 | 受市场方向影响，一侧倾向成交 |
+| 手续费 | 官方公式 0.25*(p*(1-p))^2（15m/5m），零费（1h/4h） | maker 0% / taker 最高 1.56% |
 | 成交验证 | 即时 | get_order() + get_trades() 双重确认 |
+| ECR 预测 | 仅基于已成交仓位（不含 pending） | 同上 |
+| 硬止损 | 弃市模式（ECR>1.02 + 不平衡 + 过半时间） | 同上 |
 
 **注意：** 纸上交易的盈利能力应被视为策略的**理论上限**，实盘表现通常低于此值。差距主要来源于不对称成交和市场微观结构。
 
@@ -573,4 +620,4 @@ effective_gap_ratio = base_ratio × max(0.25, 1.0 - fill_skew)
 
 ---
 
-*最后更新：2026-02-23*
+*最后更新：2026-02-24*

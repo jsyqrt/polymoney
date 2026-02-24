@@ -116,6 +116,19 @@ risk:
 
 
 # ---------------------------------------------------------------------------
+# Hard Stop-Loss (Abandon) Parameters
+# ---------------------------------------------------------------------------
+stop_loss:
+  # Realized ECR above this threshold triggers abandon evaluation.
+  abandon_ecr_threshold: 1.02
+
+  # Balance ratio below this threshold (with ECR > threshold) triggers abandon.
+  abandon_balance_threshold: 0.30
+
+  # Market must be past this fraction of duration before abandon activates.
+  abandon_time_threshold: 0.50
+
+# ---------------------------------------------------------------------------
 # Trend Detection Parameters
 # ---------------------------------------------------------------------------
 trend_detection:
@@ -191,6 +204,38 @@ simulation:
   # Previous 75% was too restrictive — after any mid-session restart, most active
   # 15-min markets already exceed 75% and the bot sat idle with nothing to trade.
   max_entry_skew: 0.85
+
+# ---------------------------------------------------------------------------
+# Multi-Timeframe Support
+# ---------------------------------------------------------------------------
+# Per-timeframe parameter overrides. The runner detects timeframe from slug
+# and applies corresponding profile.  Keys not present fall through to the
+# base strategy/simulation values above.
+timeframes:
+  15m:
+    phase1_end: 300
+    phase2_end: 600
+    market_duration: 900
+    order_timeout: 30
+    batch_ratio: 0.001
+    min_trading_time: 300
+    stale_order_threshold: 0.20
+  1h:
+    phase1_end: 1200
+    phase2_end: 2400
+    market_duration: 3600
+    order_timeout: 60
+    batch_ratio: 0.0005
+    min_trading_time: 600
+    stale_order_threshold: 0.20
+  4h:
+    phase1_end: 3600
+    phase2_end: 10800
+    market_duration: 14400
+    order_timeout: 120
+    batch_ratio: 0.0003
+    min_trading_time: 1800
+    stale_order_threshold: 0.20
 
 # ---------------------------------------------------------------------------
 # Global Fund Management

@@ -139,6 +139,15 @@ class TradingRunner:
         # CLOB client reference for balance queries (set in _init_clob_client)
         self._clob_client = None
 
+        # Binance real-time price feed for directional signals.
+        # Disabled by default; enable via config.enable_binance_feed = True.
+        self._binance_feed: Optional["BinancePriceFeed"] = None
+        if getattr(config, "enable_binance_feed", False):
+            from polymoney.data.binance_feed import BinancePriceFeed
+            self._binance_feed = BinancePriceFeed(
+                coins=config.coins or ["btc", "eth", "sol"]
+            )
+
         # Available cash tracking: prevents entering markets without sufficient funds.
         # Live mode: fetched from Polymarket API (USDC collateral balance).
         # Paper mode: initialized from config as fallback.
@@ -221,6 +230,10 @@ class TradingRunner:
         # Start data provider
         await self.data_provider.start()
 
+        # Start Binance real-time price feed (if enabled)
+        if self._binance_feed is not None:
+            await self._binance_feed.start()
+
         # Start position redeemer background scan (live mode)
         if self.redeemer is not None:
             await self.redeemer.start_background_scan()
@@ -257,6 +270,10 @@ class TradingRunner:
 
             # Stop kill switch
             await self.kill_switch.stop_monitoring()
+
+            # Stop Binance feed
+            if self._binance_feed is not None:
+                await self._binance_feed.stop()
 
             # Stop data provider
             await self.data_provider.stop()
@@ -551,6 +568,57 @@ class TradingRunner:
         return checks_passed
 
     # ------------------------------------------------------------------
+    # Multi-timeframe support
+    # ------------------------------------------------------------------
+
+    # Default per-timeframe strategy parameter overrides.
+    # Keys must match PositionArbitrageStrategy attribute names.
+    TIMEFRAME_DEFAULTS = {
+        "15m": {
+            "phase1_end": 300,
+            "phase2_end": 600,
+            "market_duration": 900,
+        },
+        "1h": {
+            "phase1_end": 1200,
+            "phase2_end": 2400,
+            "market_duration": 3600,
+        },
+        "4h": {
+            "phase1_end": 3600,
+            "phase2_end": 10800,
+            "market_duration": 14400,
+        },
+    }
+
+    @staticmethod
+    def _parse_epoch_from_slug(slug: str) -> Optional[int]:
+        """Extract the epoch timestamp from a market slug.
+
+        E.g. ``btc-updown-15m-1771224300`` → ``1771224300``.
+        Returns None if the slug doesn't end with a numeric timestamp.
+        """
+        parts = slug.rsplit("-", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            return int(parts[1])
+        return None
+
+    def _get_timeframe_overrides(self, timeframe: str) -> dict:
+        """Return strategy parameter overrides for a given timeframe.
+
+        Merges static defaults with any YAML-configured overrides from
+        ``config.timeframes.<tf>``.
+        """
+        overrides = dict(self.TIMEFRAME_DEFAULTS.get(timeframe, {}))
+
+        # Allow YAML config to override/extend
+        yaml_tf = getattr(self.config, "timeframe_configs", None)
+        if yaml_tf and timeframe in yaml_tf:
+            overrides.update(yaml_tf[timeframe])
+
+        return overrides
+
+    # ------------------------------------------------------------------
     # Data provider callbacks
     # ------------------------------------------------------------------
 
@@ -607,6 +675,9 @@ class TradingRunner:
             )
             return
 
+        # Detect timeframe from event
+        timeframe = getattr(event, "timeframe", "15m") or "15m"
+
         # Create market context
         market = {
             "slug": slug,
@@ -615,8 +686,21 @@ class TradingRunner:
             "up_token_id": event.up_token_id,
             "down_token_id": event.down_token_id,
             "settlement_time": event.settlement_time,
+            "timeframe": timeframe,
         }
         ctx = MarketContext(market, self.config)
+
+        # Apply per-timeframe strategy parameter overrides
+        tf_overrides = self._get_timeframe_overrides(timeframe)
+        if tf_overrides:
+            strategy = ctx.strategy
+            for key, value in tf_overrides.items():
+                if hasattr(strategy, key):
+                    setattr(strategy, key, value)
+            logger.info(
+                f"Applied {timeframe} overrides for {slug}: "
+                + ", ".join(f"{k}={v}" for k, v in tf_overrides.items())
+            )
 
         # Initialize strategy lifecycle
         ctx.strategy.on_market_start(
@@ -627,10 +711,17 @@ class TradingRunner:
                 "condition_id": event.condition_id,
                 "settlement_time": event.settlement_time,
                 "min_order_size": getattr(event, "min_order_size", None),
+                "timeframe": timeframe,
             },
         )
 
         self._contexts[slug] = ctx
+
+        # Record Binance epoch start for directional signal
+        if self._binance_feed is not None:
+            epoch_ts = self._parse_epoch_from_slug(slug)
+            if epoch_ts:
+                self._binance_feed.record_epoch_start(event.coin, epoch_ts)
 
         # Register with data provider
         self.data_provider.register_market(slug, market)
@@ -764,6 +855,15 @@ class TradingRunner:
             self.executor.update_spread(slug, "up", price.spread)
         elif price.token_id == down_token_id:
             self.executor.update_spread(slug, "down", price.spread)
+
+        # Inject Binance delta into strategy for directional signal
+        if self._binance_feed is not None:
+            coin = ctx.market.get("coin", "")
+            epoch_ts = self._parse_epoch_from_slug(slug)
+            if epoch_ts:
+                delta = self._binance_feed.get_epoch_delta(coin, epoch_ts)
+                ctx.strategy.binance_delta = delta
+                ctx.strategy.binance_price = self._binance_feed.get_price(coin)
 
         # Generate order signals from strategy
         signals = ctx.process_price_update(price)

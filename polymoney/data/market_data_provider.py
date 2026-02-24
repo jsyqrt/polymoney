@@ -505,38 +505,47 @@ class MarketDataProvider:
     # ------------------------------------------------------------------
 
     async def _market_scan_loop(self) -> None:
-        """Periodically scan for new markets via HTTP."""
+        """Periodically scan for new markets via HTTP.
+
+        Scans all configured timeframes (15m, 1h, 4h) for each coin.
+        """
+        # Timeframes to scan — configurable, defaults to 15m only for
+        # backward compatibility.  Set config.timeframes = ["15m", "1h", "4h"]
+        # to enable multi-timeframe discovery.
+        scan_timeframes = getattr(self.config, "timeframes", None) or ["15m"]
+
         while self._running:
             try:
                 if not self._fetcher:
                     await asyncio.sleep(self.config.market_scan_interval)
                     continue
 
-                markets_by_coin = await self._fetcher.find_multi_coin_markets(
-                    coins=self.config.coins,
-                    count_per_coin=5,
-                    include_active=True,
-                    include_closed=True,
-                )
+                # Scan 15m markets via existing method
+                if "15m" in scan_timeframes:
+                    markets_by_coin = await self._fetcher.find_multi_coin_markets(
+                        coins=self.config.coins,
+                        count_per_coin=5,
+                        include_active=True,
+                        include_closed=True,
+                    )
+                    await self._process_scanned_markets(markets_by_coin)
 
-                for coin, markets in markets_by_coin.items():
-                    for market in markets:
-                        slug = market.get("slug")
-                        if not slug:
-                            continue
-
-                        is_closed = market.get("closed", False)
-
-                        if is_closed:
-                            # Notify about closed markets
-                            if slug in self._active_markets:
-                                winner = market.get("winner")
-                                if self.on_market_closed:
-                                    await self.on_market_closed(slug, winner)
-                        else:
-                            # Discover new active markets
-                            if slug not in self._active_markets:
-                                await self._discover_market(coin, market)
+                # Scan 1h and 4h markets via new timeframe-aware method
+                for tf in scan_timeframes:
+                    if tf == "15m":
+                        continue
+                    for coin in (self.config.coins or ["btc", "eth", "sol"]):
+                        try:
+                            tf_markets = await self._fetcher.find_markets_by_timeframe(
+                                coin=coin,
+                                timeframe=tf,
+                                count=3,
+                                include_active=True,
+                                include_closed=True,
+                            )
+                            await self._process_scanned_markets({coin: tf_markets})
+                        except Exception as e:
+                            logger.debug(f"Scan {coin}/{tf}: {e}")
 
                 await asyncio.sleep(self.config.market_scan_interval)
 
@@ -545,6 +554,27 @@ class MarketDataProvider:
             except Exception as e:
                 logger.error(f"Error in market scan: {e}")
                 await asyncio.sleep(30)
+
+    async def _process_scanned_markets(
+        self, markets_by_coin: Dict[str, list]
+    ) -> None:
+        """Process scan results: notify closures and discover new markets."""
+        for coin, markets in markets_by_coin.items():
+            for market in markets:
+                slug = market.get("slug")
+                if not slug:
+                    continue
+
+                is_closed = market.get("closed", False)
+
+                if is_closed:
+                    if slug in self._active_markets:
+                        winner = market.get("winner")
+                        if self.on_market_closed:
+                            await self.on_market_closed(slug, winner)
+                else:
+                    if slug not in self._active_markets:
+                        await self._discover_market(coin, market)
 
     async def _discover_market(self, coin: str, market: Dict[str, Any]) -> None:
         """Process a newly discovered market."""
@@ -592,6 +622,18 @@ class MarketDataProvider:
                 self._skipped_markets.add(slug)
             return
 
+        # Detect timeframe from slug or market metadata
+        timeframe = market.get("timeframe", "15m")
+        if not timeframe or timeframe == "15m":
+            if "-updown-1h-" in slug:
+                timeframe = "1h"
+            elif "-updown-4h-" in slug:
+                timeframe = "4h"
+            elif "-updown-15m-" in slug:
+                timeframe = "15m"
+            elif "-updown-5m-" in slug:
+                timeframe = "5m"
+
         # Create event and notify callback
         event = MarketEventData(
             event_type=MarketEvent.MARKET_ACTIVE,
@@ -602,6 +644,7 @@ class MarketDataProvider:
             down_token_id=down_token_id or "",
             timestamp=time.time(),
             settlement_time=settlement_time,
+            timeframe=timeframe,
         )
 
         if self.on_market_discovered:

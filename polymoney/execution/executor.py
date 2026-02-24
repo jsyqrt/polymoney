@@ -108,6 +108,7 @@ class MarketExecutionConfig:
     # Fill simulation parameters (used by SimulatedExecutor)
     order_timeout: float = 30.0
     stale_order_threshold: float = 0.20
+    min_order_shares: float = 5.0       # Polymarket per-market minimum
 
 
 class OrderExecutor(ABC):
