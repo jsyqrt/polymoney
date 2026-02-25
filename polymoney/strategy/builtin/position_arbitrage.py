@@ -654,10 +654,10 @@ class PositionArbitrageStrategy(BaseStrategy):
         bal = self.balance_ratio
 
         # Pure one-sided: one side filled, the other is zero.
-        # The relaxed counterpart cap (1.25) gives the other side a chance to
-        # fill, but if it still hasn't after 15% of duration, the market has
+        # The relaxed counterpart cap (1.10) gives the other side a chance to
+        # fill, but if it still hasn't after 25% of duration, the market has
         # moved too far and continuing is a losing bet.
-        if has_position and (up_sh == 0 or down_sh == 0) and time_urgency >= 0.15:
+        if has_position and (up_sh == 0 or down_sh == 0) and time_urgency >= 0.25:
             return True
 
         ecr = self.realized_ecr
@@ -1149,7 +1149,16 @@ class PositionArbitrageStrategy(BaseStrategy):
         has_both_sides = up_shares > 0 and down_shares > 0
         severe_imbalance = self.balance_ratio < self.severe_imbalance_threshold
         
-        if has_both_sides and severe_imbalance and self.can_rebalance():
+        # DELAY SELL-REBALANCE: Data shows all 3-fill markets have sells and
+        # average -$0.53/market, while 4-fill no-sell markets average +$0.039.
+        # The sell-rebalance after 3 fills locks in ECR > 1.0 and blocks the
+        # 4th fill (strict cap applies once balanced).  Wait until 40% of
+        # market duration to give the 4th fill a chance.  After 40%, the
+        # 4th fill is unlikely and sell-rebalance caps further loss.
+        time_urgency = self._calculate_time_urgency()
+        rebal_allowed = time_urgency >= 0.40
+        
+        if has_both_sides and severe_imbalance and rebal_allowed and self.can_rebalance():
             rebalance_signal = self._generate_rebalancing_order(price_data)
 
             # Fallback: if buying underweight side was rejected (too expensive),
@@ -1191,9 +1200,10 @@ class PositionArbitrageStrategy(BaseStrategy):
 
         # ECR > 1 with any imbalance: sell excess to reduce cost even if
         # balance_ratio isn't below severe_imbalance_threshold.
+        # Same delay applies — give the 4th fill time to arrive.
         ecr = self.effective_cost_rate
         if (has_both_sides and ecr != float("inf") and ecr > 1.0
-                and not severe_imbalance and self.can_rebalance()):
+                and not severe_imbalance and rebal_allowed and self.can_rebalance()):
             sell_rebal = self._generate_sell_to_rebalance(price_data)
             if sell_rebal:
                 signals.append(sell_rebal)
@@ -2136,24 +2146,23 @@ class PositionArbitrageStrategy(BaseStrategy):
             down_limit *= scale
         
         # === ECR-aware counterpart cap ===
-        # Two tiers based on position state:
+        # Balance-aware: use relaxed cap when position is imbalanced to
+        # encourage the 4th fill that completes the hedge.  Switch to strict
+        # cap once balanced (≥85%) to prevent further ECR inflation.
         #
-        # (A) Both sides have fills: strict cap at effective_target.
-        #     Prevents incremental ECR inflation from subsequent fill cycles.
-        #
-        # (B) Only one side has fills: relaxed cap at max_one_side_ecr (1.25).
-        #     A balanced position at ECR 1.25 loses ~$1.28 deterministically.
-        #     A one-sided position loses ~$2.50-4.00 in expectation (50/50 odds)
-        #     or far worse in trending markets (20/80 odds → ~$4.00).
-        #     So allowing a fill at ECR up to 1.25 is strictly better than
-        #     blocking it and ending up one-sided.
+        # Data shows: 4-fill no-sell markets avg +$0.039 (profitable).
+        #             3-fill markets avg -$0.529 (all lose, all have sells).
+        # The strict cap after 3 fills blocks the 4th fill, triggering
+        # sell-rebalance which locks in ECR > 1.0.  The relaxed cap at 1.10
+        # allows the 4th fill while limiting worst-case ECR.
         #
         # Exception: directional recovery side is exempt (uses EV-based pricing).
-        max_one_side_ecr = 1.25
+        max_imbalanced_ecr = 1.10
         dr_side = self._directional_recovery_side
         has_up = self.up_position.shares > 0
         has_down = self.down_position.shares > 0
-        cap = effective_target if (has_up and has_down) else max_one_side_ecr
+        bal = self.balance_ratio
+        cap = effective_target if bal >= 0.85 else max_imbalanced_ecr
         if has_up and dr_side != "down":
             up_avg = self.up_position.avg_price
             max_down = cap - up_avg
