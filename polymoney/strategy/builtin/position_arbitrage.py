@@ -1290,17 +1290,15 @@ class PositionArbitrageStrategy(BaseStrategy):
             self._trend_patience_logged = False
         
         # === HEDGE COMPLETE GATE ===
-        # Data shows 4-fill no-sell markets avg +$0.196 (profitable), while
-        # 6-fill markets avg -$0.202 (extra fills inflated ECR).  Once we
-        # have a profitable balanced hedge, placing more orders only risks
-        # filling at worse prices and pushing ECR above 1.0.
+        # After 4+ balanced fills, stop placing new orders unconditionally.
+        # Data: 4-fill no-sell avg +$0.196, 6-fill avg -$0.202, 7-fill -$0.259.
+        # Extra fills inflate ECR via cross-temporal price drift.  Even when
+        # ECR > target_cost, additional fills rarely improve it — market has
+        # already moved, so new fills lock in the drift rather than fix it.
         total_fills = self.up_position.shares + self.down_position.shares
         if total_fills > 0:
             fills_est = total_fills / max(self.batch_size / 0.50, 1)
-            if (fills_est >= 3.5
-                    and self.balance_ratio >= 0.85
-                    and self.effective_cost_rate < self.target_cost
-                    and self.effective_cost_rate != float("inf")):
+            if fills_est >= 3.5 and self.balance_ratio >= 0.85:
                 return signals
         
         # === LOOP-BASED ORDER CREATION ===
