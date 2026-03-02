@@ -265,9 +265,12 @@ class PositionArbitrageV2(BaseStrategy):
                 self._state = _State.FIRST_FILL
                 self._first_fill_side = "up" if has_up else "down"
                 self._first_fill_time = time.time()
+                other_side = "down" if has_up else "up"
+                self._cancel_pending_side(other_side)
                 logger.info(
                     f"[{self.name}] First fill: {self._first_fill_side.upper()} "
-                    f"shares={up_sh if has_up else down_sh:.1f}"
+                    f"shares={up_sh if has_up else down_sh:.1f} "
+                    f"(cancelled {other_side.upper()} maker)"
                 )
             else:
                 return self._refresh_stale_orders(price_data)
@@ -355,6 +358,7 @@ class PositionArbitrageV2(BaseStrategy):
         pair_cost = maker_avg + taker_effective_price
 
         if pair_cost < self.max_taker_pair_cost:
+            self._cancel_pending_side(other_side)
             taker_limit = min(other_price + self.taker_slippage_buffer, 0.99)
             token_type = TokenType.YES if other_side == "up" else TokenType.NO
             signal = OrderSignal(
@@ -417,6 +421,18 @@ class PositionArbitrageV2(BaseStrategy):
     # ------------------------------------------------------------------
     # Order management
     # ------------------------------------------------------------------
+
+    def _cancel_pending_side(self, side: str) -> None:
+        """Remove all pending orders on a given side to prevent double fills."""
+        before = len(self.pending_orders)
+        self.pending_orders = [
+            o for o in self.pending_orders if o.side != side
+        ]
+        removed = before - len(self.pending_orders)
+        if removed > 0:
+            logger.info(
+                f"[{self.name}] Cancelled {removed} pending {side.upper()} maker(s)"
+            )
 
     def _add_pending(
         self, side: str, price: float, shares: float, market_price: float
