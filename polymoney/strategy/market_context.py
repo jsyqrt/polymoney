@@ -25,10 +25,7 @@ from polymoney.strategy.builtin.position_arbitrage import (
     LimitOrder,
     PositionArbitrageStrategy,
 )
-from polymoney.strategy.builtin.position_arbitrage_v2 import (
-    LimitOrder as LimitOrderV2,
-    PositionArbitrageV2,
-)
+from polymoney.strategy.builtin.position_arbitrage_v2 import PositionArbitrageV2
 
 logger = get_logger("strategy.market_context")
 

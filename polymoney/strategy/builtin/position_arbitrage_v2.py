@@ -27,40 +27,15 @@ from polymoney.core.models import (
     TokenType, TradeSide,
 )
 from polymoney.core.strategy import BaseStrategy, register_strategy
+from polymoney.strategy.builtin.position_arbitrage import (
+    InternalPosition,
+    LimitOrder,
+)
 
 logger = get_logger("strategy.position_arbitrage_v2")
 
 
-@dataclass
-class InternalPosition:
-    shares: float = 0.0
-    cost: float = 0.0
-
-    @property
-    def avg_price(self) -> float:
-        return self.cost / self.shares if self.shares > 0 else 0.0
-
-    def add(self, shares: float, price: float):
-        self.shares += shares
-        self.cost += shares * price
-
-    def reset(self):
-        self.shares = 0.0
-        self.cost = 0.0
-
-
-@dataclass
-class LimitOrder:
-    order_id: str = ""
-    side: str = ""
-    price: float = 0.0
-    shares: float = 0.0
-    status: str = "pending"
-    created_at: float = 0.0
-
-
 class _State:
-    """Strategy state machine states."""
     IDLE = "idle"
     PROBING = "probing"
     FIRST_FILL = "first_fill"
@@ -143,7 +118,6 @@ class PositionArbitrageV2(BaseStrategy):
         self.binance_price: Optional[float] = None
 
     def reset(self):
-        """Reset for a new market."""
         self.up_position.reset()
         self.down_position.reset()
         self.pending_orders.clear()
@@ -238,11 +212,19 @@ class PositionArbitrageV2(BaseStrategy):
         }
 
     # ------------------------------------------------------------------
-    # Optional callbacks used by the runner
+    # Runner compatibility methods
     # ------------------------------------------------------------------
 
+    def update_spread_info(self, up_spread: float, down_spread: float) -> None:
+        """Called by MarketContext to feed orderbook spread data."""
+        if up_spread > 0:
+            self._last_up_spread = up_spread
+        if down_spread > 0:
+            self._last_down_spread = down_spread
+
     def record_fill_event(self, side: str, is_cancelled: bool) -> None:
-        pass  # V2 doesn't use fill-rate EMAs
+        """Called by runner on fill/cancel events. V2 doesn't use EMAs."""
+        pass
 
     # ------------------------------------------------------------------
     # Core logic
@@ -333,18 +315,23 @@ class PositionArbitrageV2(BaseStrategy):
         order_shares = max(self.min_order_shares, self.batch_size / max(up_limit, 0.01))
 
         signals = []
-        for side, limit_price in [("up", up_limit), ("down", down_limit)]:
+        for side, limit_price, mkt_price in [
+            ("up", up_limit, up_price),
+            ("down", down_limit, down_price),
+        ]:
             if limit_price < self.low_prob_threshold:
                 continue
             token_type = TokenType.YES if side == "up" else TokenType.NO
-            signals.append(OrderSignal(
+            sig = OrderSignal(
                 side=TradeSide.BUY,
                 token_type=token_type,
                 target_price=round(limit_price, 4),
                 size=round(order_shares, 1),
                 order_type=OrderType.GTC,
                 is_taker=False,
-            ))
+            )
+            signals.append(sig)
+            self._add_pending(side, round(limit_price, 4), round(order_shares, 1), mkt_price)
 
         if signals:
             self._state = _State.PROBING
@@ -368,10 +355,7 @@ class PositionArbitrageV2(BaseStrategy):
         pair_cost = maker_avg + taker_effective_price
 
         if pair_cost < self.max_taker_pair_cost:
-            taker_limit = min(
-                other_price + self.taker_slippage_buffer,
-                0.99,
-            )
+            taker_limit = min(other_price + self.taker_slippage_buffer, 0.99)
             token_type = TokenType.YES if other_side == "up" else TokenType.NO
             signal = OrderSignal(
                 side=TradeSide.BUY,
@@ -381,6 +365,7 @@ class PositionArbitrageV2(BaseStrategy):
                 order_type=OrderType.FOK,
                 is_taker=True,
             )
+            self._add_pending(other_side, round(taker_limit, 4), round(filled_pos.shares, 1), other_price)
             self._state = _State.TAKER_SENT
             self._taker_attempt_time = time.time()
             logger.info(
@@ -417,6 +402,7 @@ class PositionArbitrageV2(BaseStrategy):
             target_price=round(sell_price, 4),
             size=round(filled_pos.shares, 1),
         )
+        self._add_pending(filled_side, round(sell_price, 4), round(filled_pos.shares, 1), market_price)
         self._scratch_sent = True
         self._state = _State.SCRATCHED
 
@@ -429,12 +415,31 @@ class PositionArbitrageV2(BaseStrategy):
         return [signal]
 
     # ------------------------------------------------------------------
-    # Order helpers
+    # Order management
     # ------------------------------------------------------------------
 
+    def _add_pending(
+        self, side: str, price: float, shares: float, market_price: float
+    ) -> None:
+        """Create a LimitOrder in pending_orders (required by runner/context)."""
+        order = LimitOrder(
+            order_id=f"{self.name}_{side}_{time.time():.0f}",
+            side=side,
+            price=price,
+            shares=shares,
+            cost=shares * price,
+            status="pending",
+            created_at=datetime.now(),
+            created_market_price=market_price,
+            timestamp=time.time(),
+        )
+        self.pending_orders.append(order)
+
     def _refresh_stale_orders(self, price_data: PriceData) -> List[OrderSignal]:
-        """Cancel stale orders and re-place with updated limits."""
-        if not self.pending_orders:
+        """Re-enter if all pending orders were cancelled by the runner."""
+        has_active = any(o.status == "pending" for o in self.pending_orders)
+        if not has_active:
+            self._state = _State.IDLE
             return self._enter_market(price_data)
         return []
 
@@ -463,20 +468,19 @@ class PositionArbitrageV2(BaseStrategy):
         )
         other_limit = max(other_limit, self.low_prob_threshold)
 
-        order_shares = max(
-            self.min_order_shares,
-            filled_pos.shares,
-        )
+        order_shares = max(self.min_order_shares, filled_pos.shares)
 
         token_type = TokenType.YES if other_side == "up" else TokenType.NO
-        return [OrderSignal(
+        sig = OrderSignal(
             side=TradeSide.BUY,
             token_type=token_type,
             target_price=round(other_limit, 4),
             size=round(order_shares, 1),
             order_type=OrderType.GTC,
             is_taker=False,
-        )]
+        )
+        self._add_pending(other_side, round(other_limit, 4), round(order_shares, 1), other_price)
+        return [sig]
 
     # ------------------------------------------------------------------
     # Pricing
@@ -488,7 +492,6 @@ class PositionArbitrageV2(BaseStrategy):
         down_price: float,
         effective_target: float,
     ) -> Tuple[float, float]:
-        """Proportional scaling with min maker discount."""
         price_sum = up_price + down_price
         if price_sum <= effective_target:
             return up_price, down_price
