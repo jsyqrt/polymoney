@@ -458,6 +458,9 @@ class SimulationConfig:
     # 0 = instant (unrealistic), 60 = typical real-world latency.
     redemption_delay: float = 60.0
 
+    # Strategy version: "v1" (maker-only) or "v2" (taker-hybrid).
+    strategy_version: str = "v1"
+
     @classmethod
     def parse_duration(cls, duration_str: str) -> float:
         """

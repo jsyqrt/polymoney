@@ -255,6 +255,37 @@ class PositionArbitrageStrategy(BaseStrategy):
             self.batch_size = explicit_batch
         else:
             self.batch_size = max(position_size * self.batch_ratio, 0.10)
+
+        # Base sizing (used for dynamic scaling)
+        self._base_position_size = position_size
+        self._base_batch_size = self.batch_size
+        self._explicit_batch_size = explicit_batch
+
+        # Dynamic position sizing: scale exposure based on spread + trend risk
+        self.enable_dynamic_size = self.params.get("enable_dynamic_size", True)
+        self.dynamic_size_min = self.params.get("dynamic_size_min", 0.60)
+        self.dynamic_size_max = self.params.get("dynamic_size_max", 1.20)
+        self.dynamic_size_spread_low = self.params.get("dynamic_size_spread_low", 0.01)
+        self.dynamic_size_spread_high = self.params.get("dynamic_size_spread_high", 0.05)
+        self.dynamic_size_trend_penalty = self.params.get("dynamic_size_trend_penalty", 0.70)
+        self.dynamic_size_phase3_penalty = self.params.get("dynamic_size_phase3_penalty", 0.80)
+        self.dynamic_size_smoothing = self.params.get("dynamic_size_smoothing", 0.30)
+        self.dynamic_size_floor = self.params.get("dynamic_size_floor", self._base_batch_size * 4)
+        self.dynamic_batch_scale = self.params.get(
+            "dynamic_batch_scale", explicit_batch is None
+        )
+        self._dynamic_multiplier = 1.0
+        self._effective_position_size = self._base_position_size
+        self._effective_batch_size = self._base_batch_size
+
+        # Tranche sizing: expand exposure only after prior tranche is hedged
+        self.enable_tranches = self.params.get("enable_tranches", True)
+        self.tranche_ratio = self.params.get("tranche_ratio", 0.25)
+        self.tranche_min_size = self.params.get("tranche_min_size", 20.0)
+        self.tranche_unlock_balance = self.params.get("tranche_unlock_balance", 0.85)
+        self.tranche_unlock_ecr = self.params.get("tranche_unlock_ecr", 1.00)
+        self._active_tranches = 1
+        self._tranche_cap = self._base_position_size
         
         # Minimum order size in shares.  Polymarket CLOB enforces a per-market
         # minimum (typically 5-15 shares).  Default 5 matches the common floor.
@@ -267,7 +298,7 @@ class PositionArbitrageStrategy(BaseStrategy):
         self.low_prob_threshold = self.params.get("low_prob_threshold", 0.05)
         
         # Risk control parameters
-        self.ecr_threshold = self.params.get("ecr_threshold", 1.05)  # 105%
+        self.ecr_threshold = self.params.get("ecr_threshold", 1.01)  # 101%
         self.balance_threshold = self.params.get("balance_threshold", 0.70)
         self.enable_ecr_stoploss = self.params.get("enable_ecr_stoploss", True)
         self.enable_rebalancing = self.params.get("enable_rebalancing", True)  # Changed default to True
@@ -601,7 +632,7 @@ class PositionArbitrageStrategy(BaseStrategy):
             Returns float('inf') if no hedged position would exist.
         """
         if order_cost is None:
-            order_cost = self.batch_size
+            order_cost = getattr(self, "_effective_batch_size", self.batch_size)
 
         # Only count realized fills — pending orders have uncertain fill rates
         up = self.up_position.shares
@@ -653,12 +684,17 @@ class PositionArbitrageStrategy(BaseStrategy):
         time_urgency = self._calculate_time_urgency()
         bal = self.balance_ratio
 
-        # Pure one-sided: one side filled, the other is zero.
-        # The relaxed counterpart cap (1.10) gives the other side a chance to
-        # fill, but if it still hasn't after 25% of duration, the market has
-        # moved too far and continuing is a losing bet.
-        if has_position and (up_sh == 0 or down_sh == 0) and time_urgency >= 0.25:
-            return True
+        # Pure one-sided with LARGE position: abandon early.
+        # Only trigger for positions > 1 pair ($5+) where the capital at risk
+        # is significant. Small one-sided positions (1 fill, ~$2.50) have
+        # approximately neutral EV when held to settlement — the limit
+        # discount exactly offsets the directional risk.
+        # Data (48 mkt): abandon-sell avg -$0.42/mkt, hold avg ~$0.00/mkt.
+        total_cost = self.up_position.cost + self.down_position.cost
+        batch = getattr(self, "_effective_batch_size", self.batch_size)
+        if has_position and (up_sh == 0 or down_sh == 0):
+            if total_cost > batch * 4 and time_urgency >= 0.12:
+                return True
 
         ecr = self.realized_ecr
         if ecr == float("inf"):
@@ -668,6 +704,13 @@ class PositionArbitrageStrategy(BaseStrategy):
         if (ecr > self.early_abandon_ecr_threshold
                 and bal < self.early_abandon_balance_threshold
                 and time_urgency >= self.early_abandon_time_threshold):
+            return True
+
+        # Medium abandon: ECR unprofitable with poor balance.
+        # With max_pending=1, imbalanced positions form when the second
+        # pair's lagging side fails to fill. Detect earlier (ECR > 1.20)
+        # to limit capital at risk.
+        if (ecr > 1.20 and bal < 0.45 and time_urgency >= 0.15):
             return True
 
         # Normal abandon
@@ -907,6 +950,104 @@ class PositionArbitrageStrategy(BaseStrategy):
         
         return adaptive
 
+    def _compute_dynamic_position_size(self, price_data: PriceData) -> Tuple[float, float]:
+        """Compute dynamic position size from spread and trend risk."""
+        if not self.enable_dynamic_size:
+            return self._base_position_size, 1.0
+
+        avg_spread = 0.0
+        count = 0
+        if self._last_up_spread > 0:
+            avg_spread += self._last_up_spread
+            count += 1
+        if self._last_down_spread > 0:
+            avg_spread += self._last_down_spread
+            count += 1
+
+        if count == 0:
+            spread_mult = 1.0
+        else:
+            avg_spread /= count
+            if avg_spread <= self.dynamic_size_spread_low:
+                spread_mult = self.dynamic_size_max
+            elif avg_spread >= self.dynamic_size_spread_high:
+                spread_mult = self.dynamic_size_min
+            else:
+                ratio = (avg_spread - self.dynamic_size_spread_low) / (
+                    self.dynamic_size_spread_high - self.dynamic_size_spread_low
+                )
+                spread_mult = (
+                    self.dynamic_size_max
+                    - ratio * (self.dynamic_size_max - self.dynamic_size_min)
+                )
+
+        trend_mult = 1.0
+        if self.enable_trend_detection:
+            _, conf = self._trend_detector.get_trend()
+            if conf >= 0.70:
+                trend_mult *= self.dynamic_size_trend_penalty
+
+        phase_mult = 1.0
+        if self.get_market_phase() == 3:
+            phase_mult *= self.dynamic_size_phase3_penalty
+
+        target_mult = spread_mult * trend_mult * phase_mult
+        target_mult = max(self.dynamic_size_min, min(self.dynamic_size_max, target_mult))
+
+        if self.dynamic_size_smoothing > 0:
+            alpha = self.dynamic_size_smoothing
+            smoothed = (1 - alpha) * self._dynamic_multiplier + alpha * target_mult
+        else:
+            smoothed = target_mult
+
+        self._dynamic_multiplier = smoothed
+        size = self._base_position_size * smoothed
+        size = max(size, self.dynamic_size_floor)
+        return size, smoothed
+
+    def _compute_tranche_cap(self, effective_position_size: float) -> float:
+        """Compute tranche budget cap based on hedged capital."""
+        if not self.enable_tranches:
+            self._active_tranches = 1
+            self._tranche_cap = effective_position_size
+            return effective_position_size
+
+        tranche_size = max(effective_position_size * self.tranche_ratio, self.tranche_min_size)
+        tranche_size = min(tranche_size, effective_position_size)
+        max_tranches = max(1, int(effective_position_size / tranche_size))
+
+        hedged_capital = 2.0 * min(self.up_position.cost, self.down_position.cost)
+        completed = int(hedged_capital / tranche_size) if tranche_size > 0 else 0
+
+        allow_unlock = (
+            self.balance_ratio >= self.tranche_unlock_balance
+            and self.effective_cost_rate != float("inf")
+            and self.effective_cost_rate <= self.tranche_unlock_ecr
+        )
+
+        if allow_unlock:
+            active = min(max_tranches, completed + 1)
+        else:
+            active = min(max_tranches, max(1, completed))
+
+        self._active_tranches = active
+        self._tranche_cap = tranche_size * active
+        return self._tranche_cap
+
+    def _get_effective_budget(self, price_data: PriceData) -> Tuple[float, float, float]:
+        """Return (effective_position_size, effective_batch_size, tranche_cap)."""
+        effective_position_size, mult = self._compute_dynamic_position_size(price_data)
+        tranche_cap = self._compute_tranche_cap(effective_position_size)
+
+        if self.dynamic_batch_scale:
+            effective_batch_size = max(self._base_batch_size * mult, 0.10)
+        else:
+            effective_batch_size = self._base_batch_size
+
+        self._effective_position_size = effective_position_size
+        self._effective_batch_size = effective_batch_size
+        return effective_position_size, effective_batch_size, tranche_cap
+
     def _calculate_time_urgency(self) -> float:
         """
         Calculate time-based urgency factor.
@@ -1078,6 +1219,10 @@ class PositionArbitrageStrategy(BaseStrategy):
                 price_data.down_price,
                 timestamp=price_data.timestamp.timestamp(),
             )
+
+        # Dynamic sizing + tranche budget cap (risk-aware exposure control)
+        effective_position_size, batch_size, tranche_cap = self._get_effective_budget(price_data)
+        budget_cap = min(effective_position_size, tranche_cap)
         
         current_risk = self.risk_state
         if current_risk != self._risk_state:
@@ -1113,7 +1258,7 @@ class PositionArbitrageStrategy(BaseStrategy):
         # Previous value max(batch*20, size*0.05) = $5.00 required 50+ fills
         # at $0.10 batch, creating a huge blind spot where ECR could spiral
         # (ETH hit ECR=2.71 with only $0.90 invested, balance rule never fired).
-        min_cost_for_ecr = self.batch_size * 4
+        min_cost_for_ecr = batch_size * 4
         
         self._ecr_recovery_side = None  # default: allow both sides
         self._directional_recovery_side = None  # reset each tick
@@ -1126,7 +1271,12 @@ class PositionArbitrageStrategy(BaseStrategy):
             max_shares = max(up_shares, down_shares)
             meaningful_imbalance = max_shares > 0 and abs(up_shares - down_shares) / max_shares > 0.05
             
-            if ecr != float("inf") and ecr > self.ecr_threshold and meaningful_imbalance:
+            if ecr == float("inf"):
+                if up_shares == 0 and down_shares > 0:
+                    self._ecr_recovery_side = "up"
+                elif down_shares == 0 and up_shares > 0:
+                    self._ecr_recovery_side = "down"
+            elif ecr > self.ecr_threshold and meaningful_imbalance:
                 minority_side = "up" if up_shares < down_shares else "down"
                 self._ecr_recovery_side = minority_side
                 if self._ecr_violations == 0:
@@ -1149,22 +1299,14 @@ class PositionArbitrageStrategy(BaseStrategy):
         has_both_sides = up_shares > 0 and down_shares > 0
         severe_imbalance = self.balance_ratio < self.severe_imbalance_threshold
         
-        # DELAY SELL-REBALANCE: Data shows all 3-fill markets have sells and
-        # average -$0.53/market, while 4-fill no-sell markets average +$0.039.
-        # The sell-rebalance after 3 fills locks in ECR > 1.0 and blocks the
-        # 4th fill (strict cap applies once balanced).  Wait until 40% of
-        # market duration to give the 4th fill a chance.  After 40%, the
-        # 4th fill is unlikely and sell-rebalance caps further loss.
+        # DELAY REBALANCE: Give the 4th fill time to arrive first.
+        # Selling excess breaks the hedge and has been a consistent
+        # value-destroyer in results, so we only BUY the underweight side.
         time_urgency = self._calculate_time_urgency()
         rebal_allowed = time_urgency >= 0.40
         
         if has_both_sides and severe_imbalance and rebal_allowed and self.can_rebalance():
             rebalance_signal = self._generate_rebalancing_order(price_data)
-
-            # Fallback: if buying underweight side was rejected (too expensive),
-            # try selling excess of the overweight side instead.
-            if rebalance_signal is None:
-                rebalance_signal = self._generate_sell_to_rebalance(price_data)
 
             if rebalance_signal:
                 signals.append(rebalance_signal)
@@ -1198,27 +1340,8 @@ class PositionArbitrageStrategy(BaseStrategy):
                 })
                 return signals  # Return just the rebalancing order
 
-        # ECR > 1 with any imbalance: sell excess to reduce cost even if
-        # balance_ratio isn't below severe_imbalance_threshold.
-        # Same delay applies — give the 4th fill time to arrive.
-        ecr = self.effective_cost_rate
-        if (has_both_sides and ecr != float("inf") and ecr > 1.0
-                and not severe_imbalance and rebal_allowed and self.can_rebalance()):
-            sell_rebal = self._generate_sell_to_rebalance(price_data)
-            if sell_rebal:
-                signals.append(sell_rebal)
-                self._last_rebalancing_time = datetime.now()
-                rebal_side = "up" if sell_rebal.token_type == TokenType.YES else "down"
-                self._rebalancing_events.append({
-                    "timestamp": datetime.now().isoformat(),
-                    "side": rebal_side,
-                    "type": "sell_excess_ecr",
-                    "size": sell_rebal.size,
-                    "price": sell_rebal.target_price,
-                    "balance_before": self.balance_ratio,
-                    "ecr": ecr,
-                })
-                return signals
+        # NOTE: Sell-rebalance for ECR>1 is disabled. It breaks the hedge and
+        # has been consistently negative EV in simulations.
 
         # === Market skew guard ===
         # Prevent new limit orders in extremely skewed markets where one side dominates.
@@ -1261,12 +1384,26 @@ class PositionArbitrageStrategy(BaseStrategy):
             price_data.up_price, price_data.down_price
         )
 
-        # Check available budget — full position_size, no reserves needed
+        # Minimum order cost enforces the Polymarket minimum order size.
+        # Each side independently needs enough dollars to produce min_order_shares.
+        min_order_cost_up = self.min_order_shares * up_limit
+        min_order_cost_down = self.min_order_shares * down_limit
+        min_pair_cost = min_order_cost_up + min_order_cost_down
+
+        # Entry budget must cover at least 2 pairs. Otherwise we only get
+        # 1-2 fills and the hedge never completes, which is negative EV.
+        min_entry_cap = min_pair_cost * 2
+        if min(self.up_position.shares, self.down_position.shares) == 0:
+            if effective_position_size < min_entry_cap:
+                return signals
+            budget_cap = max(budget_cap, min_entry_cap)
+
+        # Check available budget — dynamic sizing + tranche cap applied
         total_cost = self.up_position.cost + self.down_position.cost
         pending_cost = sum(o.cost for o in self.pending_orders)
-        available = self.position_size - total_cost - pending_cost
+        available = budget_cap - total_cost - pending_cost
 
-        if available < self.batch_size:
+        if available < batch_size:
             return signals
 
         phase = self.get_market_phase()
@@ -1290,15 +1427,23 @@ class PositionArbitrageStrategy(BaseStrategy):
             self._trend_patience_logged = False
         
         # === HEDGE COMPLETE GATE ===
-        # After 4+ balanced fills, stop placing new orders unconditionally.
-        # Data: 4-fill no-sell avg +$0.196, 6-fill avg -$0.202, 7-fill -$0.259.
-        # Extra fills inflate ECR via cross-temporal price drift.  Even when
-        # ECR > target_cost, additional fills rarely improve it — market has
-        # already moved, so new fills lock in the drift rather than fix it.
+        # Data: ECR<1.0 markets are 100% profitable, ECR>1.0 lose money.
+        # Cross-temporal price drift inflates ECR with each additional pair.
+        # Strategy: stop after 1 balanced pair to lock in profitable ECR.
+        #
+        # Threshold 1.5 accounts for dynamic batch sizing (multiplier up to 1.2x)
+        # which can make fills_est < 2.0 even after one full pair.
+        # Recovery cap at 2.5: allow 1 extra pair attempt when ECR > 1.0.
         total_fills = self.up_position.shares + self.down_position.shares
         if total_fills > 0:
-            fills_est = total_fills / max(self.batch_size / 0.50, 1)
-            if fills_est >= 3.5 and self.balance_ratio >= 0.85:
+            fills_est = total_fills / max(batch_size / 0.50, 1)
+            ecr = self.effective_cost_rate
+            if fills_est >= 1.5 and self.balance_ratio >= 0.85:
+                if ecr != float("inf") and ecr <= 1.0:
+                    return signals
+                if fills_est >= 2.5:
+                    return signals
+            if fills_est >= 0.8 and self.balance_ratio < 0.40:
                 return signals
         
         # === LOOP-BASED ORDER CREATION ===
@@ -1318,10 +1463,12 @@ class PositionArbitrageStrategy(BaseStrategy):
         )
         
         # Limits
-        # max_pending_per_side controls how many unfilled orders can exist per side.
-        # Using 2 per side at all times to maximise fill opportunities — with
-        # only 2 fills per market the ECR never averages below 1.0.
-        max_pending_per_side = 2
+        # Always serialize fills: max 1 pending order per side.
+        # Data shows max_pending=2 causes burst-fill asymmetry: cheap side
+        # fills both orders before expensive side catches up, creating
+        # imbalanced positions that lose -$2-5/market on abandon.
+        # With max_pending=1, fills alternate and positions stay balanced.
+        max_pending_per_side = 1
         max_orders_per_tick = self.max_orders_per_tick
         orders_created = 0
         
@@ -1341,16 +1488,9 @@ class PositionArbitrageStrategy(BaseStrategy):
         else:
             up_cost_ratio = down_cost_ratio = 0.5
         
-        # Minimum order cost enforces the Polymarket minimum order size.
-        # Each side independently needs enough dollars to produce min_order_shares.
-        # The expensive side naturally needs more dollars.
-        min_order_cost_up = self.min_order_shares * up_limit
-        min_order_cost_down = self.min_order_shares * down_limit
-        
         # Pair budget: enough for min_order_shares on BOTH sides.
         # If batch_size * 2 < sum of minimums, scale up to the minimums.
-        min_pair_cost = min_order_cost_up + min_order_cost_down
-        pair_budget = max(self.batch_size * 2, min_pair_cost)
+        pair_budget = max(batch_size * 2, min_pair_cost)
         
         # Loop guard: need enough for at least one side's minimum
         min_order_cost = min(min_order_cost_up, min_order_cost_down)
@@ -2158,33 +2298,35 @@ class PositionArbitrageStrategy(BaseStrategy):
             down_limit *= scale
         
         # === ECR-aware counterpart cap ===
-        # Balance-aware: use relaxed cap when position is imbalanced to
-        # encourage the 4th fill that completes the hedge.  Switch to strict
-        # cap once balanced (≥85%) to prevent further ECR inflation.
+        # Only apply when position is IMBALANCED (one side filled, other hasn't
+        # or is much smaller).  The relaxed cap (1.10) lets the counterpart fill
+        # complete the hedge even if the market moved.
         #
-        # Data shows: 4-fill no-sell markets avg +$0.039 (profitable).
-        #             3-fill markets avg -$0.529 (all lose, all have sells).
-        # The strict cap after 3 fills blocks the 4th fill, triggering
-        # sell-rebalance which locks in ECR > 1.0.  The relaxed cap at 1.10
-        # allows the 4th fill while limiting worst-case ECR.
-        #
-        # Exception: directional recovery side is exempt (uses EV-based pricing).
+        # When BALANCED (bal >= 0.85): skip the counterpart cap entirely.
+        # The hard ceiling (up_limit + down_limit <= effective_target) already
+        # ensures each new order pair is independently profitable (combined
+        # cost < $1 resolution).  The counterpart cap was preventing subsequent
+        # fills because it used historical averages — e.g., if UP avg=0.42,
+        # max_down=0.96-0.42=0.54, but DOWN market at 0.70 → limit 0.54
+        # never fills.  Without the cap, DOWN limit stays at ~0.60 (from hard
+        # ceiling), and the new pair ECR = 0.96 → profitable.
         max_imbalanced_ecr = 1.10
         dr_side = self._directional_recovery_side
         has_up = self.up_position.shares > 0
         has_down = self.down_position.shares > 0
         bal = self.balance_ratio
-        cap = effective_target if bal >= 0.85 else max_imbalanced_ecr
-        if has_up and dr_side != "down":
-            up_avg = self.up_position.avg_price
-            max_down = cap - up_avg
-            if max_down > 0.01 and down_limit > max_down:
-                down_limit = max_down
-        if has_down and dr_side != "up":
-            down_avg = self.down_position.avg_price
-            max_up = cap - down_avg
-            if max_up > 0.01 and up_limit > max_up:
-                up_limit = max_up
+        if bal < 0.85 and (has_up or has_down):
+            cap = max_imbalanced_ecr
+            if has_up and dr_side != "down":
+                up_avg = self.up_position.avg_price
+                max_down = cap - up_avg
+                if max_down > 0.01 and down_limit > max_down:
+                    down_limit = max_down
+            if has_down and dr_side != "up":
+                down_avg = self.down_position.avg_price
+                max_up = cap - down_avg
+                if max_up > 0.01 and up_limit > max_up:
+                    up_limit = max_up
         
         # === Directional recovery: aggressive pricing ===
         # When betting on the probable winner, the hedging-based limit price
@@ -2255,7 +2397,7 @@ class PositionArbitrageStrategy(BaseStrategy):
         as any sub-check produces a definitive answer.
         """
         if order_cost is None:
-            order_cost = self.batch_size
+            order_cost = getattr(self, "_effective_batch_size", self.batch_size)
 
         # --- 0. Abandon mode: no orders at all -----------------------------------
         if self._abandon_mode:
@@ -2263,11 +2405,15 @@ class PositionArbitrageStrategy(BaseStrategy):
 
         # --- 0b. Realized ECR hard gate: if filled position is already losing,
         #     only allow orders on the lagging side (recovery) ----------------
+        #     Exception: when nearly balanced (≥85%), allow BOTH sides so pair-
+        #     scaling can work.  Adding to one side alone won't fix ECR, but
+        #     adding balanced pairs at the hard ceiling averages it down.
         recr = self.realized_ecr
         if recr != float("inf") and recr > self.ecr_threshold:
-            lagging = self.get_lagging_side()
-            if side != lagging and lagging != "balanced":
-                return False
+            if self.balance_ratio < 0.85:
+                lagging = self.get_lagging_side()
+                if side != lagging and lagging != "balanced":
+                    return False
 
         # --- 1. Basic validation ------------------------------------------------
         ok, market_price = self._check_order_basics(side, limit_price, order_cost)
@@ -2311,6 +2457,10 @@ class PositionArbitrageStrategy(BaseStrategy):
         # --- 6. ECR protection per phase ----------------------------------------
         if not self._check_ecr_protection(side, up, down, phase, limit_price, order_cost,
                                           current_ecr, predicted_ecr):
+            logger.debug(
+                f"[{self.name}] ECR_PROTECT blocked {side.upper()} P{phase}: "
+                f"pred={predicted_ecr:.3f} cur={current_ecr:.3f} bal={self.balance_ratio:.2f}"
+            )
             return False
 
         # --- 7. Phase 3 settlement protection -----------------------------------
@@ -2508,6 +2658,23 @@ class PositionArbitrageStrategy(BaseStrategy):
                               phase: int, limit_price: float, order_cost: float,
                               current_ecr: float, predicted_ecr: float) -> bool:
         """ECR-based order rejection for Phase 1 vs Phase 2-3."""
+        # Pair-scaling bypass: after initial fills, individual-side ECR
+        # predictions are misleading because we place orders on BOTH sides.
+        # Adding to one side temporarily inflates ECR, but the matching order
+        # on the other side restores it.
+        #
+        # Allow when balanced (≥85%) in two scenarios:
+        #   ECR < 1.0  → position is profitable, more fills lock in margin
+        #   ECR 1.0–1.20 → position is slightly losing from cross-temporal
+        #     drift; each new pair at hard ceiling (≤0.96) averages ECR down
+        #     toward profitability.  Cap at 1.20 for safety.
+        if self.balance_ratio >= 0.85 and 0 < current_ecr < 1.20:
+            logger.debug(
+                f"[{self.name}] PAIR_SCALE bypass {side.upper()}: "
+                f"ECR={current_ecr:.3f} bal={self.balance_ratio:.2f}"
+            )
+            return True
+
         if phase == 1:
             cap = self._get_phase1_ecr_limit()
             if predicted_ecr >= cap:
@@ -2677,6 +2844,11 @@ class PositionArbitrageStrategy(BaseStrategy):
                 "effective_target_cost": self._get_adaptive_target_cost(),
                 "batch_size": self.batch_size,
                 "batch_ratio": self.batch_ratio,
+                "effective_position_size": getattr(self, "_effective_position_size", self.position_size),
+                "effective_batch_size": getattr(self, "_effective_batch_size", self.batch_size),
+                "dynamic_size_multiplier": getattr(self, "_dynamic_multiplier", 1.0),
+                "tranche_cap": getattr(self, "_tranche_cap", self.position_size),
+                "active_tranches": getattr(self, "_active_tranches", 1),
                 "ecr_threshold": self.ecr_threshold,
                 "balance_threshold": self.balance_threshold,
                 "enable_ecr_stoploss": self.enable_ecr_stoploss,

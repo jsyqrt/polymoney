@@ -65,8 +65,8 @@ strategy:
   # High liquidity (tight spread) → smaller discount (higher target).
   # Low liquidity (wide spread) → larger discount (lower target).
   enable_adaptive_target: true
-  adaptive_target_min: 0.95   # Floor for wide-spread (illiquid) markets
-  adaptive_target_max: 0.97   # Ceiling for tight-spread (liquid) markets
+  adaptive_target_min: 0.94   # Floor for wide-spread (illiquid) markets
+  adaptive_target_max: 0.955  # Ceiling for tight-spread (liquid) markets
   
   # Minimum maker discount: limit price must be at least this % below market.
   # Increased from 1.5% to 3% to improve fill rate in live trading.
@@ -112,8 +112,8 @@ risk:
   # Trend patience threshold: when max(up, down) exceeds this but is below
   # max_skew_threshold, enter "trend patience" mode — asymmetric pricing and
   # cheap-side blocking to prevent one-sided fill accumulation.
-  # Lowered from 0.65 → 0.60 to activate protection earlier.
-  trend_patience_threshold: 0.60
+  # Lowered from 0.65 → 0.57 to activate protection earlier.
+  trend_patience_threshold: 0.57
 
 
 # ---------------------------------------------------------------------------
@@ -206,11 +206,10 @@ simulation:
   min_price_threshold: 0.05
 
   # Maximum entry skew: skip markets where max(up, down) exceeds this at entry.
-  # Relaxed from 75% to 85%: the strategy's trend-adaptive pricing, SKEW GUARD
-  # bypass (Phase 2+ with trend), and ECR controls handle skewed markets safely.
-  # Previous 75% was too restrictive — after any mid-session restart, most active
-  # 15-min markets already exceed 75% and the bot sat idle with nothing to trade.
-  max_entry_skew: 0.85
+  # Reduced from 85% to 70%: data shows markets entered at >70% skew produce
+  # mostly one-sided positions with avg -$2.52/loss. The trend-adaptive pricing
+  # cannot overcome the fill asymmetry in already-skewed markets.
+  max_entry_skew: 0.70
 
 # ---------------------------------------------------------------------------
 # Multi-Timeframe Support
@@ -261,3 +260,33 @@ fund_management:
   # 0 = instant (unrealistic), 60 = typical real-world latency.
   # Live mode ignores this — PositionRedeemer handles real redemption.
   redemption_delay: 60.0
+
+# ---------------------------------------------------------------------------
+# Strategy Version
+# ---------------------------------------------------------------------------
+# "v1" = Original maker-only strategy (position_arbitrage.py)
+# "v2" = Taker-hybrid strategy (position_arbitrage_v2.py)
+#        Uses taker orders to complete hedges, scratch trades to exit flat.
+#        See docs/strategy-first-principles.md for design rationale.
+strategy_version: v1
+
+# ---------------------------------------------------------------------------
+# V2 Strategy Parameters (only used when strategy_version: v2)
+# ---------------------------------------------------------------------------
+strategy_v2:
+  # Maximum pair cost for taker completion.
+  # After one side fills as maker, the other side can be bought as taker
+  # if the combined pair cost < this threshold. Must be < 1.0 for profit.
+  max_taker_pair_cost: 0.995
+
+  # Seconds to wait for a maker fill before scratching (selling back).
+  maker_window_seconds: 30.0
+
+  # Maximum acceptable scratch loss as fraction of position cost.
+  max_scratch_loss_pct: 0.05
+
+  # Price buffer above market for taker orders (ensures fill).
+  taker_slippage_buffer: 0.005
+
+  # Minimum maker discount for V2 (tighter than V1 since taker is backup).
+  min_maker_discount: 0.015

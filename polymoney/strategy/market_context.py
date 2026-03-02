@@ -25,6 +25,10 @@ from polymoney.strategy.builtin.position_arbitrage import (
     LimitOrder,
     PositionArbitrageStrategy,
 )
+from polymoney.strategy.builtin.position_arbitrage_v2 import (
+    LimitOrder as LimitOrderV2,
+    PositionArbitrageV2,
+)
 
 logger = get_logger("strategy.market_context")
 
@@ -55,6 +59,7 @@ class MarketContext:
         self.coin = market.get("coin", "btc")
 
         # Strategy instance
+        strategy_version = getattr(config, "strategy_version", "v1")
         strategy_params = {
             "target_cost": config.target_cost,
             "batch_ratio": config.batch_ratio,
@@ -64,12 +69,20 @@ class MarketContext:
             "enable_trend_detection": config.enable_trend_detection,
             "enable_urgency_pricing": config.enable_urgency_pricing,
         }
-        self.strategy = PositionArbitrageStrategy(
-            strategy_id=f"ctx_{self.slug}",
-            name=f"Context {self.slug}",
-            position_size=config.position_size,
-            params=strategy_params,
-        )
+        if strategy_version == "v2":
+            self.strategy = PositionArbitrageV2(
+                strategy_id=f"ctx_{self.slug}",
+                name=f"Context {self.slug}",
+                position_size=config.position_size,
+                params=strategy_params,
+            )
+        else:
+            self.strategy = PositionArbitrageStrategy(
+                strategy_id=f"ctx_{self.slug}",
+                name=f"Context {self.slug}",
+                position_size=config.position_size,
+                params=strategy_params,
+            )
 
         # Result tracking
         self.result = MarketResult(

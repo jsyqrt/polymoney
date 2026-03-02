@@ -151,6 +151,31 @@ class SimulatedExecutor(OrderExecutor):
         if getattr(order, 'trade_side', 'buy') == 'sell':
             return self._simulate_sell_order(state, order)
 
+        # --- BUY taker (FOK): immediate fill at market ask ---
+        # Models FOK/taker buy where the order crosses the spread.
+        # Fee is applied as an inflated fill_price so the runner's
+        # cash accounting stays correct (cost = fill_size × fill_price).
+        if order.is_taker:
+            market_price = (
+                state.prev_up_price if order.side == "up"
+                else state.prev_down_price
+            )
+            if market_price and market_price > 0 and order.price >= market_price:
+                fee_rate = self._taker_fee_rate(market_price)
+                effective_price = market_price / (1 - fee_rate)
+                self._liquidity_tracker.record_fill(order.market_id)
+                return OrderResult(
+                    status=OrderResultStatus.FILLED,
+                    order_id=order.order_id,
+                    fill_price=effective_price,
+                    fill_size=order.size,
+                )
+            return OrderResult(
+                status=OrderResultStatus.REJECTED,
+                order_id=order.order_id,
+                error=f"Taker buy rejected: limit {order.price:.3f} < market {market_price}",
+            )
+
         # --- BUY orders: GTC maker — always goes on the book ---
         pending = PendingOrder(
             order_id=order.order_id,

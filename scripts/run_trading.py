@@ -552,6 +552,7 @@ async def cmd_run(args, yaml_config):
         )
         config.timeframes = timeframes
         config.enable_binance_feed = enable_binance
+        config.strategy_version = getattr(args, "strategy_version", "v1")
     else:
         config = SimulationConfig(
             coins=coins,
@@ -570,6 +571,7 @@ async def cmd_run(args, yaml_config):
             min_trading_time=args.min_trading_time,
             timeframes=timeframes,
             enable_binance_feed=enable_binance,
+            strategy_version=getattr(args, "strategy_version", "v1"),
         )
 
     label = "LIVE TRADING" if mode == "live" else "PAPER TRADING"
@@ -663,6 +665,9 @@ def add_run_args(p):
                     help="Enable Binance real-time price feed for directional signal")
     g.add_argument("--disable-directional-signal", action="store_true",
                     help="Disable late-game directional signal even when Binance feed is on")
+    g.add_argument("--strategy-version", type=str, default="v1",
+                    choices=["v1", "v2"],
+                    help="Strategy version: v1 (maker-only) or v2 (taker-hybrid)")
 
 
 def main():
