@@ -868,6 +868,16 @@ class TradingRunner:
         # Generate order signals from strategy
         signals = ctx.process_price_update(price)
 
+        # V2 cancel requests: strategy marks orders for cancellation
+        # (e.g. cancelling other-side maker before sending taker).
+        if hasattr(ctx.strategy, '_orders_to_cancel') and ctx.strategy._orders_to_cancel:
+            for oid in ctx.strategy._orders_to_cancel:
+                cancelled = await self.executor.cancel_order(oid)
+                if cancelled:
+                    logger.info(f"[{slug}] Cancelled order {oid} (strategy request)")
+                ctx.remove_pending_order(oid)
+            ctx.strategy._orders_to_cancel.clear()
+
         # When the strategy enters exit mode (pre-settlement sell-all),
         # cancel all pending orders so buys don't consume capital or
         # create new positions that we'd need to sell again.

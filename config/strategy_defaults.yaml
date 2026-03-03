@@ -276,14 +276,20 @@ strategy_version: v1
 strategy_v2:
   # Maximum pair cost for taker completion.
   # After one side fills as maker, the other side can be bought as taker
-  # if the combined pair cost < this threshold. Must be < 1.0 for profit.
-  max_taker_pair_cost: 0.995
+  # if the combined pair cost < this threshold.
+  # Set above 1.0 (1.015) because accepting a small taker loss ($0.075/mkt)
+  # is much better than scratching ($0.30-$0.50/mkt loss).
+  max_taker_pair_cost: 1.015
 
   # Seconds to wait for a maker fill before scratching (selling back).
   maker_window_seconds: 30.0
 
   # Maximum acceptable scratch loss as fraction of position cost.
   max_scratch_loss_pct: 0.05
+
+  # Early scratch: if unrealized loss exceeds this fraction of maker avg cost,
+  # scratch immediately instead of waiting for maker_window to expire.
+  scratch_loss_limit: 0.08
 
   # Price buffer above market for taker orders (ensures fill).
   taker_slippage_buffer: 0.005

@@ -80,9 +80,10 @@ class PositionArbitrageV2(BaseStrategy):
         self.low_prob_threshold: float = p.get("low_prob_threshold", 0.05)
 
         # --- Taker-hybrid parameters ---
-        self.max_taker_pair_cost: float = p.get("max_taker_pair_cost", 0.995)
+        self.max_taker_pair_cost: float = p.get("max_taker_pair_cost", 1.015)
         self.maker_window_seconds: float = p.get("maker_window_seconds", 30.0)
         self.max_scratch_loss_pct: float = p.get("max_scratch_loss_pct", 0.05)
+        self.scratch_loss_limit: float = p.get("scratch_loss_limit", 0.08)
         self.taker_slippage_buffer: float = p.get("taker_slippage_buffer", 0.005)
 
         # --- Adaptive target ---
@@ -100,6 +101,7 @@ class PositionArbitrageV2(BaseStrategy):
         self.up_position = InternalPosition()
         self.down_position = InternalPosition()
         self.pending_orders: List[LimitOrder] = []
+        self._orders_to_cancel: List[str] = []
         self._exit_mode: bool = False
 
         self._state: str = _State.IDLE
@@ -121,6 +123,7 @@ class PositionArbitrageV2(BaseStrategy):
         self.up_position.reset()
         self.down_position.reset()
         self.pending_orders.clear()
+        self._orders_to_cancel.clear()
         self._exit_mode = False
         self._state = _State.IDLE
         self._first_fill_side = None
@@ -379,6 +382,18 @@ class PositionArbitrageV2(BaseStrategy):
             )
             return [signal]
 
+        filled_market_price = (
+            price_data.up_price if filled_side == "up" else price_data.down_price
+        )
+        unrealized_loss_pct = (maker_avg - filled_market_price) / maker_avg
+        if unrealized_loss_pct > self.scratch_loss_limit:
+            logger.info(
+                f"[{self.name}] Early scratch: {filled_side.upper()} "
+                f"unrealized loss {unrealized_loss_pct:.1%} > {self.scratch_loss_limit:.0%} "
+                f"(avg={maker_avg:.3f}, mkt={filled_market_price:.3f})"
+            )
+            return self._scratch_position(price_data)
+
         elapsed = time.time() - self._first_fill_time
         if elapsed > self.maker_window_seconds:
             return self._scratch_position(price_data)
@@ -423,15 +438,24 @@ class PositionArbitrageV2(BaseStrategy):
     # ------------------------------------------------------------------
 
     def _cancel_pending_side(self, side: str) -> None:
-        """Remove all pending orders on a given side to prevent double fills."""
-        before = len(self.pending_orders)
-        self.pending_orders = [
-            o for o in self.pending_orders if o.side != side
-        ]
-        removed = before - len(self.pending_orders)
-        if removed > 0:
+        """Remove all pending orders on a given side to prevent double fills.
+
+        Adds removed order_ids to _orders_to_cancel so the runner can
+        cancel them in the executor (strategy can't reach executor directly).
+        """
+        keep = []
+        removed_ids = []
+        for o in self.pending_orders:
+            if o.side == side:
+                removed_ids.append(o.order_id)
+            else:
+                keep.append(o)
+        self.pending_orders = keep
+        if removed_ids:
+            self._orders_to_cancel.extend(removed_ids)
             logger.info(
-                f"[{self.name}] Cancelled {removed} pending {side.upper()} maker(s)"
+                f"[{self.name}] Cancelled {len(removed_ids)} pending "
+                f"{side.upper()} maker(s): {removed_ids}"
             )
 
     def _add_pending(
