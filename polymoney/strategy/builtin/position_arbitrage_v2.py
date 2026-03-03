@@ -81,6 +81,7 @@ class PositionArbitrageV2(BaseStrategy):
 
         # --- Taker-hybrid parameters ---
         self.max_taker_pair_cost: float = p.get("max_taker_pair_cost", 1.015)
+        self.maker_first_window: float = p.get("maker_first_window", 10.0)
         self.maker_window_seconds: float = p.get("maker_window_seconds", 30.0)
         self.max_scratch_loss_pct: float = p.get("max_scratch_loss_pct", 0.05)
         self.scratch_loss_limit: float = p.get("scratch_loss_limit", 0.08)
@@ -349,13 +350,38 @@ class PositionArbitrageV2(BaseStrategy):
         return signals
 
     def _handle_first_fill(self, price_data: PriceData) -> List[OrderSignal]:
-        """FIRST_FILL: assess taker completion or scratch."""
+        """FIRST_FILL: try maker first → taker backup → scratch.
+
+        Phase 1 (0 - maker_first_window): place maker on other side.
+            If other side fills as maker, ECR ≈ target_cost (0.96) → profitable.
+        Phase 2 (maker_first_window - maker_window): send taker if affordable.
+            ECR ≈ 1.005-1.01 → small loss but avoids bigger scratch loss.
+        Phase 3 (maker_window+): scratch — sell back the filled side.
+        At any time: scratch early if unrealized loss exceeds limit.
+        """
         filled_side = self._first_fill_side
         other_side = "down" if filled_side == "up" else "up"
         filled_pos = self.up_position if filled_side == "up" else self.down_position
         other_price = price_data.down_price if other_side == "down" else price_data.up_price
 
         maker_avg = filled_pos.avg_price
+        elapsed = time.time() - self._first_fill_time
+
+        filled_market_price = (
+            price_data.up_price if filled_side == "up" else price_data.down_price
+        )
+        unrealized_loss_pct = (maker_avg - filled_market_price) / maker_avg
+        if unrealized_loss_pct > self.scratch_loss_limit:
+            logger.info(
+                f"[{self.name}] Early scratch: {filled_side.upper()} "
+                f"unrealized loss {unrealized_loss_pct:.1%} > {self.scratch_loss_limit:.0%} "
+                f"(avg={maker_avg:.3f}, mkt={filled_market_price:.3f})"
+            )
+            return self._scratch_position(price_data)
+
+        if elapsed < self.maker_first_window:
+            return self._refresh_maker_on_other_side(other_side, price_data)
+
         taker_fee = self._taker_fee_rate(other_price)
         taker_effective_price = other_price / (1 - taker_fee)
         pair_cost = maker_avg + taker_effective_price
@@ -378,23 +404,10 @@ class PositionArbitrageV2(BaseStrategy):
             logger.info(
                 f"[{self.name}] TAKER COMPLETE: {other_side.upper()}@{taker_limit:.3f} "
                 f"(market={other_price:.3f}, fee={taker_fee:.4f}, "
-                f"pair_cost={pair_cost:.4f})"
+                f"pair_cost={pair_cost:.4f}, waited={elapsed:.0f}s)"
             )
             return [signal]
 
-        filled_market_price = (
-            price_data.up_price if filled_side == "up" else price_data.down_price
-        )
-        unrealized_loss_pct = (maker_avg - filled_market_price) / maker_avg
-        if unrealized_loss_pct > self.scratch_loss_limit:
-            logger.info(
-                f"[{self.name}] Early scratch: {filled_side.upper()} "
-                f"unrealized loss {unrealized_loss_pct:.1%} > {self.scratch_loss_limit:.0%} "
-                f"(avg={maker_avg:.3f}, mkt={filled_market_price:.3f})"
-            )
-            return self._scratch_position(price_data)
-
-        elapsed = time.time() - self._first_fill_time
         if elapsed > self.maker_window_seconds:
             return self._scratch_position(price_data)
 

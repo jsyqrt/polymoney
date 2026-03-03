@@ -281,7 +281,12 @@ strategy_v2:
   # is much better than scratching ($0.30-$0.50/mkt loss).
   max_taker_pair_cost: 1.015
 
-  # Seconds to wait for a maker fill before scratching (selling back).
+  # Phase 1: try maker on other side for this many seconds first.
+  # If both sides fill as maker, ECR = target_cost (0.96) → 4% profit.
+  maker_first_window: 10.0
+
+  # Phase 2 (after maker_first_window): send taker if affordable.
+  # Phase 3 (after maker_window): scratch if nothing filled.
   maker_window_seconds: 30.0
 
   # Maximum acceptable scratch loss as fraction of position cost.
