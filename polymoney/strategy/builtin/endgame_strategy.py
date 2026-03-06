@@ -106,10 +106,10 @@ class EndgameStrategy(BaseStrategy):
         self.arb_window = self.params.get("arb_window", 90)
 
         # --- Directional parameters ---
-        self.directional_min_delta = self.params.get("directional_min_delta", 0.002)
-        self.min_win_prob = self.params.get("min_win_prob", 0.92)
-        self.directional_max_price = self.params.get("directional_max_price", 0.94)
-        self.min_ev_per_dollar = self.params.get("min_ev_per_dollar", 0.03)
+        self.directional_min_delta = self.params.get("directional_min_delta", 0.001)
+        self.min_win_prob = self.params.get("min_win_prob", 0.80)
+        self.directional_max_price = self.params.get("directional_max_price", 0.96)
+        self.min_ev_per_dollar = self.params.get("min_ev_per_dollar", 0.04)
         self.base_volatility = self.params.get("volatility_per_minute", 0.001)
 
         # --- Arbitrage parameters ---
@@ -364,30 +364,40 @@ class EndgameStrategy(BaseStrategy):
         self, price_data: PriceData, remaining: float
     ) -> List[OrderSignal]:
         if self.binance_delta is None:
+            if not getattr(self, "_no_delta_logged", False):
+                logger.debug(f"[{self.name}] No binance_delta available")
+                self._no_delta_logged = True
             return []
 
         delta = self.binance_delta
-        if abs(delta) < self.directional_min_delta:
-            return []
-
         vol = self._get_volatility()
         prob = win_probability(delta, remaining, vol)
-        if prob < self.min_win_prob:
-            return []
-
         predicted_winner = "up" if delta > 0 else "down"
         winner_price = (
             price_data.up_price
             if predicted_winner == "up"
             else price_data.down_price
         )
-
-        if winner_price >= self.directional_max_price:
-            return []
-
-        # Expected value: prob × $1 − price
         ev_per_share = prob * 1.0 - winner_price
         ev_per_dollar = ev_per_share / winner_price if winner_price > 0 else 0
+
+        # Log evaluation every ~30 seconds
+        now_ts = time.time()
+        if now_ts - getattr(self, "_last_eval_log", 0) > 30:
+            self._last_eval_log = now_ts
+            logger.info(
+                f"[{self.name}] EVAL: delta={delta:+.4f} "
+                f"prob={prob:.1%} winner={predicted_winner.upper()} "
+                f"price={winner_price:.3f} EV/\u0024={ev_per_dollar:.1%} "
+                f"{remaining:.0f}s left"
+            )
+
+        if abs(delta) < self.directional_min_delta:
+            return []
+        if prob < self.min_win_prob:
+            return []
+        if winner_price >= self.directional_max_price:
+            return []
         if ev_per_dollar < self.min_ev_per_dollar:
             return []
 
