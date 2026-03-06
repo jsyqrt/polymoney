@@ -666,8 +666,8 @@ def add_run_args(p):
     g.add_argument("--disable-directional-signal", action="store_true",
                     help="Disable late-game directional signal even when Binance feed is on")
     g.add_argument("--strategy-version", type=str, default="v1",
-                    choices=["v1", "v2"],
-                    help="Strategy version: v1 (maker-only) or v2 (taker-hybrid)")
+                    choices=["v1", "v2", "endgame"],
+                    help="Strategy version: v1 (maker-only), v2 (taker-hybrid), endgame (last-moment directional)")
 
 
 def main():

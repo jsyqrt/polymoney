@@ -21,6 +21,7 @@ from polymoney.core.logging import get_logger
 from polymoney.core.models import OrderSignal, PriceData, TokenType
 from polymoney.data.real_data_fetcher import PriceUpdate
 from polymoney.simulation.live_runner import MarketResult, SimulationConfig
+from polymoney.strategy.builtin.endgame_strategy import EndgameStrategy
 from polymoney.strategy.builtin.position_arbitrage import (
     LimitOrder,
     PositionArbitrageStrategy,
@@ -66,7 +67,14 @@ class MarketContext:
             "enable_trend_detection": config.enable_trend_detection,
             "enable_urgency_pricing": config.enable_urgency_pricing,
         }
-        if strategy_version == "v2":
+        if strategy_version == "endgame":
+            self.strategy = EndgameStrategy(
+                strategy_id=f"ctx_{self.slug}",
+                name=f"Endgame {self.slug}",
+                position_size=config.position_size,
+                params=strategy_params,
+            )
+        elif strategy_version == "v2":
             self.strategy = PositionArbitrageV2(
                 strategy_id=f"ctx_{self.slug}",
                 name=f"Context {self.slug}",
