@@ -108,6 +108,7 @@ class EndgameStrategy(BaseStrategy):
         # --- Directional parameters ---
         self.directional_min_delta = self.params.get("directional_min_delta", 0.001)
         self.min_win_prob = self.params.get("min_win_prob", 0.80)
+        self.directional_min_price = self.params.get("directional_min_price", 0.45)
         self.directional_max_price = self.params.get("directional_max_price", 0.96)
         self.min_ev_per_dollar = self.params.get("min_ev_per_dollar", 0.04)
         self.base_volatility = self.params.get("volatility_per_minute", 0.001)
@@ -119,7 +120,7 @@ class EndgameStrategy(BaseStrategy):
         # --- Position sizing ---
         self.min_order_shares = self.params.get("min_order_shares", 5)
         self.trade_size_dollars = self.params.get("trade_size_dollars", 5.0)
-        self.max_trades_per_market = self.params.get("max_trades_per_market", 3)
+        self.max_trades_per_market = self.params.get("max_trades_per_market", 2)
         self.trade_cooldown = self.params.get("trade_cooldown", 15.0)
         self.max_market_exposure = self.params.get("max_market_exposure", 25.0)
 
@@ -395,6 +396,8 @@ class EndgameStrategy(BaseStrategy):
         if abs(delta) < self.directional_min_delta:
             return []
         if prob < self.min_win_prob:
+            return []
+        if winner_price < self.directional_min_price:
             return []
         if winner_price >= self.directional_max_price:
             return []
