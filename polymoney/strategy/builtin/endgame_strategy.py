@@ -5,19 +5,21 @@ Two sub-strategies activated only in the final minutes before settlement:
 
 1. Directional Last-Moment (最后时刻方向性交易):
    Uses Binance real-time price delta to predict the winning side with high
-   confidence. Near settlement, the actual crypto price relative to the epoch
-   start provides near-certainty on the outcome. Buys the predicted winner
-   as a taker order.
+   confidence. Targets mid-range prices ($0.15-$0.45) where the risk/reward
+   asymmetry strongly favours us: buying at $0.25 risks only $0.25 but wins
+   $0.75. EV calculation is conservative — it accounts for bid-ask spread
+   and taker fees to ensure profitability carries over to live trading.
 
 2. End-of-Life Arbitrage (临终套利):
    When the combined ask for UP+DOWN drops below $1.00, buys both sides for
    guaranteed profit at settlement. Works when market makers withdraw near
    settlement, creating pricing gaps.
 
-Core principle: near settlement, time risk approaches zero and price
-prediction accuracy approaches certainty. A 0.3% BTC delta with 60 seconds
-remaining has < 0.2% chance of reversing — yet the market may still price
-the winning token at 0.85-0.92, creating 8-15% expected profit per trade.
+Key design decisions (data-driven, 2026-03-07/08 simulation):
+- Avoid $0.50+ prices: 43% win rate at $0.50-$0.70 (need 60% to break even)
+- Focus on $0.15-$0.45: 50% win rate at breakeven-WR of only 19-42%
+- Use conservative EV: add spread buffer + taker fee to mid-price
+- Cap shares per order: stay within realistic order-book depth
 """
 
 import time
@@ -102,16 +104,17 @@ class EndgameStrategy(BaseStrategy):
 
         # --- Timing ---
         self.market_duration = self.params.get("market_duration", 900)
-        self.directional_window = self.params.get("directional_window", 180)
-        self.arb_window = self.params.get("arb_window", 90)
+        self.directional_window = self.params.get("directional_window", 300)
+        self.arb_window = self.params.get("arb_window", 120)
 
         # --- Directional parameters ---
         self.directional_min_delta = self.params.get("directional_min_delta", 0.001)
-        self.min_win_prob = self.params.get("min_win_prob", 0.80)
-        self.directional_min_price = self.params.get("directional_min_price", 0.45)
-        self.directional_max_price = self.params.get("directional_max_price", 0.96)
-        self.min_ev_per_dollar = self.params.get("min_ev_per_dollar", 0.04)
+        self.min_win_prob = self.params.get("min_win_prob", 0.82)
+        self.directional_min_price = self.params.get("directional_min_price", 0.15)
+        self.directional_max_price = self.params.get("directional_max_price", 0.45)
+        self.min_ev_per_dollar = self.params.get("min_ev_per_dollar", 0.06)
         self.base_volatility = self.params.get("volatility_per_minute", 0.001)
+        self.min_spread_buffer = self.params.get("min_spread_buffer", 0.015)
 
         # --- Arbitrage parameters ---
         self.arb_threshold = self.params.get("arb_threshold", 0.985)
@@ -121,8 +124,9 @@ class EndgameStrategy(BaseStrategy):
         self.min_order_shares = self.params.get("min_order_shares", 5)
         self.trade_size_dollars = self.params.get("trade_size_dollars", 5.0)
         self.max_trades_per_market = self.params.get("max_trades_per_market", 2)
-        self.trade_cooldown = self.params.get("trade_cooldown", 15.0)
+        self.trade_cooldown = self.params.get("trade_cooldown", 20.0)
         self.max_market_exposure = self.params.get("max_market_exposure", 25.0)
+        self.max_shares_per_order = self.params.get("max_shares_per_order", 20)
 
         # --- Internal state ---
         self._up_shares: float = 0.0
@@ -310,11 +314,16 @@ class EndgameStrategy(BaseStrategy):
     def _check_arb(
         self, price_data: PriceData, remaining: float
     ) -> List[OrderSignal]:
-        combined = price_data.up_price + price_data.down_price
-        if combined >= self.arb_threshold:
-            return []
+        # Use conservative cost: mid → ask + fee for BOTH sides
+        up_cost = self._estimate_all_in_cost(
+            price_data.up_price, price_data.spread
+        )
+        down_cost = self._estimate_all_in_cost(
+            price_data.down_price, price_data.spread
+        )
+        combined_cost = up_cost + down_cost
+        margin = 1.0 - combined_cost
 
-        margin = 1.0 - combined
         if margin < self.arb_min_margin:
             return []
 
@@ -323,12 +332,12 @@ class EndgameStrategy(BaseStrategy):
         if budget < 2.0:
             return []
 
-        shares = budget / combined
+        shares = min(budget / combined_cost, self.max_shares_per_order)
         if shares < self.min_order_shares:
             return []
 
-        up_fill = min(price_data.up_price * 1.005, 0.99)
-        down_fill = min(price_data.down_price * 1.005, 0.99)
+        up_fill = min(price_data.up_price + self.min_spread_buffer + 0.01, 0.99)
+        down_fill = min(price_data.down_price + self.min_spread_buffer + 0.01, 0.99)
 
         signals = [
             OrderSignal(
@@ -352,14 +361,30 @@ class EndgameStrategy(BaseStrategy):
         self._trades_this_market += 2
         logger.info(
             f"[{self.name}] ARB: {shares:.1f}sh × 2 sides "
-            f"UP@{price_data.up_price:.3f}+DOWN@{price_data.down_price:.3f}="
-            f"{combined:.3f} margin={margin:.3f} {remaining:.0f}s left"
+            f"UP@{price_data.up_price:.3f}+DOWN@{price_data.down_price:.3f} "
+            f"est_cost={combined_cost:.3f} margin={margin:.3f} "
+            f"{remaining:.0f}s left"
         )
         return signals
 
     # ------------------------------------------------------------------
     # Sub-strategy: Directional Last-Moment
     # ------------------------------------------------------------------
+
+    def _estimate_all_in_cost(
+        self, mid_price: float, spread: float
+    ) -> float:
+        """Conservative cost estimate: mid → ask → plus taker fee.
+
+        This is what we'd actually pay in live trading.  The simulation
+        fills at mid+fee which is slightly cheaper, so if our EV is
+        positive with this conservative estimate it will also be positive
+        in live.
+        """
+        half_spread = max(spread / 2, self.min_spread_buffer)
+        ask_estimate = min(mid_price + half_spread, 0.99)
+        fee_rate = 0.25 * (ask_estimate * (1 - ask_estimate)) ** 2
+        return ask_estimate / (1 - fee_rate)
 
     def _check_directional(
         self, price_data: PriceData, remaining: float
@@ -374,51 +399,60 @@ class EndgameStrategy(BaseStrategy):
         vol = self._get_volatility()
         prob = win_probability(delta, remaining, vol)
         predicted_winner = "up" if delta > 0 else "down"
-        winner_price = (
+        winner_mid = (
             price_data.up_price
             if predicted_winner == "up"
             else price_data.down_price
         )
-        ev_per_share = prob * 1.0 - winner_price
-        ev_per_dollar = ev_per_share / winner_price if winner_price > 0 else 0
 
-        # Log evaluation every ~30 seconds
+        all_in_cost = self._estimate_all_in_cost(
+            winner_mid, price_data.spread
+        )
+        ev_per_share = prob - all_in_cost
+        ev_per_dollar = ev_per_share / all_in_cost if all_in_cost > 0 else 0
+
         now_ts = time.time()
         if now_ts - getattr(self, "_last_eval_log", 0) > 30:
             self._last_eval_log = now_ts
             logger.info(
                 f"[{self.name}] EVAL: delta={delta:+.4f} "
                 f"prob={prob:.1%} winner={predicted_winner.upper()} "
-                f"price={winner_price:.3f} EV/\u0024={ev_per_dollar:.1%} "
-                f"{remaining:.0f}s left"
+                f"mid={winner_mid:.3f} cost={all_in_cost:.3f} "
+                f"EV/\u0024={ev_per_dollar:.1%} {remaining:.0f}s left"
             )
 
         if abs(delta) < self.directional_min_delta:
             return []
         if prob < self.min_win_prob:
             return []
-        if winner_price < self.directional_min_price:
+        if winner_mid < self.directional_min_price:
             return []
-        if winner_price >= self.directional_max_price:
+        if winner_mid >= self.directional_max_price:
             return []
         if ev_per_dollar < self.min_ev_per_dollar:
             return []
 
-        # Scale size with confidence
         headroom = self.max_market_exposure - self._total_exposure()
+
+        # Dynamic sizing: scale inversely with price — risk less at higher
+        # prices where the downside-to-upside ratio is worse.
+        price_factor = max(0.3, 1.0 - winner_mid)
         confidence_mult = min(
-            2.0,
+            1.5,
             0.5 + (prob - self.min_win_prob) / (1.0 - self.min_win_prob),
         )
-        trade_dollars = min(self.trade_size_dollars * confidence_mult, headroom)
+        trade_dollars = min(
+            self.trade_size_dollars * price_factor * confidence_mult,
+            headroom,
+        )
         if trade_dollars < 1.0:
             return []
 
-        shares = trade_dollars / winner_price
+        shares = min(trade_dollars / all_in_cost, self.max_shares_per_order)
         if shares < self.min_order_shares:
             return []
 
-        fill_price = min(winner_price * 1.005, 0.99)
+        fill_price = min(winner_mid + self.min_spread_buffer + 0.01, 0.99)
         token_type = (
             TokenType.YES if predicted_winner == "up" else TokenType.NO
         )
@@ -432,14 +466,13 @@ class EndgameStrategy(BaseStrategy):
             is_taker=True,
         )
 
-        if self._logged_direction != predicted_winner:
-            self._logged_direction = predicted_winner
-            logger.info(
-                f"[{self.name}] DIRECTIONAL: {predicted_winner.upper()} "
-                f"delta={delta:+.4f} prob={prob:.1%} "
-                f"price={winner_price:.3f} EV/\u0024={ev_per_dollar:.1%} "
-                f"shares={shares:.1f} {remaining:.0f}s left"
-            )
+        logger.info(
+            f"[{self.name}] DIRECTIONAL BUY {predicted_winner.upper()}: "
+            f"delta={delta:+.4f} prob={prob:.1%} "
+            f"mid={winner_mid:.3f} cost={all_in_cost:.3f} "
+            f"EV/\u0024={ev_per_dollar:.1%} "
+            f"${trade_dollars:.1f}→{shares:.1f}sh {remaining:.0f}s left"
+        )
 
         self._trades_this_market += 1
         return [signal]
