@@ -70,12 +70,10 @@ def win_probability(
     return 0.5 * (1.0 + erf(z / 1.4142135623730951))  # sqrt(2)
 
 
-# Coin-specific volatility estimates (1-minute std dev of returns).
-# BTC is least volatile, SOL most volatile.
-COIN_VOLATILITY = {
-    "btc": 0.0008,
-    "eth": 0.0012,
-    "sol": 0.0015,
+COIN_PARAMS = {
+    "btc": {"volatility": 0.0008, "min_delta": 0.0015, "max_shares": 20},
+    "eth": {"volatility": 0.0012, "min_delta": 0.0012, "max_shares": 15},
+    "sol": {"volatility": 0.0015, "min_delta": 0.0010, "max_shares": 10},
 }
 
 
@@ -240,7 +238,40 @@ class EndgameStrategy(BaseStrategy):
         return self._up_cost + self._down_cost
 
     def _get_volatility(self) -> float:
-        return COIN_VOLATILITY.get(self._coin, self.base_volatility)
+        return COIN_PARAMS.get(self._coin, {}).get("volatility", self.base_volatility)
+
+    def _get_asset_params(self, market_id: str = "") -> Dict[str, Any]:
+        """Get coin-specific trading parameters based on market_id or coin.
+
+        Detects coin from market_id (e.g. 'BTC-12345' -> btc) and returns
+        the corresponding volatility, min_delta, and max_shares parameters.
+
+        Args:
+            market_id: The market ID to detect coin type from.
+
+        Returns:
+            Dict with 'volatility', 'min_delta', 'max_shares' keys.
+        """
+        # Try to detect from market_id first
+        market_upper = market_id.upper() if market_id else ""
+        detected_coin = None
+        if "BTC" in market_upper:
+            detected_coin = "btc"
+        elif "ETH" in market_upper:
+            detected_coin = "eth"
+        elif "SOL" in market_upper:
+            detected_coin = "sol"
+
+        # Use detected coin or fall back to self._coin
+        coin = detected_coin if detected_coin else self._coin
+
+        default_params = {
+            "volatility": self.base_volatility,
+            "min_delta": self.directional_min_delta,
+            "max_shares": self.max_shares_per_order,
+        }
+
+        return COIN_PARAMS.get(coin, default_params)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -252,13 +283,19 @@ class EndgameStrategy(BaseStrategy):
         self.market_settlement_time = market_info.get("settlement_time")
         self._coin = market_info.get("coin", "btc").lower()
 
+        # Get coin-specific parameters
+        asset_params = self._get_asset_params(market_id)
+        self.directional_min_delta = asset_params["min_delta"]
+        self.max_shares_per_order = asset_params["max_shares"]
+
         api_min = market_info.get("min_order_size")
         if api_min and api_min > 0:
             self.min_order_shares = api_min
 
         logger.info(
             f"[{self.name}] Market started: {market_id} "
-            f"(coin={self._coin}, settlement in {self._time_remaining():.0f}s)"
+            f"(coin={self._coin.upper()}, delta_thresh={self.directional_min_delta:.4f}, "
+            f"max_shares={self.max_shares_per_order}, settlement in {self._time_remaining():.0f}s)"
         )
 
     def on_price_update(self, price_data: PriceData) -> List[OrderSignal]:
@@ -336,6 +373,21 @@ class EndgameStrategy(BaseStrategy):
         if shares < self.min_order_shares:
             return []
 
+        # Apply depth check and adjust shares for each side
+        shares = self._check_depth_and_adjust_shares(
+            price_data, "up", shares, up_cost
+        )
+        if shares < self.min_order_shares:
+            return []
+
+        down_shares = self._check_depth_and_adjust_shares(
+            price_data, "down", shares, down_cost
+        )
+        if down_shares < self.min_order_shares:
+            return []
+
+        shares = min(shares, down_shares)  # Use lower of both sides
+
         up_fill = min(price_data.up_price + self.min_spread_buffer + 0.01, 0.99)
         down_fill = min(price_data.down_price + self.min_spread_buffer + 0.01, 0.99)
 
@@ -385,6 +437,86 @@ class EndgameStrategy(BaseStrategy):
         ask_estimate = min(mid_price + half_spread, 0.99)
         fee_rate = 0.25 * (ask_estimate * (1 - ask_estimate)) ** 2
         return ask_estimate / (1 - fee_rate)
+
+
+    def _get_available_depth(
+        self, price_data: PriceData, side: str
+    ) -> Optional[float]:
+        """Get available depth (ask size) for the given side.
+
+        Args:
+            price_data: Current price data with depth information.
+            side: 'up' or 'down' for the token side.
+
+        Returns:
+            Available depth in shares, or None if not available.
+        """
+        if side == "up":
+            return price_data.up_ask_size
+        elif side == "down":
+            return price_data.down_ask_size
+        return None
+
+    def _check_depth_and_adjust_shares(
+        self,
+        price_data: PriceData,
+        side: str,
+        calculated_shares: float,
+        all_in_cost: float,
+    ) -> float:
+        """Adjust shares based on available order-book depth.
+
+        Caps the order size to avoid attempting to buy more than the
+        available liquidity at the top of book. Falls back to estimated
+        depth from spread if direct depth data is unavailable.
+
+        Args:
+            price_data: Current price data with depth information.
+            side: 'up' or 'down' for the token side.
+            calculated_shares: Shares calculated from budget/risk logic.
+            all_in_cost: Estimated cost per share (for converting depth $ to shares).
+
+        Returns:
+            Adjusted shares, capped by available depth. Returns 0 if depth
+            is insufficient for minimum order size.
+        """
+        available_depth = self._get_available_depth(price_data, side)
+
+        # If no direct depth data, estimate from spread (deeper = wider spread)
+        if available_depth is None:
+            # Conservative: use spread as a rough proxy for depth
+            # Wider spread typically means thinner book
+            spread = price_data.spread
+            if spread > 0.02:
+                # Very wide spread = low depth estimate
+                available_depth = calculated_shares * 0.5
+            elif spread > 0.01:
+                available_depth = calculated_shares * 0.7
+            else:
+                # Tight spread = assume adequate depth
+                return calculated_shares
+
+        # Convert depth dollars to shares at current price
+        if all_in_cost > 0:
+            max_shares_from_depth = available_depth / all_in_cost
+        else:
+            max_shares_from_depth = 0.0
+
+        adjusted = min(calculated_shares, max_shares_from_depth)
+
+        if adjusted < calculated_shares and adjusted >= self.min_order_shares:
+            logger.debug(
+                f"[{self.name}] Depth-adjusted {side.upper()}: "
+                f"{calculated_shares:.1f} → {adjusted:.1f} "
+                f"(available_depth={available_depth:.2f})"
+            )
+        elif adjusted < self.min_order_shares:
+            logger.debug(
+                f"[{self.name}] Skipping {side.upper()} due to insufficient depth: "
+                f"only {available_depth:.2f} available, need {self.min_order_shares:.1f}"
+            )
+
+        return adjusted
 
     def _check_directional(
         self, price_data: PriceData, remaining: float
@@ -449,6 +581,13 @@ class EndgameStrategy(BaseStrategy):
             return []
 
         shares = min(trade_dollars / all_in_cost, self.max_shares_per_order)
+        if shares < self.min_order_shares:
+            return []
+
+        # Apply depth check for the predicted winner side
+        shares = self._check_depth_and_adjust_shares(
+            price_data, predicted_winner, shares, all_in_cost
+        )
         if shares < self.min_order_shares:
             return []
 

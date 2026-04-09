@@ -65,6 +65,8 @@ class PriceData(BaseModel):
     down_price: float = Field(ge=0, le=1, description="NO/DOWN token best price")
     timestamp: datetime = Field(default_factory=datetime.now, description="Price timestamp")
     spread: float = Field(default=0, ge=0, description="Bid-ask spread")
+    up_ask_size: Optional[float] = Field(default=None, description="Top-of-book ask size for UP")
+    down_ask_size: Optional[float] = Field(default=None, description="Top-of-book ask size for DOWN")
 
     model_config = ConfigDict(ser_json_timedelta="iso8601")
 
