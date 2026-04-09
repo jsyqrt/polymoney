@@ -70,12 +70,10 @@ def win_probability(
     return 0.5 * (1.0 + erf(z / 1.4142135623730951))  # sqrt(2)
 
 
-# Coin-specific volatility estimates (1-minute std dev of returns).
-# BTC is least volatile, SOL most volatile.
-COIN_VOLATILITY = {
-    "btc": 0.0008,
-    "eth": 0.0012,
-    "sol": 0.0015,
+COIN_PARAMS = {
+    "btc": {"volatility": 0.0008, "min_delta": 0.0015, "max_shares": 20},
+    "eth": {"volatility": 0.0012, "min_delta": 0.0012, "max_shares": 15},
+    "sol": {"volatility": 0.0015, "min_delta": 0.0010, "max_shares": 10},
 }
 
 
@@ -240,7 +238,40 @@ class EndgameStrategy(BaseStrategy):
         return self._up_cost + self._down_cost
 
     def _get_volatility(self) -> float:
-        return COIN_VOLATILITY.get(self._coin, self.base_volatility)
+        return COIN_PARAMS.get(self._coin, {}).get("volatility", self.base_volatility)
+
+    def _get_asset_params(self, market_id: str = "") -> Dict[str, Any]:
+        """Get coin-specific trading parameters based on market_id or coin.
+
+        Detects coin from market_id (e.g. 'BTC-12345' -> btc) and returns
+        the corresponding volatility, min_delta, and max_shares parameters.
+
+        Args:
+            market_id: The market ID to detect coin type from.
+
+        Returns:
+            Dict with 'volatility', 'min_delta', 'max_shares' keys.
+        """
+        # Try to detect from market_id first
+        market_upper = market_id.upper() if market_id else ""
+        detected_coin = None
+        if "BTC" in market_upper:
+            detected_coin = "btc"
+        elif "ETH" in market_upper:
+            detected_coin = "eth"
+        elif "SOL" in market_upper:
+            detected_coin = "sol"
+
+        # Use detected coin or fall back to self._coin
+        coin = detected_coin if detected_coin else self._coin
+
+        default_params = {
+            "volatility": self.base_volatility,
+            "min_delta": self.directional_min_delta,
+            "max_shares": self.max_shares_per_order,
+        }
+
+        return COIN_PARAMS.get(coin, default_params)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -252,13 +283,19 @@ class EndgameStrategy(BaseStrategy):
         self.market_settlement_time = market_info.get("settlement_time")
         self._coin = market_info.get("coin", "btc").lower()
 
+        # Get coin-specific parameters
+        asset_params = self._get_asset_params(market_id)
+        self.directional_min_delta = asset_params["min_delta"]
+        self.max_shares_per_order = asset_params["max_shares"]
+
         api_min = market_info.get("min_order_size")
         if api_min and api_min > 0:
             self.min_order_shares = api_min
 
         logger.info(
             f"[{self.name}] Market started: {market_id} "
-            f"(coin={self._coin}, settlement in {self._time_remaining():.0f}s)"
+            f"(coin={self._coin.upper()}, delta_thresh={self.directional_min_delta:.4f}, "
+            f"max_shares={self.max_shares_per_order}, settlement in {self._time_remaining():.0f}s)"
         )
 
     def on_price_update(self, price_data: PriceData) -> List[OrderSignal]:
