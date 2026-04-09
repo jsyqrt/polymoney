@@ -373,6 +373,21 @@ class EndgameStrategy(BaseStrategy):
         if shares < self.min_order_shares:
             return []
 
+        # Apply depth check and adjust shares for each side
+        shares = self._check_depth_and_adjust_shares(
+            price_data, "up", shares, up_cost
+        )
+        if shares < self.min_order_shares:
+            return []
+
+        down_shares = self._check_depth_and_adjust_shares(
+            price_data, "down", shares, down_cost
+        )
+        if down_shares < self.min_order_shares:
+            return []
+
+        shares = min(shares, down_shares)  # Use lower of both sides
+
         up_fill = min(price_data.up_price + self.min_spread_buffer + 0.01, 0.99)
         down_fill = min(price_data.down_price + self.min_spread_buffer + 0.01, 0.99)
 
@@ -422,6 +437,86 @@ class EndgameStrategy(BaseStrategy):
         ask_estimate = min(mid_price + half_spread, 0.99)
         fee_rate = 0.25 * (ask_estimate * (1 - ask_estimate)) ** 2
         return ask_estimate / (1 - fee_rate)
+
+
+    def _get_available_depth(
+        self, price_data: PriceData, side: str
+    ) -> Optional[float]:
+        """Get available depth (ask size) for the given side.
+
+        Args:
+            price_data: Current price data with depth information.
+            side: 'up' or 'down' for the token side.
+
+        Returns:
+            Available depth in shares, or None if not available.
+        """
+        if side == "up":
+            return price_data.up_ask_size
+        elif side == "down":
+            return price_data.down_ask_size
+        return None
+
+    def _check_depth_and_adjust_shares(
+        self,
+        price_data: PriceData,
+        side: str,
+        calculated_shares: float,
+        all_in_cost: float,
+    ) -> float:
+        """Adjust shares based on available order-book depth.
+
+        Caps the order size to avoid attempting to buy more than the
+        available liquidity at the top of book. Falls back to estimated
+        depth from spread if direct depth data is unavailable.
+
+        Args:
+            price_data: Current price data with depth information.
+            side: 'up' or 'down' for the token side.
+            calculated_shares: Shares calculated from budget/risk logic.
+            all_in_cost: Estimated cost per share (for converting depth $ to shares).
+
+        Returns:
+            Adjusted shares, capped by available depth. Returns 0 if depth
+            is insufficient for minimum order size.
+        """
+        available_depth = self._get_available_depth(price_data, side)
+
+        # If no direct depth data, estimate from spread (deeper = wider spread)
+        if available_depth is None:
+            # Conservative: use spread as a rough proxy for depth
+            # Wider spread typically means thinner book
+            spread = price_data.spread
+            if spread > 0.02:
+                # Very wide spread = low depth estimate
+                available_depth = calculated_shares * 0.5
+            elif spread > 0.01:
+                available_depth = calculated_shares * 0.7
+            else:
+                # Tight spread = assume adequate depth
+                return calculated_shares
+
+        # Convert depth dollars to shares at current price
+        if all_in_cost > 0:
+            max_shares_from_depth = available_depth / all_in_cost
+        else:
+            max_shares_from_depth = 0.0
+
+        adjusted = min(calculated_shares, max_shares_from_depth)
+
+        if adjusted < calculated_shares and adjusted >= self.min_order_shares:
+            logger.debug(
+                f"[{self.name}] Depth-adjusted {side.upper()}: "
+                f"{calculated_shares:.1f} → {adjusted:.1f} "
+                f"(available_depth={available_depth:.2f})"
+            )
+        elif adjusted < self.min_order_shares:
+            logger.debug(
+                f"[{self.name}] Skipping {side.upper()} due to insufficient depth: "
+                f"only {available_depth:.2f} available, need {self.min_order_shares:.1f}"
+            )
+
+        return adjusted
 
     def _check_directional(
         self, price_data: PriceData, remaining: float
@@ -486,6 +581,13 @@ class EndgameStrategy(BaseStrategy):
             return []
 
         shares = min(trade_dollars / all_in_cost, self.max_shares_per_order)
+        if shares < self.min_order_shares:
+            return []
+
+        # Apply depth check for the predicted winner side
+        shares = self._check_depth_and_adjust_shares(
+            price_data, predicted_winner, shares, all_in_cost
+        )
         if shares < self.min_order_shares:
             return []
 
