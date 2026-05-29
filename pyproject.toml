@@ -55,8 +55,8 @@ dev = [
 polymoney = "polymoney.cli.main:app"
 
 [project.urls]
-"Homepage" = "https://github.com/polymoney/polymoney"
-"Bug Tracker" = "https://github.com/polymoney/polymoney/issues"
+"Homepage" = "https://github.com/jsyqrt/polymoney"
+"Bug Tracker" = "https://github.com/jsyqrt/polymoney/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
